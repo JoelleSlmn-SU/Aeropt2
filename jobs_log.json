@@ -1,0 +1,132 @@
+[
+  {
+    "jobid": "8106391",
+    "kind": "solver",
+    "n": 0,
+    "cond": "cond_1",
+    "remote_dir": "/home/s.2268086/aeropt/aeropt_out/Corner_Bump_Surface_Coarse/solutions/n_0/cond_1/",
+    "base_name": "corner",
+    "submitted_at": "2025-11-11T11:45:03.488125Z",
+    "rsd_hint": [
+      ".rsd",
+      ".RSD"
+    ]
+  },
+  {
+    "jobid": "8106205",
+    "kind": "solver",
+    "n": 0,
+    "cond": "cond_1",
+    "remote_dir": "/home/s.2268086/aeropt/aeropt_out/Corner_Bump_Surface_Parallel/solutions/n_0/cond_1",
+    "base_name": "corner",
+    "submitted_at": "2025-11-11T11:45:03.488125Z",
+    "rsd_hint": [
+      ".rsd",
+      ".RSD"
+    ]
+  },
+  {
+    "jobid": "8106209",
+    "kind": "solver",
+    "n": 0,
+    "cond": "cond_2",
+    "remote_dir": "/home/s.2268086/aeropt/aeropt_out/Corner_Bump_Surface_Parallel/solutions/n_0/cond_2",
+    "base_name": "corner",
+    "submitted_at": "2025-11-11T11:45:03.488125Z",
+    "rsd_hint": [
+      ".rsd",
+      ".RSD"
+    ]
+  },
+  {
+    "jobid": "8106211",
+    "kind": "solver",
+    "n": 0,
+    "cond": "cond_3",
+    "remote_dir": "/home/s.2268086/aeropt/aeropt_out/Corner_Bump_Surface_Parallel/solutions/n_0/cond_3",
+    "base_name": "corner",
+    "submitted_at": "2025-11-11T11:45:03.488125Z",
+    "rsd_hint": [
+      ".rsd",
+      ".RSD"
+    ]
+  },
+  {
+    "jobid": "8106213",
+    "kind": "solver",
+    "n": 0,
+    "cond": "cond_4",
+    "remote_dir": "/home/s.2268086/aeropt/aeropt_out/Corner_Bump_Surface_Parallel/solutions/n_0/cond_4",
+    "base_name": "corner",
+    "submitted_at": "2025-11-11T11:45:03.488125Z",
+    "rsd_hint": [
+      ".rsd",
+      ".RSD"
+    ]
+  },
+  {
+    "jobid": "8106214",
+    "kind": "solver",
+    "n": 0,
+    "cond": "cond_5",
+    "remote_dir": "/home/s.2268086/aeropt/aeropt_out/Corner_Bump_Surface_Parallel/solutions/n_0/cond_5",
+    "base_name": "corner",
+    "submitted_at": "2025-11-11T11:45:03.488125Z",
+    "rsd_hint": [
+      ".rsd",
+      ".RSD"
+    ]
+  },
+  {
+    "jobid": "8106216",
+    "kind": "solver",
+    "n": 0,
+    "cond": "cond_6",
+    "remote_dir": "/home/s.2268086/aeropt/aeropt_out/Corner_Bump_Surface_Parallel/solutions/n_0/cond_6",
+    "base_name": "corner",
+    "submitted_at": "2025-11-11T11:45:03.488125Z",
+    "rsd_hint": [
+      ".rsd",
+      ".RSD"
+    ]
+  },
+  {
+    "jobid": "8106218",
+    "kind": "solver",
+    "n": 0,
+    "cond": "cond_7",
+    "remote_dir": "/home/s.2268086/aeropt/aeropt_out/Corner_Bump_Surface_Parallel/solutions/n_0/cond_7",
+    "base_name": "corner",
+    "submitted_at": "2025-11-11T11:45:03.488125Z",
+    "rsd_hint": [
+      ".rsd",
+      ".RSD"
+    ]
+  },
+  {
+    "jobid": "8106219",
+    "kind": "solver",
+    "n": 0,
+    "cond": "cond_8",
+    "remote_dir": "/home/s.2268086/aeropt/aeropt_out/Corner_Bump_Surface_Parallel/solutions/n_0/cond_8",
+    "base_name": "corner",
+    "submitted_at": "2025-11-11T11:45:03.488125Z",
+    "rsd_hint": [
+      ".rsd",
+      ".RSD"
+    ]
+  },
+  {
+    "jobid": "8106220",
+    "kind": "solver",
+    "n": 0,
+    "cond": "cond_9",
+    "remote_dir": "/home/s.2268086/aeropt/aeropt_out/Corner_Bump_Surface_Parallel/solutions/n_0/cond_9",
+    "base_name": "corner",
+    "submitted_at": "2025-11-11T11:45:03.488125Z",
+    "rsd_hint": [
+      ".rsd",
+      ".RSD"
+    ]
+  }
+]

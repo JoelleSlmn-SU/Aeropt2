@@ -1,0 +1,15 @@
+# Ignore examples folder
+examples/
+
+# Ignore virtual environments
+venv/
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyd
+
+# Ignore logs and settings
+*.log
+*.env
+*.ini
