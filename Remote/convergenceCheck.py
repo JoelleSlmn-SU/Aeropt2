@@ -92,7 +92,7 @@ def _forces_oscillatory(table, cols=FORCE_COLS, peak_thresh=0.5):
             ok = ok or (p > peak_thresh)
     return ok, peaks
 
-def _residual_converged(table, res_col=DEFAULT_RESIDUAL_COL, threshold=1e-3):
+def _residual_converged(table, res_col=DEFAULT_RESIDUAL_COL, threshold=-3):
     if table is None or table.shape[1] <= res_col:
         return None, "no residual column"
     res = table[:, res_col]

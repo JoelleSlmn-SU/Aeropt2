@@ -75,6 +75,7 @@ class MainWindow(QMainWindow):
         self.prepro_settings_saved = False
         self.solver_settings_saved = False
         self.optimisation_settings_saved = False
+        self.control_node_source = "mesh"
         
         self.rbf_original = None
         self.rbf_current  = None
@@ -346,6 +347,7 @@ class MainWindow(QMainWindow):
         ext = os.path.splitext(filename)[1].lower()
 
         if ext in (".step", ".stp", ".iges", ".igs"):
+            ## dialog to ask if CAD parameterisation
             self.display_stack.setCurrentIndex(self.IDX_GEO)
             self.geo_viewer.load_cad(filename)
             self.geo_viewer.set_input_filepath(self.input_file_path)
@@ -593,7 +595,7 @@ class MainWindow(QMainWindow):
             self.run_sim_btn.setEnabled(False)
 
     def check_run_opt_button_state(self):
-        if self.run_sim_btn.isEnabled() and self.optimisation_settings_saved:
+        if self.run_morph_btn.isEnabled() and self.run_sim_btn.isEnabled() and self.optimisation_settings_saved:
             self.run_opt_btn.setEnabled(True)
             self.logger.log("[INFO] All requirements met. You can now run optimisation.")
         else:
@@ -657,18 +659,22 @@ class MainWindow(QMainWindow):
                 self.logger.log(f"[ERROR] Cannot run simulation: {' and '.join(missing_items)}.")
                 return
 
+        if hasattr(self, "output_directory") and self.output_directory:
+            base = self.get_project_basename()
+            default_inp = os.path.join(self.output_directory, f"{base}.inp")
+            if os.path.exists(default_inp):
+                self.solver_input_path = default_inp
+        
         # Pull conditions from the parallel editor if present; otherwise fall back to the Objective editor
         conds = []
         if hasattr(self, "sim_config") and self.sim_config:
             conds = self.sim_config.get("conditions", [])
-        elif hasattr(self, "objective_config") and self.objective_config:
-            conds = self.objective_config.get("conditions", [])
-
         if not conds:
-            self.logger.log("[SIM] No conditions provided; opening Parallel Flow Conditions editor…")
-            self.open_sim_editor()
-            conds = getattr(self, "sim_config", {}).get("conditions", [])
-
+            self.logger.log(
+                "[SIM] No parallel flow conditions defined; "
+                "running a single case using the solver .inp settings."
+            )
+            conds = [{}]
         if not conds:
             self.logger.log("[SIM][ERROR] Still no conditions. Aborting.")
             return
@@ -724,8 +730,6 @@ class MainWindow(QMainWindow):
             try:
                 sftp.put(bo_json, posixpath.join(remote_run, "bo_settings.json"))
                 sftp.put(obj_json, posixpath.join(remote_run, "objective.json"))
-                sftp.put(os.path.join(os.getcwd(), "Remote", "remote_opt.py"),
-                        posixpath.join(remote_run, "remote_opt.py"))
             finally:
                 sftp.close()
 
@@ -735,18 +739,19 @@ class MainWindow(QMainWindow):
                 "#SBATCH --job-name=opt_orch",
                 "#SBATCH --output=opt_orch.%J.out",
                 "#SBATCH --error=opt_orch.%J.err",
-                "#SBATCH --time=7-00:00",
+                "#SBATCH --time=3-00:00",
                 "#SBATCH --nodes=1",
                 "#SBATCH --ntasks=1",
                 "source ~/.bashrc",
                 "set -euo pipefail",
                 f"cd {remote_run}",
-                f"python3 remote_opt.py {remote_run}"
-            ]) + "\n"
+                f"python3 /home/{self.ssh_creds['username']}/aeropt/Scripts/Remote/remoteOpt.py {remote_run}",
+            ])
 
             # write locally then upload then sbatch (same as your pipeline)
             local_batch = os.path.join(local_tmp, "batchfile_opt_orchestrator")
-            with open(local_batch, "w") as f: f.write(batch)
+            with open(local_batch, "w", newline="\n") as f:
+                f.write(batch + "\n")
             sftp = self.ssh_client.open_sftp()
             try:
                 sftp.put(local_batch, posixpath.join(remote_run, "batchfile_opt_orchestrator"))
@@ -987,8 +992,8 @@ class MainWindow(QMainWindow):
             self.logger.log(f"[Bayes] Settings saved to {out_path}")
 
         # Initialise optimiser
-        self.bayesian_optimiser = BayesianOptimiser(settings, eval_func=None)
-        self.logger.log("[Bayes] BayesianOptimiser initialised with current settings.")
+        #self.bayesian_optimiser = BayesianOptimiser(settings, eval_func=None)
+        #self.logger.log("[Bayes] BayesianOptimiser initialised with current settings.")
         
         self.optimisation_settings_saved = True
         self.check_run_opt_button_state()
@@ -1199,6 +1204,7 @@ class MainWindow(QMainWindow):
             return
 
         self.solver_template_dir = folder
+        self.solver_input_path = save_path
         self.logger.log(f"[Solver] Using solver template dir: {self.solver_template_dir}")
 
         # Mark solver settings saved → check run_sim_btn

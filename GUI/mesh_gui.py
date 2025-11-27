@@ -321,7 +321,7 @@ class MeshViewer(QWidget):
         self.main_layout.addWidget(self.hide_btn)
         self.hide_mode_enabled = False
 
-        self.tc_btn = QPushButton("Select T/C Surfaces")
+        self.tc_btn = QPushButton("Select T/U/C Surfaces")
         self.tc_btn.clicked.connect(self.tc_surfaces)
         self.main_layout.addWidget(self.tc_btn)
 

@@ -12,6 +12,7 @@ import os, io, fnmatch
 import numpy as np
 import posixpath
 import tempfile
+import json
 
 # ---------- SFTP utilities ----------
 def stat_isdir(st_mode):
@@ -86,15 +87,19 @@ class PostViewer(QWidget):
 
         # Row 1: HPC file controls + variable chooser
         row1 = QHBoxLayout()
-        self.refresh_btn  = QPushButton("Refresh post-proc jobs")
-        self.download_btn = QPushButton("Download && Open")
+        self.refresh_btn   = QPushButton("Refresh post-proc jobs")
+        self.download_btn  = QPushButton("Download && Open")
+        self.hist_btn      = QPushButton("Load History")       # NEW
+
         row1.addWidget(self.refresh_btn)
         row1.addWidget(self.download_btn)
+        row1.addWidget(self.hist_btn)                          # NEW
         row1.addStretch(1)
-
+        
+        
         row1.addWidget(QLabel("Field:"))
         self.field_combo = QComboBox()
-        self.field_combo.setMinimumWidth(220)
+        self.field_combo.setMinimumWidth(100)
         row1.addWidget(self.field_combo)
 
         self.gamma_edit = QLineEdit(str(self._gamma))
@@ -105,6 +110,11 @@ class PostViewer(QWidget):
 
         root.addLayout(row1)
 
+        # Jobs list
+        self.jobs = QListWidget()
+        self.jobs.setFixedHeight(100)
+        root.addWidget(self.jobs)
+        
         # Row 2: actions (hide/reset/clip)
         row2 = QHBoxLayout()
         self.reset_cam_btn = QPushButton("Reset Camera")
@@ -131,10 +141,6 @@ class PostViewer(QWidget):
         self.hide_orig_chk.toggled.connect(self._toggle_original_visibility)
         self.freeze_clip_btn.clicked.connect(self._freeze_current_clip)
         
-        # Jobs list
-        self.jobs = QListWidget()
-        self.jobs.setFixedHeight(100)
-        root.addWidget(self.jobs)
 
         # Embedded PyVista view
         self.plotter = QtInteractor(self)
@@ -144,6 +150,7 @@ class PostViewer(QWidget):
         # Wiring
         self.refresh_btn.clicked.connect(self.refresh_jobs)
         self.download_btn.clicked.connect(self.download_and_open)
+        self.hist_btn.clicked.connect(self.load_history_into_list)  # NEW
         self.field_combo.currentTextChanged.connect(self._update_scalars)
         self.reset_cam_btn.clicked.connect(self._reset_camera)
         self.reset_vis_btn.clicked.connect(self._reset_visibility)
@@ -162,6 +169,39 @@ class PostViewer(QWidget):
         return posixpath.join(self.mw.remote_output_dir, "postprocessed")
 
     # ---------- Populate jobs ----------
+    def _jobs_log_path(self):
+        # same convention as SolverViewer
+        return os.path.join(os.getcwd(), "jobs_log.json")
+
+    def _load_job_history(self):
+        path = self._jobs_log_path()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                data = []
+        except Exception:
+            data = []
+        # Filter for post-processing entries; adjust keys to whatever you log
+        return [
+            d for d in data
+            if isinstance(d, dict) and d.get("kind") in ("post", "postproc", "ensight")
+        ]
+
+    def load_history_into_list(self):
+        hist = self._load_job_history()
+        if not hist:
+            QMessageBox.information(self, "History", "No post-processing jobs found in jobs_log.json.")
+            return
+
+        self.jobs.clear()
+        for d in hist:
+            # similar label style to solver_gui
+            label = f"{d.get('jobid','?')} — n={d.get('n')} {d.get('cond','')} — {d.get('remote_dir','')}"
+            it = QListWidgetItem(label)
+            it.setData(Qt.UserRole, d)  # stash full dict on the item
+            self.jobs.addItem(it)
+
     def refresh_jobs(self):
         self.jobs.clear()
         try:
@@ -196,11 +236,43 @@ class PostViewer(QWidget):
     def download_and_open(self):
         it = self.jobs.currentItem()
         if not it:
-            QMessageBox.information(self, "No selection", "Select a .case job first.")
+            QMessageBox.information(self, "No selection", "Select a post-proc job first.")
             return
 
-        remote_case = it.text()
-        remote_dir  = posixpath.dirname(remote_case)
+        meta = it.data(Qt.UserRole)
+        remote_case = None
+        remote_dir  = None
+
+        try:
+            sftp = self.mw.ssh_client.open_sftp()
+        except Exception as e:
+            QMessageBox.critical(self, "SSH error", str(e))
+            return
+
+        try:
+            if isinstance(meta, dict):
+                # History entry: we stored the remote directory; find a .case inside it
+                remote_dir = meta.get("remote_dir")
+                if not remote_dir:
+                    raise RuntimeError("History record missing 'remote_dir'.")
+                case_candidates = []
+                for attr in sftp.listdir_attr(remote_dir):
+                    name = attr.filename
+                    if name.lower().endswith(".case"):
+                        case_candidates.append(posixpath.join(remote_dir, name))
+                if not case_candidates:
+                    raise FileNotFoundError(f"No .case found in {remote_dir}")
+                remote_case = sorted(case_candidates)[0]  # pick one deterministically
+            else:
+                # Live list population from refresh_jobs: item text is the full case path
+                remote_case = it.text()
+                remote_dir  = posixpath.dirname(remote_case)
+        except Exception as e:
+            try: sftp.close()
+            except Exception: pass
+            QMessageBox.critical(self, "Remote error", str(e))
+            return
+
 
         local_root = QFileDialog.getExistingDirectory(self, "Select local folder to store EnSight case")
         if not local_root:

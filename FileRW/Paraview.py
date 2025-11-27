@@ -2,8 +2,8 @@
 # Usage: pvpython sweep_x_rho_mach.py
 
 # ========================= CONFIG =========================
-CASE_FILE   = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\temp\ENSIGHTbase.case"   # .case/.foam/.pvtu/.vtu/etc.
-OUT_DIR     = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\temp\contours\x_sweep_out"              # output directory for images + HTML
+CASE_FILE   = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\temp\smaller mf\ENSIGHTcorner.case"   # .case/.foam/.pvtu/.vtu/etc.
+OUT_DIR     = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\temp\contours\smaller mf\x_sweep_out"              # output directory for images + HTML
 IMAGE_SIZE  = (1200, 600)                   # pixels (w, h)
 
 # Sweep extents and resolution

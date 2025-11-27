@@ -283,7 +283,7 @@ def _build_local_displacements_like_local(viewer, logger):
 
     # bump window, then scale like local
     d_ctrl = _apply_bump_window(viewer, cn, cn_normals, d_ctrl, logger=logger)
-    d_ctrl = d_ctrl * 10.0
+    #d_ctrl = d_ctrl * 10
 
     # U & C anchors with zero displacement
     u_anchor = _sample_surface_vertices(viewer, u_ids, max_pts_per_surf=1000)

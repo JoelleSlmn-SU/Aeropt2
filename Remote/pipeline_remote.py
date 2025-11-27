@@ -59,7 +59,7 @@ class HPCPipelineManager:
         self.prepro_exe      = getattr(self, "prepro_exe",      "/home/s.o.hassan/bin/Gen3d_jj")
         self.solver_exe      = getattr(self, "solver_exe",      "/home/s.o.hassan/bin/UnsMgnsg3d")
         self.combine_exe     = getattr(self, "combine_exe",     "/home/s.engevabj/codes/utilities/makeplot2")
-        self.ensight_exe     = getattr(self, "ensight_exe",     "/home/s.engevabj/codes/utilities/engen_tet_mesh")
+        self.ensight_exe     = getattr(self, "ensight_exe",     "/home/s.engevabj/codes/utilities/engen_tet")
         
         self.splitplot_exe = getattr(self, "splitplot_exe", "/home/s.engevabj/codes/utilities/splitplot2")
         self.makeplot_exe  = getattr(self, "makeplot_exe",  "/home/s.engevabj/codes/utilities/makeplot2")
@@ -346,8 +346,9 @@ class HPCPipelineManager:
         sol_dir,
         stdout_name="solver_output",
         solver_job_id=None,
-        res_threshold=1e-3,
+        res_threshold=-3,
         residual_csv=None,
+        runafter = None,
     ):
         """
         Simple two-step guard:
@@ -419,23 +420,75 @@ class HPCPipelineManager:
 
         # Next attempt number (persist attempt in file)
         bf2.lines.append('NEXT=1')
-        bf2.lines.append('if [ -f convergence_state.json ]; then NEXT=$(python3 - <<PY\n'
-                        'import json; print(json.load(open("convergence_state.json")).get("attempt",0)+1)\n'
-                        'PY\n); fi')
-        bf2.lines.append('echo "{\"attempt\": $NEXT, \"last_reason\": \"$REASON\"}" > convergence_state.json')
+        bf2.lines.append('if [ -f convergence_state.json ]; then')
+        bf2.lines.append("  NEXT=$(python3 - <<'PY'\n"
+                        "import json\n"
+                        "with open('convergence_state.json','r',encoding='utf-8') as f:\n"
+                        "    d = json.load(f)\n"
+                        "print(d.get('attempt',0) + 1)\n"
+                        "PY\n"
+                        ")")
+        bf2.lines.append('fi')
+
+        # Write convergence_state.json using json.dump (always valid JSON)
+        bf2.lines.append("python3 - <<PY\n"
+                        "import json\n"
+                        "data = {'attempt': int('" + "${NEXT}" + "'), 'last_reason': '" + "${REASON}" + "'}\n"
+                        "with open('convergence_state.json','w',encoding='utf-8') as f:\n"
+                        "    json.dump(data, f)\n"
+                        "PY")
 
         # Patch restart number in <base>.inp to $NEXT
+                # Patch restart number in <base>.inp by bumping the existing value (0→1, 1→2, ...)
         bf2.lines.append("python3 - <<'PY'")
-        bf2.lines.append("import os, re")
+        bf2.lines.append("import re")
         bf2.lines.append(f"p = '{self.base_name}.inp'")
-        bf2.lines.append("val = int(os.environ.get('NEXT','1'))")
-        bf2.lines.append("with open(p,'r',encoding='utf-8',errors='ignore') as f: txt=f.read()")
-        bf2.lines.append(r"txt = re.sub(r'(?im)^(\\s*restart\\s*number\\s*[:=]\\s*)\\d+', r'\\1' + str(val), txt, count=1)")
-        bf2.lines.append("with open(p,'w',encoding='utf-8',newline='\\n') as f: f.write(txt)")
-        bf2.lines.append("print(f'[GUARD] set restart number = {val} in {p}')")
+        bf2.lines.append("with open(p,'r',encoding='utf-8',errors='ignore') as f:")
+        bf2.lines.append("    txt = f.read()")
+        bf2.lines.append("")
+        bf2.lines.append("def bump(match):")
+        bf2.lines.append("    prefix = match.group('p')")
+        bf2.lines.append("    old_s = match.group('n')")
+        bf2.lines.append("    try:")
+        bf2.lines.append("        old = int(old_s)")
+        bf2.lines.append("    except ValueError:")
+        bf2.lines.append("        old = 0")
+        bf2.lines.append("    new = old + 1")
+        bf2.lines.append("    print(f'[GUARD] restart number {old} -> {new} in {p}')")
+        bf2.lines.append("    return prefix + str(new)")
+        bf2.lines.append("")
+        # allow:  "restart number 0", "restart number = 0", "restart   number:    0"
+        bf2.lines.append("")
+        bf2.lines.append("def bump(match):")
+        bf2.lines.append("    prefix = match.group('p')")
+        bf2.lines.append("    old_s = match.group('n')")
+        bf2.lines.append("    try:")
+        bf2.lines.append("        old = int(old_s)")
+        bf2.lines.append("    except ValueError:")
+        bf2.lines.append("        old = 0")
+        bf2.lines.append("    new = old + 1")
+        bf2.lines.append("    print(f'[GUARD] restart number {old} -> {new} in {p}')")
+        bf2.lines.append("    return prefix + str(new) + match.group('trail')")
+        bf2.lines.append("")
+        # Match: "ivd%restartNumber = 0," with optional spaces and optional comma
+        bf2.lines.append(r"pattern = r'(?im)^(?P<p>\s*ivd%restartNumber\s*=\s*)(?P<n>\d+)(?P<trail>\s*,?)'")
+        bf2.lines.append("txt2, n = re.subn(pattern, bump, txt, count=1)")
+        bf2.lines.append("if n == 0:")
+        bf2.lines.append("    print('[GUARD] WARNING: ivd%restartNumber line not found in file')")
+        bf2.lines.append("else:")
+        bf2.lines.append("    with open(p,'w',encoding='utf-8',newline='\\n') as f:")
+        bf2.lines.append("        f.write(txt2)")
         bf2.lines.append("PY")
 
-        # Run splitplot2 with your quick here-doc, then re-submit the standard solver batch
+        # Run makeplot2 and splitplot2 with your quick here-doc, then re-submit the standard solver batch
+        bf2.lines.append(f'"{self.makeplot_exe}" <<INPUT1')
+        bf2.lines.append('plotreg.reg')
+        bf2.lines.append(f'{self.base_name}.res')
+        bf2.lines.append(f'{self.base_name}.unk')
+        bf2.lines.append('F')
+        bf2.lines.append('T')
+        bf2.lines.append('INPUT1')
+        
         bf2.lines.append(f'"{self.splitplot_exe}" <<INPUT2')
         bf2.lines.append('plotreg.reg')
         bf2.lines.append(f'{self.base_name}.unk')
@@ -1020,8 +1073,7 @@ class HPCPipelineManager:
             sol_dir=sol_dir,
             stdout_name="solver_output",
             solver_job_id=jobid,
-            max_retries=2,             # tweak as you like
-            res_threshold=1e-3,        # your “-3” threshold
+            res_threshold=-3,        # your “-3” threshold
             residual_csv=f"{self.base_name}.rsd",  # or "" if unavailable
             runafter = None,
         )

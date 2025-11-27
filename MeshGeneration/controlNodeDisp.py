@@ -127,22 +127,37 @@ def getDisplacements(output_dir,
 
     # after phi is built; k = phi.shape[1]
     if normal_project:
-        # spectral decay prior
-        j = np.arange(1, k+1, dtype=float)
-        decay = 1.0 / (j**2.0)        # p = 2; tune 1.5–3
-        # target RMS amplitude as fraction of spacing
-        # estimate spacing from control nodes
-        from sklearn.neighbors import NearestNeighbors
-        nn = NearestNeighbors(n_neighbors=8).fit(control_nodes)
-        d8 = nn.kneighbors(return_distance=True)[0][:, -1].mean()
-        amp = 0.15 * d8               # ≤ 15% of local spacing
-        # sample smooth coefficients
-        rng = np.random.default_rng(seed)
-        coeffs = rng.normal(0.0, 1.0, size=k) * decay
-        coeffs *= (amp / (np.linalg.norm(coeffs) + 1e-12))
+        # --- scalar modal field projected along normals: coeffs length = k ---
+        if coeffs is None:
+            # spectral decay prior (your existing random design)
+            j = np.arange(1, k+1, dtype=float)
+            decay = 1.0 / (j**2.0)
+
+            # estimate spacing from control nodes
+            from sklearn.neighbors import NearestNeighbors
+            nn = NearestNeighbors(n_neighbors=8).fit(control_nodes)
+            d8 = nn.kneighbors(return_distance=True)[0][:, -1].mean()
+            amp = 0.15 * d8               # ≤ 15% of local spacing
+
+            coeffs = rng.normal(0.0, 1.0, size=k) * decay
+            coeffs *= (amp / (np.linalg.norm(coeffs) + 1e-12))
+        else:
+            coeffs = np.asarray(coeffs, float)
+            if coeffs.size != k:
+                raise ValueError(f"Expected {k} modal coeffs, got {coeffs.size}")
+
         d_ctrl = expand_modal_coeffs(phi, coeffs, normals=normals)
         d_ctrl = laplacian_smooth(control_nodes, d_ctrl, iters=3)
 
-    # d_ctrl = np.clip(d_ctrl, lower_bound, upper_bound)
+    else:
+        # --- full 3-axis basis: coeffs length = 3*k ---
+        if coeffs is None:
+            coeffs = np.zeros(3*k, dtype=float)
+        else:
+            coeffs = np.asarray(coeffs, float)
+            if coeffs.size != 3*k:
+                raise ValueError(f"Expected {3*k} coeffs for 3D basis, got {coeffs.size}")
+        d_ctrl = expand_modal_coeffs(phi, coeffs, normals=None)
+        d_ctrl = laplacian_smooth(control_nodes, d_ctrl, iters=3)
 
     return d_ctrl  # shape (N,3)

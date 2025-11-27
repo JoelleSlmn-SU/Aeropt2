@@ -2,6 +2,34 @@
 import os, json, time, posixpath, sys, re, subprocess
 import numpy as np
 
+script_dir = os.path.dirname(os.path.abspath(__file__))  # .../something/Remote
+
+root = script_dir
+project_root = None
+for _ in range(5):  # climb up at most 5 levels just to be safe
+    candidate = os.path.join(root, "Optimisation")
+    if os.path.isdir(candidate):
+        project_root = root
+        break
+    new_root = os.path.dirname(root)
+    if new_root == root:
+        break
+    root = new_root
+
+if project_root is None:
+    # Fallback: just assume two levels up is project root
+    project_root = os.path.dirname(os.path.dirname(script_dir))
+
+# Put project_root and common subpackages on sys.path
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+for sub in ("FileRW", "Optimisation", "ConvertFileType", "MeshGeneration", "Remote"):
+    sub_path = os.path.join(project_root, sub)
+    if os.path.isdir(sub_path) and sub_path not in sys.path:
+        sys.path.insert(0, sub_path)
+
+
 # --- Helpers
 def _log(msg, log_path):
     print(msg, flush=True)
@@ -39,30 +67,49 @@ class HeadlessTestManager:
         return int(gen_num) * 1_000_000 + int(local_idx)
 
     def _start_one(self, n_index, x, conds):
-        # Compose a minimal “submit one design” script by calling your pipeline remotely.
-        # Here we just write a tiny Python driver that imports your pipeline and submits jobs.
+        # x is the BO design vector (modal coefficients)
+        x_list = list(map(float, x))
+
         driver = f"""#!/usr/bin/env python3
-import os, json
-from pipeline_remote import HPCPipelineManager
+    import os, json
+    from pipeline_remote import HPCPipelineManager
 
-# Fake a tiny main_window-like shim
-class MW: 
-    ssh_client=None; remote_output_dir="{self.remote_root}"; logger=type("L",(),{{"log":print}})()
-    input_file_path=os.path.join("{self.remote_root}","orig","DUMMY.vtm")  # not used if you cold-start
-    input_directory="{self.remote_root}"
-    output_directory="{self.remote_root}"
+    # Design vector (Bayesian Optimiser sample) → modal coefficients
+    X = {x_list!r}
 
-mw = MW()
-pipe = HPCPipelineManager(mw, n={n_index})
-# Make BO X drive the deformation on the remote—assuming your morph step reads these from mesh_viewer;
-# if needed you can persist them to a file and have morph read them.
-# For now we just run volume→prepro and solver over all conditions; morph() if your workflow requires.
-# pipe.morph()
-v = pipe.volume()
-p = pipe.prepro(runafter=v)
-for i,cond in enumerate({json.dumps(conds)},1):
-    pipe.solver(cond, nc=i)
-"""
+    # Minimal mesh_viewer stub that just carries modal_coeffs.
+    class MeshViewerStub:
+        def __init__(self, coeffs):
+            # interpret coeffs as Laplacian modal coefficients
+            self.modal_coeffs = list(coeffs)
+
+    # Fake a tiny main_window-like shim for HPCPipelineManager
+    class MW:
+        def __init__(self, remote_root, coeffs):
+            self.ssh_client = None
+            self.remote_output_dir = remote_root
+            # simple logger shim
+            self.logger = type("L", (), {{"log": staticmethod(print)}})()
+            self.input_file_path = os.path.join(remote_root, "orig", "corner.vtm")
+            self.input_directory = remote_root
+            self.output_directory = remote_root
+            # stuff used by morph() / runSurfMorph()
+            self.mesh_viewer = MeshViewerStub(coeffs)
+            self.geo_viewer = None
+
+    mw = MW("{self.remote_root}", X)
+    pipe = HPCPipelineManager(mw, n={n_index})
+
+    # Once remoteMorph/runSurfMorph are wired to controlNodeDisp.getDisplacements(..., coeffs=X),
+    # this will produce a morphed FRO specific to this design.
+
+    morph_id = pipe.morph()
+    v = pipe.volume()
+    p = pipe.prepro(runafter=v)
+    for i, cond in enumerate({json.dumps(conds)}, 1):
+        pipe.solver(cond, nc=i)
+    """
+
         run_dir = os.path.join(self.remote_root, "headless", f"n_{n_index}")
         _safe_mkdir(run_dir)
         drv_path = os.path.join(run_dir, "submit_one.py")
@@ -73,9 +120,9 @@ for i,cond in enumerate({json.dumps(conds)},1):
         with open(bf, "w") as f:
             f.write("\n".join([
                 "#!/bin/bash -l",
-                "#SBATCH --job-name=opt_n{}".format(n_index),
-                "#SBATCH --output=opt_n{}.out".format(n_index),
-                "#SBATCH --error=opt_n{}.err".format(n_index),
+                f"#SBATCH --job-name=opt_n{n_index}",
+                f"#SBATCH --output=opt_n{n_index}.out",
+                f"#SBATCH --error=opt_n{n_index}.err",
                 "#SBATCH --time=3-00:00",
                 "#SBATCH --nodes=1",
                 "#SBATCH --ntasks=1",
@@ -145,7 +192,7 @@ for i,cond in enumerate({json.dumps(conds)},1):
             results.append(per_cond)
         return results
 
-def main():
+def main():    
     if len(sys.argv) < 2:
         print("usage: remote_opt.py <remote_run_dir>", flush=True)
         sys.exit(2)
