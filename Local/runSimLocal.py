@@ -10,7 +10,7 @@ from MeshGeneration.controlNodeDisp import _surface_normals, _map_normals_to_con
 from MeshGeneration.MorphModel import *
 from MeshGeneration.Rbf import *
 from MeshGeneration.BasisFunctions import get_bf
-from MeshGeneration.MorphBS import MorphMesh
+from MeshGeneration.Morph import MorphMesh
 from ConvertFileType.convertVtmtoFro import *
 from Utilities.PointClouds import *
 

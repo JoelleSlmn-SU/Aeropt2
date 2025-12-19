@@ -10,7 +10,7 @@
 # ----------------------------------------------------------------------
 
 import os, posixpath, shutil, re, textwrap
-from Remote.runSimRemote import runSurfMorph
+from Remote.runSimRemote import runSurfMorph, runCadMorph
 from ConvertFileType.convertVtmtoFro import vtm_to_fro
 from ConvertFileType.convertEnGeoToFro import engeo_to_fro
 
@@ -30,10 +30,9 @@ class Batchfile:
         hdr = ["#!/bin/bash -l", "#SBATCH --export=NONE"]
         for k, v in self.sbatch_params.items():
             hdr.append(f"#SBATCH --{k}={v}")
-        return "\n".join(hdr + [
-            'source ~/.bashrc',
-            ': "${PROMPT_COMMAND:=}"',
-            ': "${PYTHONPATH:=}"',
+        return "\n".join(['module load anaconda/2024.06',
+            'source activate',
+            'conda activate aeropt-hpc',
             'set -euo pipefail',
         ] + self.lines + [""])
 
@@ -74,6 +73,7 @@ class HPCPipelineManager:
 
         # surfacedir/vol/pre/sol roots
         self.job_ids = {}
+        self.sol_parallel_domains = 1
 
         # probe input-folder assets (highest precedence)
         def _probe(p): return p if (p and os.path.exists(p)) else None
@@ -590,20 +590,11 @@ class HPCPipelineManager:
         surf_dir = posixpath.join(self.remote_output, "surfaces", f"n_{self.n}/")
         self._mkdir_p_remote(surf_dir)
 
-        morph_id = runSurfMorph(self.mesh_viewer, n=self.n, debug=True, run_as_batch=True)
+        if getattr(self.main_window, "control_node_source", "cad"):
+            jobid = runCadMorph(self.geo_viewer, n=self.n, debug=True, run_as_batch=True)
+        else:
+            jobid = runSurfMorph(self.mesh_viewer, n=self.n, debug=True, run_as_batch=True)
         
-        batch_name = f"morph_n{self.n}"
-        bf = Batchfile(batch_name)
-        bf.lines.append(self.intel_module)
-        bf.lines.append(self.gnu_module)
-        bf.lines.append(f"cd {surf_dir}")
-        bf.lines.append(f"{self.morph_cmd} {self.base_name} &> morph_output")
-
-        local_batch = os.path.join(self.output_dir, f"batchfile_{batch_name}")
-        with open(local_batch, "w", newline="\n") as f:
-            f.write(str(bf))
-
-        jobid = self._upload_batch_and_submit(local_batch, surf_dir, batch_name, dep_jobid=runafter)
         self.job_ids["morph"] = jobid
         self._log(f"[HPC] Morph job {jobid}")
         return jobid
@@ -794,7 +785,6 @@ class HPCPipelineManager:
         bf.sbatch_params["mem"] = "0"
         bf.lines.append("")
         bf.lines.append("")
-        bf.lines.append("module purge")
         bf.lines.append(self.intel_module)
         bf.lines.append(self.gnu_module)
         bf.lines.append("")

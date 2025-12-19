@@ -19,6 +19,7 @@ for dir in ["FileRW", "ShapeParameterization", "MeshGeneration", "ConvertFileTyp
     sys.path.append(os.path.dirname(dir))
 from ShapeParameterization.surfaceFitting import selectControlNodes
 from MeshGeneration.meshFile import load_mesh
+from MeshGeneration.controlNodeDisp import _surface_normals, _map_normals_to_control
 from Local.runSimLocal import *
 from ConvertFileType.convertToStep import *
 from GUI.workers import MorphWorker
@@ -65,6 +66,8 @@ class MeshViewer(QWidget):
         self._dbg_pending = False
         self._dbg_last_title = "Debug"
         self.debug_plot_requested.connect(self._update_debug_plot_mpl)
+        
+        self.rigid_boundary_translation = False
 
         self.mesh_obj = None
         self.surface_actors = {}
@@ -381,9 +384,9 @@ class MeshViewer(QWidget):
             if lc_ids is None:
                 # Some FroFile APIs return only local; ensure g_ids is list of globals
                 g_ids = g_ids if g_ids is not None else []
-            # Append this surface's points
+            # Append this surface's self.points
             order.extend(list(g_ids))
-            # Same color for this surface's points
+            # Same color for this surface's self.points
             c = cmap(i)
             colors.extend([c] * len(g_ids))
 
@@ -403,7 +406,7 @@ class MeshViewer(QWidget):
 
     @pyqtSlot(object, str)
     def _update_debug_plot_mpl(self, fro_obj, title):
-        # GUI thread: fast in-place update of one scatter with all points (no sampling)
+        # GUI thread: fast in-place update of one scatter with all self.points (no sampling)
         self._ensure_mpl_canvas()
 
         # First time: build fixed order & scatter
@@ -645,46 +648,61 @@ class MeshViewer(QWidget):
             self.set_output_directory(default_dir)
             self.log(f"[Info] Output directory auto-set to: {default_dir}")
 
-        # Build the universe of available surfaces from your actors (names)
-        all_surface_names = [self._surface_id_from_actor_name(n) for n in self.surface_actors.keys()]
-        
-        # Dedup current selections (still names at this point)
-        self.TSurfaces = _dedup_preserve_order(self.TSurfaces)
-        self.USurfaces = _dedup_preserve_order(self.USurfaces)
-        self.CSurfaces = _dedup_preserve_order(self.CSurfaces)
-
-        # Anything NOT in T or C goes to U (names)
-        TU_set = set(self.TSurfaces) | set(self.USurfaces)
-        complement_for_C = [nm for nm in all_surface_names if nm not in TU_set]
-        self.CSurfaces = _dedup_preserve_order(self.USurfaces + complement_for_C)
-
-        # --- Keep copies of the NAME lists for preview/export ---
-        T_names = list(self.TSurfaces)
-        U_names = list(self.USurfaces)
-        C_names = list(self.CSurfaces)
-
-        # --- Convert NAME lists to INTEGER surface IDs for the morph pipeline ---
-        def _names_to_ids(names):
-            ids = []
-            for nm in names:
+        # --- Helper: robust int list ---
+        def _as_int_list(lst):
+            out = []
+            for x in lst:
                 try:
-                    # if it’s already digits, accept
-                    sid = int(nm) if str(nm).isdigit() else int(self.mesh_obj.get_surface_id(nm))
-                    ids.append(sid)
-                except Exception as e:
-                    self.log(f"[WARN] Could not resolve surface '{nm}' to an ID: {e}")
-            # dedup while preserving order
+                    out.append(int(x))
+                except Exception:
+                    pass
+            return _dedup_preserve_order(out)
+
+        # --- Preserve NAME selections for preview BEFORE overwriting with ints ---
+        # Assumption: your surface_actors keys are the same "names" used by mesh_obj.get_surface_points(name)
+        T_names = list(self.TSurfaces) if self.TSurfaces else []
+        C_names = list(self.CSurfaces) if self.CSurfaces else []
+        U_names = list(self.USurfaces) if self.USurfaces else []
+
+        # --- Universe of surfaces as IDs ---
+        all_ids = _as_int_list([self.mesh_obj.get_surface_id(nm) for nm in self.surface_actors.keys()])
+
+        # Convert selected name lists to ID lists (if they’re names, get_surface_id will be safer)
+        # If self.TSurfaces already stores ids, int() will handle it; if it stores names, use get_surface_id.
+        def _names_or_ids_to_ids(seq):
+            ids = []
+            for item in (seq or []):
+                # if it's already a number-like string/int
+                try:
+                    ids.append(int(item))
+                    continue
+                except Exception:
+                    pass
+                # otherwise treat as name
+                try:
+                    sid = self.mesh_obj.get_surface_id(item)
+                    if sid is not None:
+                        ids.append(int(sid))
+                except Exception:
+                    pass
             return _dedup_preserve_order(ids)
 
-        self.TSurfaces = _names_to_ids(T_names)
-        self.USurfaces = _names_to_ids(U_names)
-        self.CSurfaces = _names_to_ids(C_names)
+        T = _names_or_ids_to_ids(T_names)
+        C = _names_or_ids_to_ids(C_names)
 
-        # Log both for clarity
-        self.log(f"Marked T surfaces (names): {T_names}")
-        self.log(f"Marked C surfaces (names): {C_names}")
-        self.log(f"Marked U surfaces (names): {U_names}")
-        #self.log(f"[CHECK] T={self.TSurfaces}, U={self.USurfaces}, C={self.CSurfaces}")
+        # Auto-compute U from the universe (recommended)
+        U = _dedup_preserve_order([sid for sid in all_ids if sid not in (set(T) | set(C))])
+
+        # Save IDs back (these are what should go to morph_config)
+        self.TSurfaces = T
+        self.CSurfaces = C
+        self.USurfaces = U
+
+        # Logging (accurate)
+        self.log(f"Marked T surfaces (IDs): {T}")
+        self.log(f"Marked C surfaces (IDs): {C}")
+        self.log(f"Marked U surfaces (IDs): {U}")
+        self.log(f"[CHECK] overlap(T,C)={set(T) & set(C)}")
 
         # Hide selection widgets (unchanged)
         for wdg in [self.hide_btn, self.reset_btn, self.cam_btn, self.T_btn, self.C_btn,
@@ -694,7 +712,7 @@ class MeshViewer(QWidget):
             except Exception:
                 pass
 
-        # Prompt user for number of control nodes (unchanged) ...
+        # Prompt user for number of control nodes (unchanged)
         num_input, ok = QInputDialog.getInt(
             self, "Control Node Count",
             "How many control nodes would you like to use?",
@@ -702,8 +720,8 @@ class MeshViewer(QWidget):
         )
         if not ok:
             return
-        
-        # Build preview PolyData from the NAME copies (not the ints)
+
+        # --- Build preview PolyData from T surface NAMES ---
         append = pv.PolyData()
         for nm in T_names:
             pts = self.mesh_obj.get_surface_points(nm)
@@ -741,13 +759,24 @@ class MeshViewer(QWidget):
         self.log(f"[EDIT] Updated surfaces: T={self.TSurfaces}, U={self.USurfaces}, C={self.CSurfaces}")
 
     def plot_T_surfaces(self, vtk_path, num_control_nodes):
-        points, self.control_nodes = selectControlNodes(vtk_path, self.output_dir, num_control_nodes)
+        self.points, self.control_nodes = selectControlNodes(vtk_path, self.output_dir, num_control_nodes)
+        surf_normals = _surface_normals(self.points, knn=16)
+        self.control_normals = _map_normals_to_control(self.control_nodes, self.points, surf_normals, k=12)
 
+        try:
+            pts = np.asarray(self.points, float)
+            d = pts.max(axis=0) - pts.min(axis=0)
+            self.t_patch_scale = float(np.linalg.norm(d))  # bbox diagonal
+            self.log(f"[INFO] T-patch scale (from plot_T_surfaces points) = {self.t_patch_scale:.6g}")
+        except Exception as e:
+            self.t_patch_scale = None
+            self.log(f"[WARN] Failed to compute T-patch scale in plot_T_surfaces: {e}")
+        
         self.plotter.close()
         self.plotter = QtInteractor(self)
         self.main_layout.addWidget(self.plotter)
 
-        polydata = pv.PolyData(points)
+        polydata = pv.PolyData(self.points)
         self.plotter.add_mesh(polydata, show_edges=True, opacity=0.3)
 
         # Plot control nodes directly
@@ -770,9 +799,10 @@ class MeshViewer(QWidget):
         self.main_layout.addWidget(self.back_btn)
         
         # k_modes
+        n_cn = len(self.control_nodes)
         self.k_modes_spin = QSpinBox()
-        self.k_modes_spin.setRange(1, 64)
-        self.k_modes_spin.setValue(getattr(self, "k_modes", 6))   # sensible default
+        self.k_modes_spin.setRange(1, n_cn)
+        self.k_modes_spin.setValue(min(getattr(self, "k_modes", 6), n_cn))
         self.form.addRow("Number of modes (k):", self.k_modes_spin)
 
         # spectral decay p
@@ -801,6 +831,11 @@ class MeshViewer(QWidget):
         self.normal_proj_cb = QCheckBox("Project along surface normals")
         self.normal_proj_cb.setChecked(getattr(self, "normal_project", True))
         self.form.addRow(self.normal_proj_cb)
+        
+        self.rigid_c_cb = QCheckBox("Translate C surfaces rigidly with boundaries")
+        # Persist last choice if present
+        self.rigid_c_cb.setChecked(getattr(self, "rigid_boundary_translation", False))
+        self.form.addRow(self.rigid_c_cb)
 
         # ---- Optional bump window controls
         self.bump_enable_cb = QCheckBox("Enable bump window")
@@ -860,6 +895,7 @@ class MeshViewer(QWidget):
         self.coeff_frac = float(self.coeff_frac_spin.value())
         self.seed = int(self.seed_spin.value())
         self.normal_project = bool(self.normal_proj_cb.isChecked())
+        self.rigid_boundary_translation = bool(self.rigid_c_cb.isChecked())
 
         # Bump (optional)
         self.bump_enable = bool(self.bump_enable_cb.isChecked())
@@ -927,7 +963,7 @@ class MeshViewer(QWidget):
             if not hasattr(self, "plotter") or self.plotter is None:
                 self.log("[WARN] Plotter not initialised."); return
             if not hasattr(self, "cn_points") or self.cn_points is None or len(self.cn_points) == 0:
-                self.log("[WARN] No control-node points."); return
+                self.log("[WARN] No control-node self.points."); return
             if not hasattr(self, "cn_targets") or self.cn_targets is None or len(self.cn_targets) == 0:
                 self.log("[WARN] No displaced control-node targets."); return
             if not hasattr(self, "TSurfaces") or not self.TSurfaces:
@@ -983,7 +1019,7 @@ class MeshViewer(QWidget):
             cnP_lift  = cnP.copy();  cnP_lift[:,2]  += lift
             tgtP_lift = (cnP + scale*vecs).copy(); tgtP_lift[:,2] += lift
 
-            # spheres for points
+            # spheres for self.points
             r = 0.012 * lmin
             sph_black = pv.Sphere(radius=r); sph_red = pv.Sphere(radius=r)
             cn_poly   = pv.PolyData(cnP_lift)

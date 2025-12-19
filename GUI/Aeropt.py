@@ -419,7 +419,7 @@ class MainWindow(QMainWindow):
                 _in, _out, _err = self.ssh_client.exec_command("bash -lc 'printf %s \"$HOME\"'")
                 home = _out.read().decode().strip() or "~"
                 temp = os.path.basename(self.output_directory.rstrip('/\\')).replace(' ', '_')
-                base_hpc_dir = f"{home}/aeropt/aeropt_out/{temp}"
+                base_hpc_dir = f"/scratch/{self.ssh_creds['username']}/aeropt/aeropt_out/{temp}" # TODO: FIX - CHANGE TO SCRATCH
 
                 # Create remote dirs with bash (handles parents)
                 subfolders = ["preprocessed", "solutions", "surfaces", "volumes", "postprocessed"]
@@ -575,7 +575,7 @@ class MainWindow(QMainWindow):
 
     
     def get_project_basename(self):
-        """Return base name of loaded geometry/mesh file without extension."""
+        """Return self.base name of loaded geometry/mesh file without extension."""
         if hasattr(self, "input_filename") and self.input_filename:
             return os.path.splitext(self.input_filename)[0]
         return "project"
@@ -645,8 +645,16 @@ class MainWindow(QMainWindow):
             self.logger.log(f"[ERROR] Cannot run morph: {' and '.join(missing_items)}.")
             return
         
-        # Existing code
-        self.mesh_viewer.morphMesh()
+                # Decide which viewer to use based on where CNs came from
+        src = getattr(self, "control_node_source", "mesh")
+
+        if src == "cad":
+            self.logger.log("[MORPH] Using CAD-based control nodes → GeometryPanel.morphCAD().")
+            self.geo_viewer.morphCAD()
+        else:
+            self.logger.log("[MORPH] Using mesh-based control nodes → MeshViewer.morphMesh().")
+            self.mesh_viewer.morphMesh()
+
         
     def run_simulation(self):
         if not self.run_sim_btn.isEnabled():
@@ -660,8 +668,8 @@ class MainWindow(QMainWindow):
                 return
 
         if hasattr(self, "output_directory") and self.output_directory:
-            base = self.get_project_basename()
-            default_inp = os.path.join(self.output_directory, f"{base}.inp")
+            self.base = self.get_project_basename()
+            default_inp = os.path.join(self.output_directory, f"{self.base}.inp")
             if os.path.exists(default_inp):
                 self.solver_input_path = default_inp
         
@@ -699,76 +707,409 @@ class MainWindow(QMainWindow):
         self.logger.log("[SIM] Preparing submission…")
         self.sim_thread.start()
         
-        
+    def export_morph_basis_for_opt(self, remote_run: str) -> str:
+        """
+        Build a morph_basis.json from the current MeshViewer settings and upload it
+        into the optimisation run directory on the HPC.
+
+        Returns the remote path to morph_basis.json (Unix-style).
+        """
+        import json, os, posixpath, tempfile
+
+        # Sanity checks
+        if not hasattr(self, "mesh_viewer") or self.mesh_viewer is None:
+            self.logger.log("[OPT][ERROR] No MeshViewer available to export morph basis.")
+            return ""
+
+        mv = self.mesh_viewer
+        # We expect save_controlnodes to have been called already
+        if not hasattr(mv, "control_nodes") or mv.control_nodes is None:
+            self.logger.log("[OPT][ERROR] Control nodes not defined; save them before running optimisation.")
+            return ""
+    
+
+        # ---- 1) Build local JSON from mesh viewer state ----
+        basis_cfg = {
+            "control_nodes": mv.control_nodes.tolist(),
+            "control_normals": getattr(mv, "control_normals", None).tolist() if getattr(mv, "control_normals", None) is not None else None,
+            "t_patch_scale": getattr(mv, "t_patch_scale", None),
+            "TSurfaces": getattr(mv, "TSurfaces", []),
+            "USurfaces": getattr(mv, "USurfaces", []),
+            "CSurfaces": getattr(mv, "CSurfaces", []),
+            "k_modes": getattr(mv, "k_modes", 6),
+            "spectral_p": getattr(mv, "spectral_p", 2.0),
+            "coeff_frac": getattr(mv, "coeff_frac", 0.15),
+            "seed": getattr(mv, "seed", 0),
+            "normal_project": getattr(mv, "normal_project", True),
+            "bump_enable": getattr(mv, "bump_enable", False),
+            "bump_center": getattr(mv, "bump_center", None),
+            "bump_radius": getattr(mv, "bump_radius", None),
+            "bump_one_sided": getattr(mv, "bump_one_sided", False),
+            "rigid_translation": getattr(mv, "rigid_boundary_translation", True)
+        }
+
+        local_tmp = tempfile.mkdtemp()
+        local_basis = os.path.join(local_tmp, "morph_basis.json")
+        with open(local_basis, "w", encoding="utf-8") as f:
+            json.dump(basis_cfg, f, indent=2)
+        self.logger.log(f"[OPT] Wrote morph_basis.json → {local_basis}")
+
+        # ---- 2) Upload to HPC under <remote_run>/morph/morph_basis.json ----
+        if getattr(self, "run_mode", "") != "HPC":
+            self.logger.log("[OPT] Not in HPC mode; skipping remote upload of morph basis.")
+            return ""
+
+        if not hasattr(self, "ssh_client"):
+            self.logger.log("[OPT][ERROR] No SSH client for remote upload of morph basis.")
+            return ""
+
+        remote_morph_dir = posixpath.join(remote_run, "morph")
+        remote_basis_path = posixpath.join(remote_morph_dir, "morph_basis.json")
+
+        try:
+            # Create morph dir and WAIT for completion (handles missing parent 'opt')
+            cmd = f"bash -lc 'mkdir -p \"{remote_morph_dir}\"'"
+            stdin, stdout, stderr = self.ssh_client.exec_command(cmd)
+            exit_code = stdout.channel.recv_exit_status()
+            err_text = stderr.read().decode().strip()
+
+            if exit_code != 0 or err_text:
+                self.logger.log(
+                    f"[OPT][HPC][ERROR] Failed to create morph dir '{remote_morph_dir}'. "
+                    f"exit={exit_code}, stderr={err_text}"
+                )
+                return ""
+
+            # Now upload the file
+            sftp = self.ssh_client.open_sftp()
+            try:
+                self.logger.log(
+                    f"[OPT][HPC] Uploading morph basis '{local_basis}' → '{remote_basis_path}'"
+                )
+                sftp.put(local_basis, remote_basis_path)
+            finally:
+                sftp.close()
+
+            self.morph_basis_remote = remote_basis_path
+        except Exception as e:
+            self.logger.log(
+                f"[OPT][HPC][ERROR] Failed to upload morph basis to '{remote_basis_path}': {e}"
+            )
+            return ""
+
+        return remote_basis_path
+
+    def _stage_orig_inputs_to_remote(self) -> str:
+        """
+        Stage BAC/BPP/BCO + simple 'control' files from the local project
+        into the cluster-side 'orig/' directory.
+
+        Returns the remote 'orig' directory path (posix) or "" on failure.
+        """
+        if self.run_mode != "HPC" or not getattr(self, "ssh_client", None):
+            self.logger.log("[OPT][HPC] Not staging orig inputs (not in HPC mode or no SSH).")
+            return ""
+
+        import os, posixpath, glob, tempfile
+
+        base = getattr(self, "base_name", None) or self.get_project_basename()
+
+        # Local search dirs (PC side)
+        inp_dir = getattr(self, "input_directory", None)
+        if not inp_dir and getattr(self, "input_file_path", None):
+            inp_dir = os.path.dirname(self.input_file_path)
+
+        out_dir = getattr(self, "output_directory", None) or os.getcwd()
+        search_dirs = []
+        for d in (inp_dir, out_dir):
+            if d and d not in search_dirs:
+                search_dirs.append(d)
+
+        if not search_dirs:
+            self.logger.log("[OPT][HPC][WARN] No local search dirs for orig staging.")
+            return ""
+
+        remote_orig = posixpath.join(self.remote_output_dir, "orig")
+        # ensure remote orig/ exists
+        cmd = f"bash -lc 'mkdir -p \"{remote_orig}\"'"
+        _in, _out, _err = self.ssh_client.exec_command(cmd)
+        exit_code = _out.channel.recv_exit_status()
+        err_text = _err.read().decode().strip()
+        if exit_code != 0 or err_text:
+            self.logger.log(f"[OPT][HPC][WARN] Failed to create remote orig/: {err_text or exit_code}")
+            return ""
+
+        def find_first(relname: str):
+            for d in search_dirs:
+                cand = os.path.join(d, relname)
+                if os.path.exists(cand):
+                    return cand
+            return None
+
+        files_to_upload = {}
+
+        # Core FLITE inputs
+        for ext in ("bac", "bpp", "bco"):
+            rel = f"{base}.{ext}"
+            src = find_first(rel)
+            if src:
+                files_to_upload[rel] = src
+            else:
+                self.logger.log(f"[OPT][HPC][WARN] No local {rel} found in {search_dirs}")
+
+        # Generic "control" files (optional, very loose match)
+        for pattern in (f"{base}*control*", "control*", f"Mesh3D_v50.ctl"):
+            for d in search_dirs:
+                for path in glob.glob(os.path.join(d, pattern)):
+                    rel = os.path.basename(path)
+                    if rel not in files_to_upload:
+                        files_to_upload[rel] = path
+
+        if not files_to_upload:
+            self.logger.log("[OPT][HPC][WARN] No BAC/BPP/BCO/control files staged to orig/.")
+            return remote_orig
+
+        # Upload via SFTP
+        try:
+            sftp = self.ssh_client.open_sftp()
+            try:
+                for relname, src in files_to_upload.items():
+                    dst = posixpath.join(remote_orig, relname)
+                    sftp.put(src, dst)
+                    self.logger.log(f"[OPT][HPC] Staged {src} → {dst}")
+            finally:
+                sftp.close()
+        except Exception as e:
+            self.logger.log(f"[OPT][HPC][WARN] Failed to upload orig inputs: {e}")
+            return ""
+
+        return remote_orig
+
+    def _pick_surface_mesh_for_opt(self) -> str:
+        """
+        Best-effort selection of a *local* surface mesh to use as the baseline
+        for optimisation, and (if in HPC mode) stage it into remote_output_dir/orig.
+
+        Returns the remote 'orig' directory path on the cluster if upload succeeds,
+        otherwise "" (and logs warnings).
+        """
+        import os, glob, posixpath
+
+        tried = []
+
+        def _add(p):
+            if p and p not in tried:
+                tried.append(p)
+
+        self.base = self.get_project_basename()
+        local_surf = None
+
+        # 1) Prefer a canonical .fro in rbf_original (surfaces/n_0)
+        surf_dir = getattr(self, "rbf_original", None)
+        if surf_dir:
+            cand = os.path.join(surf_dir, f"{self.base}.fro")
+            if os.path.exists(cand):
+                self.logger.log(f"[OPT] Using baseline FRO from rbf_original: {cand}")
+                local_surf = cand
+            else:
+                _add(cand)
+                # any other .fro in rbf_original
+                for p in glob.glob(os.path.join(surf_dir, "*.fro")):
+                    if os.path.exists(p):
+                        self.logger.log(f"[OPT] Using baseline FRO found in rbf_original: {p}")
+                        local_surf = p
+                        break
+
+        # 2) Loaded file itself, if it's a supported surface mesh
+        if not local_surf:
+            loaded = getattr(self, "input_file_path", None)
+            if loaded and os.path.exists(loaded) and os.path.splitext(loaded)[1].lower() in (".fro", ".vtk", ".vtm"):
+                self.logger.log(f"[OPT] Using loaded file as baseline surface: {loaded}")
+                local_surf = loaded
+            _add(loaded)
+
+        # 3) Search the input_directory for any .fro/.vtm/.vtk
+        if not local_surf:
+            inp_dir = getattr(self, "input_directory", None) or ""
+            for ext in (".fro", ".vtm", ".vtk"):
+                for p in glob.glob(os.path.join(inp_dir, f"*{ext}")):
+                    if os.path.exists(p):
+                        self.logger.log(f"[OPT] Using baseline surface from input dir: {p}")
+                        local_surf = p
+                        break
+                if local_surf:
+                    break
+                _add(os.path.join(inp_dir, f"*{ext}"))
+
+        # 4) Nothing found → log and bail gracefully
+        if not local_surf or not os.path.exists(local_surf):
+            self.logger.log("[OPT][HPC][WARN] No baseline surface mesh found. Tried:")
+            for t in tried:
+                if t:
+                    self.logger.log(f"    {t}")
+            return ""
+
+        # 5) If VTK/VTM, convert to FRO and use that instead
+        ext = os.path.splitext(local_surf)[1].lower()
+        if ext in (".vtm", ".vtk"):
+            try:
+                from ConvertFileType.convertVtmtoFro import vtm_to_fro
+            except ImportError as e:
+                self.logger.log(f"[OPT][ERROR] Cannot import vtm_to_fro to convert {local_surf}: {e}")
+                return ""
+
+            fro_dir = surf_dir
+            if not fro_dir:
+                if getattr(self, "output_directory", None):
+                    fro_dir = os.path.join(self.output_directory, "surfaces", "n_0")
+                else:
+                    fro_dir = os.path.dirname(local_surf)
+
+            os.makedirs(fro_dir, exist_ok=True)
+            fro_out = os.path.join(fro_dir, f"{self.base}.fro")
+            self.logger.log(f"[OPT] Converting {local_surf} → {fro_out}")
+            try:
+                vtm_to_fro(local_surf, fro_out)
+            except Exception as e:
+                self.logger.log(f"[OPT][ERROR] VTM/VYK → FRO conversion failed: {e}")
+                return ""
+
+            if not os.path.exists(fro_out):
+                self.logger.log(f"[OPT][ERROR] Conversion did not produce '{fro_out}'.")
+                return ""
+
+            local_surf = fro_out
+
+        # 6) Upload to remote 'orig/' if in HPC mode
+        if (
+            getattr(self, "run_mode", "") == "HPC"
+            and getattr(self, "remote_output_dir", None)
+            and hasattr(self, "ssh_client")
+        ):
+            remote_orig = posixpath.join(self.remote_output_dir, "orig")
+            cmd = f"bash -lc 'mkdir -p \"{remote_orig}\"'"
+            _in, _out, _err = self.ssh_client.exec_command(cmd)
+            exit_code = _out.channel.recv_exit_status()
+            err_text = _err.read().decode().strip()
+            if exit_code != 0 or err_text:
+                self.logger.log(f"[OPT][HPC][WARN] Failed to create remote 'orig/': {err_text or exit_code}")
+                return ""
+
+            try:
+                sftp = self.ssh_client.open_sftp()
+                try:
+                    remote_mesh = posixpath.join(remote_orig, os.path.basename(local_surf))
+                    sftp.put(local_surf, remote_mesh)
+                    self.logger.log(f"[OPT][HPC] Staged baseline surface mesh → {remote_mesh}")
+                finally:
+                    sftp.close()
+            except Exception as e:
+                self.logger.log(f"[OPT][HPC][WARN] Failed to upload baseline surface mesh: {e}")
+                return ""
+
+            return remote_orig
+
+        # Not in HPC mode → just return empty to indicate "no remote orig"
+        return ""
+
     def run_optimisation(self):
         if not getattr(self, "optimisation_settings_saved", False):
             self.logger.log("[OPT] Please save optimisation settings first.")
             return
 
-        if self.run_mode == "HPC":
-            # 1) Resolve remote path
-            _in,_out,_err = self.ssh_client.exec_command("bash -lc 'printf %s \"$HOME\"'")
-            home = _out.read().decode().strip() or "~"
-            remote_run = f"{self.remote_output_dir}/opt"
-            # 2) mkdir -p
-            self.ssh_client.exec_command(f"bash -lc 'mkdir -p {remote_run}'")
-
-            # 3) Save JSONs locally then SFTP them up
-            import json, os, posixpath, tempfile
-            local_tmp = tempfile.mkdtemp()
-            bo_json = os.path.join(local_tmp, "bo_settings.json")
-            obj_json = os.path.join(local_tmp, "objective.json")
-
-            # turn your in-memory settings → json-safe (map class names)
-            s = dict(self.bayes_settings)
-            s["kernel"] = self.bo_kernel_combo.currentText()
-            s["acquisition_function"] = self.bo_acq_combo.currentText()
-            with open(bo_json, "w") as f: json.dump(s, f, indent=2)
-            with open(obj_json,"w") as f: json.dump(self.objective_config, f, indent=2)
-
-            sftp = self.ssh_client.open_sftp()
-            try:
-                sftp.put(bo_json, posixpath.join(remote_run, "bo_settings.json"))
-                sftp.put(obj_json, posixpath.join(remote_run, "objective.json"))
-            finally:
-                sftp.close()
-
-            # 4) Create & sbatch orchestrator
-            batch = "\n".join([
-                "#!/bin/bash -l",
-                "#SBATCH --job-name=opt_orch",
-                "#SBATCH --output=opt_orch.%J.out",
-                "#SBATCH --error=opt_orch.%J.err",
-                "#SBATCH --time=3-00:00",
-                "#SBATCH --nodes=1",
-                "#SBATCH --ntasks=1",
-                "source ~/.bashrc",
-                "set -euo pipefail",
-                f"cd {remote_run}",
-                f"python3 /home/{self.ssh_creds['username']}/aeropt/Scripts/Remote/remoteOpt.py {remote_run}",
-            ])
-
-            # write locally then upload then sbatch (same as your pipeline)
-            local_batch = os.path.join(local_tmp, "batchfile_opt_orchestrator")
-            with open(local_batch, "w", newline="\n") as f:
-                f.write(batch + "\n")
-            sftp = self.ssh_client.open_sftp()
-            try:
-                sftp.put(local_batch, posixpath.join(remote_run, "batchfile_opt_orchestrator"))
-            finally:
-                sftp.close()
-
-            _in,_out,_err = self.ssh_client.exec_command(
-                f"bash -lc 'cd {remote_run}; sbatch batchfile_opt_orchestrator'"
-            )
-            out = _out.read().decode().strip()
-            jid = out.split()[-1] if "Submitted batch job" in out else "?"
-            self.logger.log(f"[OPT] Submitted headless optimisation job {jid}. You can now close the UI.")
+        if self.run_mode != "HPC":
+            self.logger.log("[OPT] Optimisation is currently only wired for HPC mode.")
             return
 
-        # --- else: Local fallback (your existing background thread path) ---
-        # (keep your current QThread + OptimisationWorker flow here)  # :contentReference[oaicite:7]{index=7}
+        import os, posixpath, json, tempfile
 
+        # ----------------------------------------------------------
+        # 1) Resolve remote path for THIS optimisation run
+        # ----------------------------------------------------------
+        remote_run = posixpath.join(self.remote_output_dir, "opt")
+        #remote_orig = self._pick_surface_mesh_for_opt()
+        #if not remote_orig:
+        #    self.logger.log(
+        #        "[OPT][HPC][WARN] No baseline surface staged to 'orig/'. "
+        #        "Optimiser will rely on whatever exists on the cluster."
+        #    )
+        #remote_orig = self._stage_orig_inputs_to_remote()
+        #if not remote_orig:
+        #    self.logger.log("[OPT][HPC][WARN] Could not stage BAC/BPP/BCO to orig/; "
+        #                    "remoteOpt will rely on existing files on the cluster.")    
+
+        # 1a) Export & upload morph_basis.json for this run
+        remote_basis_path = self.export_morph_basis_for_opt(remote_run)
+        if not remote_basis_path:
+            self.logger.log("[OPT][WARN] Morph basis not available; optimisation may run with zero morphing.")
+
+        # 2) mkdir -p remote_run
+        self.ssh_client.exec_command(
+            f"bash -lc 'mkdir -p \"{remote_run}\"'"
+        )
+
+        # 3) Save JSONs locally then SFTP them up
+        import json, os, posixpath, tempfile
+        local_tmp = tempfile.mkdtemp()
+        bo_json = os.path.join(local_tmp, "bo_settings.json")
+        obj_json = os.path.join(local_tmp, "objective.json")
+
+        # turn your in-memory settings → json-safe (map class names)
+        s = dict(self.bayes_settings)
+        s["kernel"] = self.bo_kernel_combo.currentText()
+        s["acquisition_function"] = self.bo_acq_combo.currentText()
+        s["sim_dir"] = remote_run + "/"
+        s["units"] = self.cad_units
+        # NEW: include path to morph_basis.json on the cluster
+        s["morph_basis_json"] = remote_basis_path
+        
+        s["base_name"] = self.base
+        s["input_dir"] = posixpath.join(self.remote_output_dir, "orig")
+
+        with open(bo_json, "w", encoding="utf-8") as f:
+            json.dump(s, f, indent=2)
+        with open(obj_json,"w", encoding="utf-8") as f:
+            json.dump(self.objective_config, f, indent=2)
+
+        sftp = self.ssh_client.open_sftp()
+        try:
+            sftp.put(bo_json, posixpath.join(remote_run, "bo_settings.json"))
+            sftp.put(obj_json, posixpath.join(remote_run, "objective.json"))
+        finally:
+            sftp.close()
+
+        # 4) Create & sbatch orchestrator
+        batch = "\n".join([
+            "#!/bin/bash -l",
+            "#SBATCH --job-name=opt_orch",
+            "#SBATCH --output=opt_orch.%J.out",
+            "#SBATCH --error=opt_orch.%J.err",
+            "#SBATCH --time=3-00:00",
+            "#SBATCH --nodes=1",
+            "#SBATCH --ntasks=1",
+            "source ~/.bashrc",
+            "set -euo pipefail",
+            f"cd \"{remote_run}\"",
+            f"/home/{self.ssh_creds['username']}/.conda/envs/aeropt-hpc/bin/python "
+            f"/home/{self.ssh_creds['username']}/aeropt/Scripts/Remote/remoteOpt.py \"{remote_run}\"",
+        ])
+
+        local_batch = os.path.join(local_tmp, "batchfile_opt_orchestrator")
+        with open(local_batch, "w", newline="\n") as f:
+            f.write(batch + "\n")
+        sftp = self.ssh_client.open_sftp()
+        try:
+            sftp.put(local_batch, posixpath.join(remote_run, "batchfile_opt_orchestrator"))
+        finally:
+            sftp.close()
+
+        _in,_out,_err = self.ssh_client.exec_command(
+            f"bash -lc 'cd \"{remote_run}\"; sbatch batchfile_opt_orchestrator'"
+        )
+        out = _out.read().decode().strip()
+        jid = out.split()[-1] if "Submitted batch job" in out else "?"
+        self.logger.log(f"[OPT] Submitted headless optimisation job {jid}. You can now close the UI.")
+        return
 
     def open_geometry_window(self):
         if hasattr(self, "mesh_viewer") and self.mesh_viewer.mesh_obj:
@@ -979,8 +1320,8 @@ class MainWindow(QMainWindow):
 
         # Save JSON (store class/function names instead of raw objects)
         if hasattr(self, "output_directory") and self.output_directory:
-            base = self.get_project_basename()
-            out_path = os.path.join(self.output_directory, f"{base}_bo.json")
+            self.base = self.get_project_basename()
+            out_path = os.path.join(self.output_directory, f"{self.base}_bo.json")
 
             json_settings = {
                 **settings,
@@ -1191,8 +1532,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "Please set an output directory first.")
             return
 
-        base = self.get_project_basename()
-        save_path = os.path.join(self.output_directory, f"{base}.inp")
+        self.base = self.get_project_basename()
+        save_path = os.path.join(self.output_directory, f"{self.base}.inp")
         folder = os.path.dirname(save_path)
         
         try:

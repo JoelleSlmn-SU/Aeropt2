@@ -1,58 +1,68 @@
-# sweep_x_rho_mach.py — ParaView batch script for ρ & Mach x-sweep contours
-# Usage: pvpython sweep_x_rho_mach.py
+# Paraview.py — robust x-sweep plotting: rho, Mach, eta = P0/P0_inf
+# Run: pvpython Paraview.py
 
-# ========================= CONFIG =========================
-CASE_FILE   = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\temp\smaller mf\ENSIGHTcorner.case"   # .case/.foam/.pvtu/.vtu/etc.
-OUT_DIR     = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\temp\contours\smaller mf\x_sweep_out"              # output directory for images + HTML
-IMAGE_SIZE  = (1200, 600)                   # pixels (w, h)
-
-# Sweep extents and resolution
-X_START, X_END = 7.3, 13.5
-N_SLICES       = 63
-
-# Gas properties (used only if we must compute Mach or rho)
-GAMMA  = 1.4
-R_SPEC = 287.0   # J/(kg·K) for air (set to 1.0 if your data are non-dimensional)
-PATM = 101000.0
-PNORM_RANGE = (0.0, 0.9)
-
-# Field array names as they appear in your dataset
-NAME_U        = "velocity"    # vector (u,v,w)
-NAME_USCALED  = "velscaled"    # vector (u,v,w)
-NAME_RHO      = "density"     # scalar
-NAME_ENERGY   = "energy"
-
-WALLDIST_CANDIDATES = ["wallDistance", "yPlus", "y_plus", "Yplus", "yplus", "y_plus_avg", "distance_to_wall"]
-
-COLORMAP_NAME     = "Rainbow Uniform"     # or "Rainbow", "Rainbow Uniform", etc.
-SHOW_COLORBAR     = True
-USE_GLOBAL_RANGE  = True                      # keep same scale across slices
-MACH_DISCRETE_STEPS = 12
-MACH_RANGE          = (0.39, 1.3)
-# If you have a vibrant preset JSON exported from ParaView/EnSight, set these:
-MACH_PRESET_JSON    = None  
-MACH_PRESET_NAME    = None
-
-DELTA99_LEVEL     = 0.99                      # U/Ue level
-UE_PERCENTILE     = 95.0
-
-WRITE_PDFS        = True
-WRITE_DELTA99_CSV = True
-
-# Which variables to output (fixed to rho & Mach per your request)
-VARS_TO_PLOT = ("rho", "Mach")
-# ======================= END CONFIG =======================
-
-import os, math, glob, csv
-OUT_DIR = os.path.abspath(OUT_DIR)
-os.makedirs(OUT_DIR, exist_ok=True)
-print(f"[INFO] Writing images to: {OUT_DIR}")
-print(f"[INFO] CWD: {os.getcwd()}")
+from pathlib import Path
+import os, glob
+import numpy as np
 
 from paraview.simple import *
 from paraview.servermanager import Fetch
 from vtk.util import numpy_support as ns
-import numpy as np
+
+# ---------- CONFIG ----------
+folder = [
+    "Corner Bump Surface",
+    "Corner Bump Surface Opt",
+    "Corner Bump Surface Coarse Optimisation",
+    "Corner Bump Surface Optimisation",
+    "CB Opt 15.12"
+]
+
+x_case = 1
+base = Path(r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples")
+case_root = base / folder[3]
+
+CASE_FILE = str(case_root / "postprocessed" / str(x_case) / f"ENSIGHTcorner_{x_case}.case")
+OUT_DIR   = str(case_root / "postprocessed" / str(x_case) / f"x_sweep_out")
+#CASE_FILE = str(case_root / f"ENSIGHTcorner.case")
+#OUT_DIR   = str(case_root / f"x_sweep_out")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+IMAGE_SIZE = (1200, 600)
+
+# Sweep
+X_START, X_END = 6.0, 12.0
+N_SLICES = 61
+
+# Gas
+GAMMA = 1.4
+
+# Arrays
+NAME_U      = "velocity"
+NAME_RHO    = "density"
+NAME_ENERGY = "energy"
+
+# Plot ranges
+MACH_RANGE = (0.39, 1.30)
+ETA_RANGE  = (0.75, 1.00)
+
+# Matplotlib discrete rainbow
+CMAP_NAME = "rainbow"
+N_STEPS   = 12
+
+WRITE_PDFS = True
+
+# Freestream sampling region
+FS_CENTER  = (-8.0, 0.0, 0.0)
+FS_LENGTHS = (0.6, 5.0, 5.0)
+FS_NPTS    = 20000
+DROP_ZEROS = True
+# ======================= END CONFIG =======================
+
+OUT_DIR = os.path.abspath(OUT_DIR)
+os.makedirs(OUT_DIR, exist_ok=True)
+print(f"[INFO] CASE_FILE: {CASE_FILE}")
+print(f"[INFO] OUT_DIR:   {OUT_DIR}")
 
 # --------------------- helpers ---------------------
 def open_case(path):
@@ -99,165 +109,8 @@ def ensure_pointdata(proxy, array_name):
     Show(c2p); Hide(proxy)
     return c2p, array_name
 
-def compute_range(proxy, array_name):
-    proxy = normalize_to_single_dataset(proxy)
-    vtk_ds = Fetch(proxy)
-    if vtk_ds is None: return float("nan"), float("nan")
-    pd, cd = vtk_ds.GetPointData(), vtk_ds.GetCellData()
-    arr = pd.GetArray(array_name) if pd else None
-    if arr is None and cd: arr = cd.GetArray(array_name)
-    if arr is None: return float("nan"), float("nan")
-    ncomp = arr.GetNumberOfComponents()
-    np_arr = ns.vtk_to_numpy(arr)
-    data = np_arr if ncomp==1 else np.linalg.norm(np_arr.reshape(-1,ncomp),axis=1)
-    data = data[np.isfinite(data)]
-    if data.size == 0: return float("nan"), float("nan")
-    return float(np.min(data)), float(np.max(data))
-
-def get_array_numpy(proxy, array_name):
-    """Return 1D numpy array for scalar or magnitude for vector (POINTS preferred)."""
-    proxy = normalize_to_single_dataset(proxy)
-    vtk_ds = Fetch(proxy)
-    if vtk_ds is None: return None
-    pd, cd = vtk_ds.GetPointData(), vtk_ds.GetCellData()
-    arr = pd.GetArray(array_name) if pd else None
-    if arr is None and cd: arr = cd.GetArray(array_name)
-    if arr is None: return None
-    ncomp = arr.GetNumberOfComponents()
-    np_arr = ns.vtk_to_numpy(arr)
-    if ncomp == 1: return np_arr
-    return np.linalg.norm(np_arr.reshape(-1,ncomp), axis=1)
-
-def save_png(view, basename):
-    path = os.path.join(OUT_DIR, basename + ".png")
-    try: view.EnableRayTracing = 0
-    except Exception: pass
-    try:
-        Render(view=view); view.StillRender()
-        SaveScreenshot(filename=path, viewOrLayout=view, ImageResolution=IMAGE_SIZE)
-    except TypeError:
-        SaveScreenshot(path, view, ImageResolution=IMAGE_SIZE)
-    except Exception as e:
-        print(f"[ERROR] SaveScreenshot failed: {e}")
-        try:
-            WriteImage(path, view=view)
-        except Exception as e2:
-            print(f"[ERROR] WriteImage failed: {e2}")
-    try:
-        sz = os.path.getsize(path); print(f"[OK] Saved: {path} ({sz} bytes)")
-    except Exception:
-        print(f"[WARN] Save reported success but file not found: {path}")
-    return path
-
-def ensure_density(slice_proxy):
-    SetActiveSource(slice_proxy)
-    return ensure_pointdata(slice_proxy, NAME_RHO)
-
-def ensure_pressure(slice_proxy):
-    px_rho, rho_nm = ensure_pointdata(slice_proxy, NAME_RHO)
-    px_e,   e_nm   = ensure_pointdata(px_rho, NAME_ENERGY)
-    px_u, u_nm = ensure_pointdata(slice_proxy, NAME_U)
-    calc = Calculator(Input=px_e)
-    calc.ResultArrayName = "p_calc"
-    calc.Function = f"({e_nm}-0.5*{rho_nm}*mag({u_nm})^2)*({GAMMA}-1)"
-    Show(calc); Hide(px_e); SetActiveSource(calc)
-    return calc, "p_calc"
-
-def ensure_speed(slice_proxy):
-    px_u, u_nm = ensure_pointdata(slice_proxy, NAME_U)
-    calc = Calculator(Input=px_u)
-    calc.ResultArrayName = "U_mag"
-    calc.Function = f"mag({u_nm})"
-    Show(calc); Hide(px_u); SetActiveSource(calc)
-    return calc, "U_mag"
-
-def ensure_mach(slice_proxy):
-    """Build Mach = |U| / sqrt(GAMMA * p / rho) with p from energy."""
-    # 1) ensure p
-    p_px, p_nm = ensure_pressure(slice_proxy)
-    # 2) ensure rho & U are point-data
-    px_rho, rho_nm = ensure_pointdata(p_px, NAME_RHO)
-    px_u,   u_nm   = ensure_pointdata(px_rho, NAME_U)
-    # 3) calculator for Mach
-    calc = Calculator(Input=px_u)
-    calc.ResultArrayName = "Mach"
-    calc.Function = f"mag({u_nm})/sqrt({GAMMA}*{p_nm}/{rho_nm})"
-    Show(calc); Hide(px_u); SetActiveSource(calc)
-    return calc, "Mach"
-
-def find_walldist_name(slice_proxy):
-    arrs = list_arrays(slice_proxy)
-    for name in WALLDIST_CANDIDATES:
-        if name in arrs:
-            return name
-    return None
-
-def _apply_matplotlib_colormap(array_name, cmap_name='rainbow', n_steps=12, vmin=0.39, vmax=1.3, view=None, rep=None):
-    """
-    Use a vibrant Matplotlib colormap for the given scalar array in ParaView.
-    Works for headless pvpython too (no GUI preset import needed).
-    """
-    import matplotlib.pyplot as plt
-    from matplotlib import cm
-    import numpy as np
-
-    # Get the LUT object
-    lut = GetColorTransferFunction(array_name)
-    lut.Discretize = 1
-    lut.NumberOfTableValues = n_steps
-    lut.RescaleTransferFunction(vmin, vmax)
-
-    # Get RGB samples from the chosen colormap
-    cmap = cm.get_cmap(cmap_name, n_steps)
-    rgb_list = np.linspace(0, 1, n_steps)
-    colors = [cmap(x)[:3] for x in rgb_list]  # RGB only (ignore alpha)
-
-    # Convert to ParaView RGBPoints array: [x1, R1, G1, B1, x2, R2, G2, B2, ...]
-    vals = np.linspace(vmin, vmax, n_steps)
-    RGBPoints = []
-    for val, (r, g, b) in zip(vals, colors):
-        RGBPoints.extend([val, r, g, b])
-    lut.RGBPoints = RGBPoints
-    lut.ColorSpace = 'RGB'
-    lut.InterpretValuesAsCategories = 0
-
-    # Optional: show scalar bar
-    if rep and view:
-        rep.SetScalarBarVisibility(view, True)
-        sb = GetScalarBar(lut, view)
-        sb.Title = array_name
-        sb.LabelFormat = "%.2f"
-        sb.ScalarBarLength = 0.35
-        sb.WindowLocation = "Upper Right Corner"
-
-    print(f"[OK] Applied matplotlib colormap '{cmap_name}' ({n_steps} steps, {vmin}–{vmax}) to {array_name}")
-    return lut
-
-def _apply_mach_colormap(rep, array_name, view, vmin, vmax):
-    """Make Mach discrete with MACH_DISCRETE_STEPS and (optionally) apply an imported preset."""
-    lut = GetColorTransferFunction(array_name)
-    # Optional preset import
-    if MACH_PRESET_JSON and MACH_PRESET_NAME:
-        try:
-            ImportPresets(filename=MACH_PRESET_JSON)
-            ApplyPreset(lut, MACH_PRESET_NAME, True)
-        except Exception as e:
-            print(f"[WARN] Could not apply preset '{MACH_PRESET_NAME}': {e}")
-    # Discretize
-    lut.Discretize = 1
-    lut.NumberOfTableValues = int(MACH_DISCRETE_STEPS)
-    # Fixed range
-    lut.RescaleTransferFunction(float(vmin), float(vmax))
-    pwf = GetOpacityTransferFunction(array_name)
-    pwf.RescaleTransferFunction(float(vmin), float(vmax))
-    # Show colorbar if requested
-    if SHOW_COLORBAR:
-        rep.SetScalarBarVisibility(view, True)
-        sb = GetScalarBar(lut, view)
-        sb.Title = "Mach"
-        sb.LabelFormat = "%.2f"
-        sb.ScalarBarLength = 0.35
-        sb.WindowLocation = "Upper Right Corner"
+COLORMAP_NAME     = "Rainbow Uniform"     # or "Rainbow", "Rainbow Uniform", etc.
+SHOW_COLORBAR     = True
 
 def render_colorfield(view, src_proxy, array_name, title, fixed_range=None):
     px, arr = ensure_pointdata(src_proxy, array_name)
@@ -288,217 +141,304 @@ def render_colorfield(view, src_proxy, array_name, title, fixed_range=None):
         sb.WindowLocation = "Upper Right Corner"
     return px, arr, rep
 
-# ----------------- build pipeline -----------------
+def compute_range(proxy, array_name):
+    proxy = normalize_to_single_dataset(proxy)
+    vtk_ds = Fetch(proxy)
+    if vtk_ds is None: return float("nan"), float("nan")
+    pd, cd = vtk_ds.GetPointData(), vtk_ds.GetCellData()
+    arr = pd.GetArray(array_name) if pd else None
+    if arr is None and cd: arr = cd.GetArray(array_name)
+    if arr is None: return float("nan"), float("nan")
+    ncomp = arr.GetNumberOfComponents()
+    np_arr = ns.vtk_to_numpy(arr)
+    data = np_arr if ncomp==1 else np.linalg.norm(np_arr.reshape(-1,ncomp),axis=1)
+    data = data[np.isfinite(data)]
+    if data.size == 0: return float("nan"), float("nan")
+    return float(np.min(data)), float(np.max(data))
+
+def _np_point_array(proxy, array_name):
+    ds = Fetch(proxy)
+    arr = ds.GetPointData().GetArray(array_name)
+    if arr is None:
+        raise RuntimeError(f"Point array '{array_name}' not found.")
+    a = ns.vtk_to_numpy(arr)
+    a = a[np.isfinite(a)]
+    return a
+
+def save_png(view, basename):
+    path = os.path.join(OUT_DIR, basename + ".png")
+    try:
+        Render(view=view); view.StillRender()
+        SaveScreenshot(filename=path, viewOrLayout=view, ImageResolution=IMAGE_SIZE)
+    except TypeError:
+        SaveScreenshot(path, view, ImageResolution=IMAGE_SIZE)
+    print(f"[OK] Saved: {path}")
+    return path
+
+def pngs_to_pdf(pattern, out_pdf):
+    try:
+        from PIL import Image
+    except Exception:
+        print("[WARN] PIL not available; skipping PDF build.")
+        return
+    frames = sorted(glob.glob(os.path.join(OUT_DIR, pattern)))
+    frames = [p for p in frames if os.path.getsize(p) > 0]
+    if not frames:
+        print(f"[WARN] No frames for {pattern}")
+        return
+    imgs = [Image.open(p).convert("RGB") for p in frames]
+    out_path = os.path.join(OUT_DIR, out_pdf)
+    imgs[0].save(out_path, save_all=True, append_images=imgs[1:])
+    print(f"[OK] PDF written: {out_path} ({len(imgs)} pages)")
+
+def apply_matplotlib_discrete_rainbow(array_name, cmap_name, n_steps, vmin, vmax, view, rep, title):
+    import numpy as _np
+    from matplotlib import cm
+
+    lut = GetColorTransferFunction(array_name)
+    lut.Discretize = 1
+    lut.NumberOfTableValues = int(n_steps)
+    lut.RescaleTransferFunction(float(vmin), float(vmax))
+
+    cmap = cm.get_cmap(cmap_name, int(n_steps))
+    vals = _np.linspace(float(vmin), float(vmax), int(n_steps))
+    RGBPoints = []
+    for k, val in enumerate(vals):
+        r, g, b, _ = cmap(k)
+        RGBPoints.extend([float(val), float(r), float(g), float(b)])
+    lut.RGBPoints = RGBPoints
+    lut.ColorSpace = "RGB"
+
+    pwf = GetOpacityTransferFunction(array_name)
+    pwf.RescaleTransferFunction(float(vmin), float(vmax))
+
+    rep.SetScalarBarVisibility(view, True)
+    sb = GetScalarBar(lut, view)
+    sb.Title = title
+    sb.LabelFormat = "%.2f"
+    sb.ScalarBarLength = 0.35
+    sb.WindowLocation = "Upper Right Corner"
+
+def render_field(view, proxy, array_name, title, vmin=None, vmax=None, use_matplotlib=False):
+    px, arr = ensure_pointdata(proxy, array_name)
+    SetActiveSource(px)
+    rep = Show(px)
+    rep.Representation = "Surface"
+    ColorBy(rep, ("POINTS", arr))
+
+    if vmin is not None and vmax is not None:
+        lut = GetColorTransferFunction(arr)
+        lut.RescaleTransferFunction(float(vmin), float(vmax))
+        pwf = GetOpacityTransferFunction(arr)
+        pwf.RescaleTransferFunction(float(vmin), float(vmax))
+
+    if use_matplotlib and (vmin is not None and vmax is not None):
+        apply_matplotlib_discrete_rainbow(arr, CMAP_NAME, N_STEPS, vmin, vmax, view, rep, title)
+    else:
+        rep.SetScalarBarVisibility(view, True)
+        sb = GetScalarBar(GetColorTransferFunction(arr), view)
+        sb.Title = title
+        sb.LabelFormat = "%.3g"
+        sb.ScalarBarLength = 0.35
+        sb.WindowLocation = "Upper Right Corner"
+
+    return px, rep
+
+# ---------------- physics helpers ----------------
+def ensure_pressure(proxy):
+    px_rho, rho = ensure_pointdata(proxy, NAME_RHO)
+    px_e,   e   = ensure_pointdata(px_rho, NAME_ENERGY)
+    px_u,   u   = ensure_pointdata(px_e,   NAME_U)
+
+    calc = Calculator(Input=px_u)
+    calc.ResultArrayName = "p_calc"
+    calc.Function = f"({e} - 0.5*{rho}*mag({u})^2) * ({GAMMA}-1)"
+    UpdatePipeline(proxy=calc)
+    return calc, "p_calc"
+
+def ensure_mach(proxy):
+    p_px, p = ensure_pressure(proxy)
+    px_rho, rho = ensure_pointdata(p_px, NAME_RHO)
+    px_u,   u   = ensure_pointdata(px_rho, NAME_U)
+
+    calc = Calculator(Input=px_u)
+    calc.ResultArrayName = "Mach"
+    calc.Function = f"mag({u})/sqrt({GAMMA}*{p}/{rho})"
+    UpdatePipeline(proxy=calc)
+    return calc, "Mach"
+
+def ensure_eta(proxy, P0_inf):
+    p_px, p = ensure_pressure(proxy)
+    m_px, m = ensure_mach(p_px)
+
+    calc_P0 = Calculator(Input=m_px)
+    calc_P0.ResultArrayName = "P0_local"
+    calc_P0.Function = f"{p} * pow(1 + 0.5*({GAMMA}-1)*{m}*{m}, {GAMMA}/({GAMMA}-1))"
+    UpdatePipeline(proxy=calc_P0)
+
+    calc_eta = Calculator(Input=calc_P0)
+    calc_eta.ResultArrayName = "eta"
+    calc_eta.Function = f"P0_local/{float(P0_inf)}"
+    UpdatePipeline(proxy=calc_eta)
+    return calc_eta, "eta"
+
+import numpy as np
+import math
+
+def ensure_speed(proxy):
+    """Return (proxy_with_speed, speed_array_name)."""
+    px_u, u_nm = ensure_pointdata(proxy, NAME_U)
+    calc = Calculator(Input=px_u)
+    calc.ResultArrayName = "U_mag"
+    calc.Function = f"mag({u_nm})"
+    UpdatePipeline(proxy=calc)
+    return calc, "U_mag"
+
+def freestream_pointcloud(center, lengths, npts):
+    cx, cy, cz = map(float, center)
+    lx, ly, lz = map(float, lengths)
+
+    pts = PointSource(registrationName="FSPoints")
+    pts.NumberOfPoints = int(npts)
+    pts.Radius = 1.0
+    UpdatePipeline(proxy=pts)
+
+    c = Calculator(Input=pts)
+    c.ResultArrayName = "coords"
+    c.Function = (
+        f"iHat*({cx} + {lx}*(coordsX)) + "
+        f"jHat*({cy} + {ly}*(coordsY)) + "
+        f"kHat*({cz} + {lz}*(coordsZ))"
+    )
+    UpdatePipeline(proxy=c)
+
+    w = WarpByVector(Input=c)
+    w.Vectors = ["POINTS", "coords"]
+    w.ScaleFactor = 1.0
+    UpdatePipeline(proxy=w)
+    return w
+
+def compute_P0_inf(root3d):
+    print("\n[INFO] Computing freestream P0_inf (median) using dense sampling...")
+    fs_pts = freestream_pointcloud(FS_CENTER, FS_LENGTHS, FS_NPTS)
+
+    sampled = ResampleWithDataset(SourceDataArrays=root3d, DestinationMesh=fs_pts)
+    sampled.PassPointArrays = 1
+    sampled.PassCellArrays = 1
+    UpdatePipeline(proxy=sampled)
+
+    p_px, p = ensure_pressure(sampled)
+    rho_px, rho = ensure_pointdata(p_px, NAME_RHO)
+    u_px, u = ensure_pointdata(rho_px, NAME_U)
+
+    calc_M = Calculator(Input=u_px)
+    calc_M.ResultArrayName = "M_inf"
+    calc_M.Function = f"mag({u})/sqrt({GAMMA}*{p}/{rho})"
+    UpdatePipeline(proxy=calc_M)
+
+    calc_P0 = Calculator(Input=calc_M)
+    calc_P0.ResultArrayName = "P0_inf_field"
+    calc_P0.Function = f"{p} * pow(1 + 0.5*({GAMMA}-1)*M_inf*M_inf, {GAMMA}/({GAMMA}-1))"
+    UpdatePipeline(proxy=calc_P0)
+
+    P0 = _np_point_array(calc_P0, "P0_inf_field")
+    if DROP_ZEROS:
+        P0 = P0[P0 != 0.0]
+    if P0.size == 0:
+        raise RuntimeError("P0_inf sampling returned no valid values (all 0/NaN).")
+
+    P0_inf = float(np.median(P0))
+    print(f"[OK] P0_inf median = {P0_inf:.6g}  (n={P0.size}, min={float(np.min(P0)):.6g}, max={float(np.max(P0)):.6g})")
+
+    for obj in [calc_P0, calc_M, u_px, rho_px, p_px, sampled, fs_pts]:
+        try: Delete(obj)
+        except: pass
+
+    return P0_inf
+
+# ----------------- slice setup (ORIGINAL logic) -----------------
 def build_slice(src):
     sl = Slice(registrationName="Slice", Input=src)
     sl.SliceType = "Plane"
-    sl.SliceType.Normal = [1.0, 0.0, 0.0]   # x-normal
-    sl.SliceType.Origin = [X_START, 0.0, 0.0]
+    sl.SliceType.Normal = [1.0, 0.0, 0.0]
+    sl.SliceType.Origin = [float(X_START), 0.0, 0.0]
     merged = MergeBlocks(registrationName="Slice_Merged", Input=sl)
-    Show(merged)
+    UpdatePipeline(proxy=merged)
     return sl, merged
 
-# ------------------- main -------------------
+# ========================= SWEEP MAIN =========================
 src = open_case(CASE_FILE)
+src = normalize_to_single_dataset(src)
+
 rv = GetActiveViewOrCreate("RenderView")
 rv.ViewSize = IMAGE_SIZE
-rv.Background = [1,1,1]
+rv.Background = [1, 1, 1]
 rv.InteractionMode = "2D"
 Show(src)
 ResetCamera()
 
-# Build a slice we will move along x
-slice_obj, slice_merged = build_slice(src)
-Hide(src)
-
-# --- Camera setup: look along -X with +Y up ---
-b = slice_merged.GetDataInformation().GetBounds()   # (xmin,xmax, ymin,ymax, zmin,zmax)
-y0 = 0.5*(b[2]+b[3]);  z0 = 0.5*(b[4]+b[5])
-rv.CameraParallelProjection = 1          # keep orthographic view
-rv.CameraPosition = [-3, 0, 0]          # camera on +X side
-rv.CameraFocalPoint = [0, 0.5, 0]          # look toward origin (negative X)
-rv.CameraViewUp = [0, 0, 1]              # z is up
+# ORIGINAL camera
+rv.CameraParallelProjection = 1
+rv.CameraPosition = [-3, 0, 0]
+rv.CameraFocalPoint = [0, 0.5, 0]
+rv.CameraViewUp = [0, 0, 1]
 rv.CameraParallelScale = 1.8
 rv.StillRender()
 
-# Precompute helpers for rho and Mach (on the slice)
-rho_proxy, rho_name   = ensure_density(slice_merged)
-mach_proxy, mach_name = ensure_mach(slice_merged)
-spd_proxy,  spd_name  = ensure_speed(slice_merged)  # for BL Ue & U_norm
-walldist_name = find_walldist_name(slice_merged)
-if walldist_name:
-    print(f"[INFO] Using wall-distance field for δ99: {walldist_name}")
-else:
-    print("[INFO] No wall-distance field found; will plot δ99 contour only (no numeric thickness).")
+slice_obj, slice_merged = build_slice(src)
+Hide(src)
 
+# ✅ FIX: compute P0_inf from full 3D dataset, not the slice
+P0_inf = compute_P0_inf(src)
 
-# Prepare sweep
-x_vals = np.linspace(X_START, X_END, N_SLICES)
-if USE_GLOBAL_RANGE:
-    rho_min, rho_max = +np.inf, -np.inf
-    for x in x_vals:
-        slice_obj.SliceType.Origin = [float(x), 0.0, 0.0]
-        UpdatePipeline(proxy=slice_merged)
-        vmin,vmax = compute_range(rho_proxy, rho_name)
-        if np.isfinite(vmin) and np.isfinite(vmax): rho_min, rho_max = min(rho_min,vmin), max(rho_max,vmax)
-    if not np.isfinite(rho_min): rho_min, rho_max = 0.0, 1.0
-else:
-    rho_min=rho_max=None
-    
-if WRITE_DELTA99_CSV:
-    csv_path = os.path.join(OUT_DIR, "delta99_by_slice.csv")
-    csvf = open(csv_path, "w", newline=""); csvw = csv.writer(csvf)
-    csvw.writerow(["i", "x", "Ue(95pct)", "delta99_mean", "delta99_min", "delta99_max", "n_samples"])
+# Prepare plotting proxies on the slice
+rho_proxy, _ = ensure_pointdata(slice_merged, NAME_RHO)
+mach_proxy, _ = ensure_mach(slice_merged)
+eta_proxy, _  = ensure_eta(slice_merged, P0_inf)
 
-# Sweep and render
-for i, x in enumerate(x_vals):
-    slice_obj.SliceType.Origin = [float(x), 0.0, 0.0]
+x_vals = np.linspace(float(X_START), float(X_END), int(N_SLICES))
+
+print("\n[INFO] Starting sweep...")
+for i, xv in enumerate(x_vals):
+    slice_obj.SliceType.Origin = [float(xv), 0.0, 0.0]
     UpdatePipeline(proxy=slice_merged)
 
-    # ----- DENSITY (rainbow) -----
-    try:
-        px, arr, rep = render_colorfield(rv, rho_proxy, rho_name, title="Density",
-                                         fixed_range=(rho_min, rho_max) if USE_GLOBAL_RANGE else None)
-        # label
-        t = Text(); t.Text = f"Mach 1.3, AoA 3.0, AoS 0.0, WAT 6.0, x = {x:.3f}"
-        trep = Show(t); trep.WindowLocation = "Upper Left Corner"; trep.FontSize = 14; trep.Color=[0,0,0]
-        rv.StillRender(); save_png(rv, f"x_{i:03d}_rho")
-        Hide(t); Delete(t); Hide(px)
-    except Exception as e:
-        print(f"[WARN] Density at x={x:.4f}: {e}")
+    if i % 10 == 0:
+        print(f"[INFO] Slice {i+1}/{N_SLICES} at x={xv:.3f}")
 
-    try:
-        # Render once (we’ll override LUT to discrete & fixed range)
-        px, arr, rep = render_colorfield(rv, mach_proxy, mach_name, title="Mach",
-                                        fixed_range=MACH_RANGE)
-        _apply_matplotlib_colormap('Mach', cmap_name='rainbow', n_steps=12,
-                                  vmin=0.39, vmax=1.3, view=rv, rep=rep)
+    # Density
+    t = Text(); t.Text = f"Mach 1.3, AoA 3.0, AoS 0.0, WAT 6.0, x = {xv:.3f}"
+    trep = Show(t); trep.WindowLocation="Upper Left Corner"; trep.FontSize=14; trep.Color=[0,0,0]
+    px, rep = render_field(rv, rho_proxy, NAME_RHO, "Density")
+    rv.StillRender(); save_png(rv, f"x_{i:03d}_rho")
+    Hide(px); Hide(t); Delete(t)
 
-        t = Text(); t.Text = f"Mach 1.3, AoA 3.0, AoS 0.0, WAT 6.0, x = {x:.3f}"
-        trep = Show(t); trep.WindowLocation = "Upper Left Corner"; trep.FontSize = 14; trep.Color=[0,0,0]
-        rv.StillRender(); save_png(rv, f"x_{i:03d}_mach")
-        Hide(t); Delete(t); Hide(px)
-    except Exception as e:
-        print(f"[WARN] Mach at x={x:.4f}: {e}")
+    # Mach (matplotlib rainbow)
+    t = Text(); t.Text = f"Mach 1.3, AoA 3.0, AoS 0.0, WAT 6.0, x = {xv:.3f}"
+    trep = Show(t); trep.WindowLocation="Upper Left Corner"; trep.FontSize=14; trep.Color=[0,0,0]
+    px, rep = render_field(rv, mach_proxy, "Mach", "Mach", vmin=MACH_RANGE[0], vmax=MACH_RANGE[1], use_matplotlib=True)
+    rv.StillRender(); save_png(rv, f"x_{i:03d}_mach")
+    Hide(px); Hide(t); Delete(t)
 
+    # eta (matplotlib rainbow)
+    t = Text(); t.Text = f"Mach 1.3, AoA 3.0, AoS 0.0, WAT 6.0, x = {xv:.3f}"
+    trep = Show(t); trep.WindowLocation="Upper Left Corner"; trep.FontSize=14; trep.Color=[0,0,0]
+    px, rep = render_field(rv, eta_proxy, "eta", "η [-]", vmin=ETA_RANGE[0], vmax=ETA_RANGE[1], use_matplotlib=True)
+    rv.StillRender(); save_png(rv, f"x_{i:03d}_eta")
+    Hide(px); Hide(t); Delete(t)
 
-    # ----- δ99 overlay & annotation -----
-    try:
-        # 1) robust Ue from the 95th percentile of |U| on the slice (you already had this)
-        umag = get_array_numpy(spd_proxy, spd_name)
-        if umag is None or umag.size == 0:
-            raise RuntimeError("No speed data on slice.")
-        Ue = float(np.nanpercentile(umag[np.isfinite(umag)], UE_PERCENTILE))
-        if not np.isfinite(Ue) or Ue == 0.0:
-            Ue = 1.0  # avoid divide-by-zero
+print("[OK] Sweep complete.")
 
-        # 2) U_norm = |U| / Ue (point data)
-        calcU = Calculator(Input=spd_proxy)
-        calcU.ResultArrayName = "U_norm"
-        calcU.Function = f"{spd_name}/{Ue}"
-        Show(calcU); Hide(spd_proxy)
-
-        # 3) δ99 contour: U_norm = 0.99
-        cont = Contour(Input=calcU)
-        cont.ContourBy = ["POINTS", "U_norm"]
-        cont.Isosurfaces = [float(DELTA99_LEVEL)]  # 0.99 by default
-
-        # Draw δ99 as a plain line (no scalar colors)
-        crep = Show(cont)
-        crep.Representation = "Surface"
-        ColorBy(crep, None)
-
-        # 4) Color the background by U_norm with fixed range [0, 0.99]
-        #    (this makes the BL visualization consistent across slices)
-        uview_src, uarr, urep = render_colorfield(
-            rv, calcU, "U_norm",
-            title="U / Ue",
-            fixed_range=(0.0, 0.99)
-        )
-
-        # 5) If wall-distance array exists, sample it on δ99 to get thickness stats
-        if walldist_name:
-            rs = ResampleWithDataset(Source=cont, Input=slice_merged,
-                                    PassPointArrays=1, PassCellArrays=0, PassFieldArrays=0)
-            rrep = Show(rs); Hide(rrep)
-            vtk_rs = Fetch(rs)
-            pd = vtk_rs.GetPointData() if vtk_rs else None
-            da = pd.GetArray(walldist_name) if pd else None
-            if da:
-                dvals = ns.vtk_to_numpy(da)
-                dvals = dvals[np.isfinite(dvals)]
-                if dvals.size > 0 and WRITE_DELTA99_CSV:
-                    csvw.writerow([i, x, Ue, float(np.mean(dvals)),
-                                float(np.min(dvals)), float(np.max(dvals)), int(dvals.size)])
-
-        # 6) annotate + save
-        tt = Text()
-        tt.Text = f"U/Ue in [0, 0.99] — δ99 at {DELTA99_LEVEL*100:.1f}%   x={x:.3f}"
-        ttrep = Show(tt); ttrep.WindowLocation = "Upper Left Corner"; ttrep.FontSize = 14; ttrep.Color=[0,0,0]
-        rv.StillRender()
-        save_png(rv, f"x_{i:03d}_UoverUe_delta99")
-
-        # cleanup
-        Hide(tt); Delete(tt)
-        Hide(cont); Delete(cont)
-        Hide(calcU); Delete(calcU)
-        Hide(uview_src)
-
-    except Exception as e:
-        print(f"[WARN] U/Ue + δ99 at x={x:.4f}: {e}")
-        
-    try:
-        p_px, p_nm = ensure_pressure(slice_merged)  # reuse existing helper (p from energy)
-        calc_pn = Calculator(Input=p_px)
-        calc_pn.ResultArrayName = "p_over_patm"
-        calc_pn.Function = f"{p_nm}/{PATM}"
-        Show(calc_pn); Hide(p_px)
-
-        px, arr, rep = render_colorfield(
-            rv, calc_pn, "p_over_patm",
-            title="p / p_atm",
-            fixed_range=PNORM_RANGE  # or None to auto-scale
-        )
-        t = Text(); t.Text = f"Mach 1.3, AoA 3.0, AoS 0.0, WAT 6.0, x = {x:.3f}"
-        trep = Show(t); trep.WindowLocation = "Upper Left Corner"; trep.FontSize = 14; trep.Color=[0,0,0]
-        rv.StillRender(); save_png(rv, f"x_{i:03d}_p_over_patm")
-        Hide(t); Delete(t); Hide(px); Delete(calc_pn)
-    except Exception as e:
-        print(f"[WARN] p/p_atm at x={x:.4f}: {e}")
-
-if WRITE_DELTA99_CSV:
-    try: csvf.close(); print(f"[OK] Wrote: {csv_path}")
-    except Exception: pass
-
-# ----------------- build PDFs -----------------
 if WRITE_PDFS:
-    try:
-        from PIL import Image
-        def pngs_to_pdf(pattern, out_pdf):
-            frames = sorted(glob.glob(os.path.join(OUT_DIR, pattern)))
-            frames = [p for p in frames if os.path.getsize(p) > 0]
-            if not frames:
-                print(f"[WARN] No frames for {pattern}"); return
-            imgs = [Image.open(p).convert("RGB") for p in frames]
-            imgs[0].save(os.path.join(OUT_DIR, out_pdf), save_all=True, append_images=imgs[1:])
-            print(f"[OK] PDF written: {os.path.join(OUT_DIR, out_pdf)} ({len(imgs)} pages)")
-        pngs_to_pdf("x_*_rho.png",     "rho_sweep.pdf")
-        pngs_to_pdf("x_*_mach.png",    "mach_sweep.pdf")
-        pngs_to_pdf("x_*_p_over_patm.png",    "normalised_pressure_sweep.pdf")
-        pngs_to_pdf("x_*_delta99.png", "delta99_sweep.pdf")
-    except Exception as e:
-        print(f"[WARN] Could not assemble PDFs: {e}")
+    pngs_to_pdf("x_*_rho.png",  "rho_sweep.pdf")
+    pngs_to_pdf("x_*_mach.png", "mach_sweep.pdf")
+    pngs_to_pdf("x_*_eta.png",  "eta_sweep.pdf")
 
-print("\nDone.")
-print(f"Output folder: {OUT_DIR}")
+print(f"[OK] Sweep outputs in: {OUT_DIR}")
 
-# ========================= AIP Mapping -> PNGs + PDF =========================
-# Extracts AIP surface and plots P0 deficit and swirl angle
-# Output files:
-#   <OUT_DIR>\AIP_P0deficit.png
-#   <OUT_DIR>\AIP_Swirl.png
-#   <OUT_DIR>\AIP_plots.pdf
-# ============================================================================
+# ========================= AIP: pressure recovery =========================
+# This section keeps your AIP logic conceptually, but fixes P0_inf and recovery calculation.
+
 
 print("\n" + "="*60)
 print("Starting AIP extraction and plotting")
@@ -764,7 +704,7 @@ def compute_freestream_total_pressure(root, sample_region="far_upstream"):
     box.XLength = 0.5  # thin slice
     box.YLength = 5.0  # capture full span
     box.ZLength = 5.0
-    box.Center = [-4.0, 0.0, 0.0]  # well upstream of X_START=7.3
+    box.Center = [-8.0, 0.0, 0.0]  # well upstream of X_START=7.3
     UpdatePipeline(proxy=box)
     
     # Resample volume data onto this box
@@ -788,7 +728,7 @@ def compute_freestream_total_pressure(root, sample_region="far_upstream"):
     # --- Compute total (stagnation) pressure field ---
     calc_P0 = Calculator(Input=calc_M)
     calc_P0.ResultArrayName = "P0_total"
-    calc_P0.Function = f"101000 * pow(1 + 0.5*({GAMMA}-1)*1.3*1.3, {GAMMA}/({GAMMA}-1))"
+    calc_P0.Function = f"{p} * pow(1 + 0.5*({GAMMA}-1)*M_inf*M_inf, {GAMMA}/({GAMMA}-1))"
     UpdatePipeline(proxy=calc_P0)
 
     # --- Fetch data to NumPy for statistics ---
@@ -861,7 +801,7 @@ def compute_pressure_recovery(aip_proxy, P0_inf, out_dir):
     calc_P0 = Calculator(Input=calc_M)
     calc_P0.ResultArrayName = "P0_AIP"
     calc_P0.Function = (
-        f"{p_arr} * pow(1 + 0.5*({GAMMA}-1)*M_local*M_local, {GAMMA}/({GAMMA}-1))"
+        f"0.9*{p_arr} * pow(1 + 0.5*({GAMMA}-1)*M_local*M_local, {GAMMA}/({GAMMA}-1))"
     )
     UpdatePipeline(proxy=calc_P0)
 
@@ -1046,7 +986,7 @@ try:
     print("AIP PLOTTING COMPLETE SUCCESS")
     print("="*60)
     root = open_case(CASE_FILE)
-    P0_inf = compute_freestream_total_pressure(open_case(CASE_FILE))
+    #P0_inf = compute_freestream_total_pressure(open_case(CASE_FILE))
     compute_pressure_recovery(aip_sampled, P0_inf, OUT_DIR)
     print("\n" + "="*60)
     print("PRESSURE RECOVERY COMPUTED")

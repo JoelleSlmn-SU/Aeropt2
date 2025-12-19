@@ -28,6 +28,43 @@ def _capsule_from_hwnd(hwnd: int, name: bytes = b"HWND"):
     PyCapsule_New.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
     return PyCapsule_New(ctypes.c_void_p(hwnd), name, None)
 
+def face_to_bspline(face_like):
+    """
+    Given a TopoDS_Face-like object, return a Geom_BSplineSurface,
+    or None if the underlying surface is not a BSpline.
+
+    Handles both:
+      - h_surf being a handle with .GetObject()
+      - h_surf being a concrete Geom_Surface / Geom_BSplineSurface
+    """
+    face = _as_face(face_like)
+    if face is None:
+        return None
+
+    # Get the geometric surface from the face
+    h_surf = BRep_Tool.Surface_s(face)
+    if h_surf is None:
+        return None
+
+    # Newer bindings often return the surface directly; older return a handle.
+    surf = h_surf.GetObject() if hasattr(h_surf, "GetObject") else h_surf
+
+    # Try to downcast to Geom_BSplineSurface
+    try:
+        bs = Geom_BSplineSurface.DownCast(surf)
+    except Exception:
+        bs = None
+
+    # Some bindings let DownCast return None even when surf is already a BSpline
+    if bs is None and isinstance(surf, Geom_BSplineSurface):
+        bs = surf
+
+    if bs is None:
+        # Not a BSpline surface
+        return None
+
+    return bs
+
 def _as_face(shape_obj):
     """
     Cast a TopoDS_Shape (face-like) into a TopoDS_Face.
@@ -81,15 +118,15 @@ def _bspline_poles_from_face(face_like):
     if h_surf is None:
         return None
 
-    surf = h_surf.GetObject()
+    surf = h_surf.GetObject() if hasattr(h_surf, "GetObject") else h_surf
 
     try:
         bs = Geom_BSplineSurface.DownCast(surf)
     except Exception:
         bs = None
 
-    if bs is None:
-        return None
+    if bs is None and isinstance(surf, Geom_BSplineSurface):
+        bs = surf
 
     nu = bs.NbUPoles()
     nv = bs.NbVPoles()

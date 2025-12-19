@@ -1,37 +1,27 @@
-# remote_opt.py
-import os, json, time, posixpath, sys, re, subprocess
+# remoteOpt.py - FIXED FOR CLUSTER EXECUTION
+# ----------------------------------------------------------------------
+# This script runs ON THE CLUSTER (not your local machine)
+# It uses ClusterPipelineManager instead of HPCPipelineManager
+# ----------------------------------------------------------------------
+
+import os, json, time, sys, re, subprocess
 import numpy as np
 
-script_dir = os.path.dirname(os.path.abspath(__file__))  # .../something/Remote
+# Add project paths
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(script_dir)  # Assuming remoteOpt.py is in Scripts/
 
-root = script_dir
-project_root = None
-for _ in range(5):  # climb up at most 5 levels just to be safe
-    candidate = os.path.join(root, "Optimisation")
-    if os.path.isdir(candidate):
-        project_root = root
-        break
-    new_root = os.path.dirname(root)
-    if new_root == root:
-        break
-    root = new_root
+for subdir in ["", "Optimisation", "FileRW", "Remote", "MeshGeneration"]:
+    path = os.path.join(project_root, subdir) if subdir else project_root
+    if path not in sys.path:
+        sys.path.insert(0, path)
 
-if project_root is None:
-    # Fallback: just assume two levels up is project root
-    project_root = os.path.dirname(os.path.dirname(script_dir))
-
-# Put project_root and common subpackages on sys.path
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
-
-for sub in ("FileRW", "Optimisation", "ConvertFileType", "MeshGeneration", "Remote"):
-    sub_path = os.path.join(project_root, sub)
-    if os.path.isdir(sub_path) and sub_path not in sys.path:
-        sys.path.insert(0, sub_path)
+# Import cluster-side pipeline (NO SSH)
+from pipeline_cluster import ClusterPipelineManager
 
 
-# --- Helpers
 def _log(msg, log_path):
+    """Log to both stdout and file"""
     print(msg, flush=True)
     try:
         with open(log_path, "a") as f:
@@ -39,217 +29,308 @@ def _log(msg, log_path):
     except Exception:
         pass
 
+
 def _cond_tag(cond):
-    return f"AoA{cond.get('AoA')}_M{cond.get('Mach',1.0)}_Re{int(cond.get('Re',0))}_T{cond.get('TurbModel',0)}"
+    """Create filesystem-safe tag for condition"""
+    return f"AoA{cond.get('AoA',0)}_M{cond.get('Mach',1.0)}_Re{int(cond.get('Re',0))}_T{cond.get('TurbModel',0)}"
 
-def _solutions_dir(remote_root, n):
-    return posixpath.join(remote_root, "solutions", f"n_{n}")
 
-def _metrics_path(remote_root, n, tag):
-    return posixpath.join(_solutions_dir(remote_root, n), f"{tag}", "liftdrag.res")
+def _metrics_path(remote_root, n, cond_index: int):
+    """Path to metrics file for a given test and condition index (1-based)"""
+    return os.path.join(
+        remote_root,
+        "solutions",
+        f"n_{n}",
+        f"cond_{cond_index}",
+        "corner.rsd",
+    )
 
-def _safe_mkdir(p):
-    os.makedirs(p, exist_ok=True)
-
-def run_cmd(cmd, cwd=None):
-    return subprocess.run(cmd, shell=True, cwd=cwd, check=False, capture_output=True, text=True)
-
-# --- Headless TestManager (no Qt, no SSH)
-class HeadlessTestManager:
-    def __init__(self, remote_root, poll_s=120, concurrent_tests=0, logger=None):
-        self.remote_root = remote_root.rstrip("/") + "/"
-        self.poll_s = int(max(10, poll_s))
-        self.concurrent_tests = int(max(0, concurrent_tests))
-        self.jobs = {}
-        self.logger = logger or (lambda m: None)
-
-    def _alloc_n_index(self, gen_num, local_idx):
-        return int(gen_num) * 1_000_000 + int(local_idx)
-
-    def _start_one(self, n_index, x, conds):
-        # x is the BO design vector (modal coefficients)
-        x_list = list(map(float, x))
-
-        driver = f"""#!/usr/bin/env python3
-    import os, json
-    from pipeline_remote import HPCPipelineManager
-
-    # Design vector (Bayesian Optimiser sample) → modal coefficients
-    X = {x_list!r}
-
-    # Minimal mesh_viewer stub that just carries modal_coeffs.
-    class MeshViewerStub:
-        def __init__(self, coeffs):
-            # interpret coeffs as Laplacian modal coefficients
-            self.modal_coeffs = list(coeffs)
-
-    # Fake a tiny main_window-like shim for HPCPipelineManager
-    class MW:
-        def __init__(self, remote_root, coeffs):
-            self.ssh_client = None
-            self.remote_output_dir = remote_root
-            # simple logger shim
-            self.logger = type("L", (), {{"log": staticmethod(print)}})()
-            self.input_file_path = os.path.join(remote_root, "orig", "corner.vtm")
-            self.input_directory = remote_root
-            self.output_directory = remote_root
-            # stuff used by morph() / runSurfMorph()
-            self.mesh_viewer = MeshViewerStub(coeffs)
-            self.geo_viewer = None
-
-    mw = MW("{self.remote_root}", X)
-    pipe = HPCPipelineManager(mw, n={n_index})
-
-    # Once remoteMorph/runSurfMorph are wired to controlNodeDisp.getDisplacements(..., coeffs=X),
-    # this will produce a morphed FRO specific to this design.
-
-    morph_id = pipe.morph()
-    v = pipe.volume()
-    p = pipe.prepro(runafter=v)
-    for i, cond in enumerate({json.dumps(conds)}, 1):
-        pipe.solver(cond, nc=i)
+class ClusterTestManager:
     """
+    Test manager that runs ON THE CLUSTER.
+    Uses ClusterPipelineManager (no SSH/SFTP).
+    """
+    def __init__(self, remote_root, base_name, input_dir, executables, poll_s=120, morph_basis_json="", units="mm"):
+        self.remote_root = os.path.abspath(remote_root)
+        self.base_name = base_name
+        self.input_dir = input_dir
+        self.executables = executables
+        self.poll_s = int(max(10, poll_s))
+        self.jobs = {}
+        self.morph_basis_json = morph_basis_json or ""
+        self.units = units
+        
+        # Create logs directory
+        self.log_dir = os.path.join(self.remote_root, "logs")
+        os.makedirs(self.log_dir, exist_ok=True)
+    
+    def _alloc_n_index(self, gen_num, local_idx):
+        """Generate unique n-index for (generation, design) pair"""
+        return int(gen_num) * 1_000_000 + int(local_idx)
+    
+    def _start_one(self, n_index, x, conds):
+        """Start pipeline for one design point"""
+        print(f"[CLUSTER-TM] Starting n={n_index} with x={x}", flush=True)
+        
+        self.remote_output = self.remote_root
+        # Build config for ClusterPipelineManager
+        config = {
+            "remote_output": self.remote_output,
+            "base_name": self.base_name,
+            "input_dir": self.input_dir,
+            "modal_coeffs": list(map(float, x)),  # BO design vector
+            "morph_basis_json": self.morph_basis_json,
+            "cad_units": self.units,
+            **self.executables,
+        }
 
-        run_dir = os.path.join(self.remote_root, "headless", f"n_{n_index}")
-        _safe_mkdir(run_dir)
-        drv_path = os.path.join(run_dir, "submit_one.py")
-        with open(drv_path, "w") as f:
-            f.write(driver)
-
-        bf = os.path.join(run_dir, "batchfile_submit_one")
-        with open(bf, "w") as f:
-            f.write("\n".join([
-                "#!/bin/bash -l",
-                f"#SBATCH --job-name=opt_n{n_index}",
-                f"#SBATCH --output=opt_n{n_index}.out",
-                f"#SBATCH --error=opt_n{n_index}.err",
-                "#SBATCH --time=3-00:00",
-                "#SBATCH --nodes=1",
-                "#SBATCH --ntasks=1",
-                "source ~/.bashrc",
-                "set -euo pipefail",
-                f"python3 {drv_path}"
-            ]) + "\n")
-
-        out = run_cmd(f"sbatch {bf}", cwd=run_dir)
-        jid = ""
-        if "Submitted batch job" in out.stdout:
-            jid = out.stdout.strip().split()[-1]
-        self.jobs[n_index] = jid
-        self.logger(f"[HEADLESS] Submitted n={n_index} → job {jid}")
-
-    # Exposed to BO
+        # Use n_index as the pipeline's "gen"/n-directory
+        pipe = ClusterPipelineManager(config, gen=0, n=n_index)
+        
+        # Submit jobs in sequence with dependencies
+        try:
+            morph_id = pipe.morph(n=n_index)           # <- pass n_index through
+            vol_id = pipe.volume(runafter=morph_id)
+            pre_id = pipe.prepro(runafter=vol_id)
+            
+            # Submit solver for each condition
+            sol_ids = []
+            for i, cond in enumerate(conds, 1):
+                jid = pipe.solver(cond, nc=i)
+                sol_ids.append(jid)
+            
+            self.jobs[n_index] = {
+                "morph": morph_id,
+                "volume": vol_id,
+                "prepro": pre_id,
+                "solvers": sol_ids
+            }
+            
+            print(f"[CLUSTER-TM] Submitted n={n_index} â†’ jobs={self.jobs[n_index]}", flush=True)
+            return sol_ids[-1]  # Return last solver job for dependency chaining
+            
+        except Exception as e:
+            print(f"[CLUSTER-TM] ERROR starting n={n_index}: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            return None
+    
     def init_generation(self, X_list, gen_num, conds):
-        plan = [(self._alloc_n_index(gen_num, i+1), list(map(float, x))) for i, x in enumerate(X_list)]
-        if self.concurrent_tests > 0:
-            for i in range(0, len(plan), self.concurrent_tests):
-                chunk = plan[i:i+self.concurrent_tests]
-                for n_index, x in chunk:
-                    self._start_one(n_index, x, conds)
-        else:
-            for n_index, x in plan:
-                self._start_one(n_index, x, conds)
-
+        """Submit all designs for a generation"""
+        print(f"[CLUSTER-TM] Initializing generation {gen_num} with {len(X_list)} designs", flush=True)
+        
+        for i, x in enumerate(X_list):
+            n_index = self._alloc_n_index(gen_num, i+1)
+            self._start_one(n_index, x, conds)
+    
     def evaluate_generation(self, X_list, gen_num, conds):
-        # Wait for all liftdrag.res files to appear, then parse.
-        tags = [_cond_tag(c) for c in conds]
+        """Wait for all results and parse them"""
+        num_conds = len(conds)
+        tags = [_cond_tag(c) for c in conds]  # still useful for logging if you want
+        
+        # Build list of required result files
         need = []
-        for i,_x in enumerate(X_list, 1):
+        for i, x in enumerate(X_list, 1):
             n_index = self._alloc_n_index(gen_num, i)
-            for t in tags:
-                need.append((_metrics_path(self.remote_root, n_index, t), n_index, t))
-
-        self.logger(f"[HEADLESS] Waiting for {len(need)} results…")
-        unfinished = set(p for (p,_,_) in need)
+            for nc in range(1, num_conds + 1):
+                path = _metrics_path(self.remote_root, n_index, nc)
+                need.append((path, n_index, nc))
+        
+        print(f"[CLUSTER-TM] Waiting for {len(need)} result files...", flush=True)
+        
+        # Poll until all files exist
+        unfinished = set(p for (p, _, _) in need)
         while unfinished:
             done = {p for p in list(unfinished) if os.path.exists(p)}
             unfinished -= done
             if unfinished:
+                print(f"[CLUSTER-TM] Still waiting for {len(unfinished)} files...", flush=True)
                 time.sleep(self.poll_s)
-
+        
+        print(f"[CLUSTER-TM] All results ready!", flush=True)
+        
         def parse_one(path):
             try:
                 with open(path, "r") as f:
                     lines = f.read().splitlines()
+                # Find last valid line with numbers
                 last = None
                 for raw in reversed(lines):
                     toks = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", raw)
                     if len(toks) >= 4:
-                        last = toks; break
-                if not last: return {"CL":0.0,"CD":1e9,"CM":0.0}
-                drag_over_q = float(last[3])
-                CD = drag_over_q
-                CL = float(last[2]) if len(last)>2 else 0.0
-                CM = float(last[1]) if len(last)>1 else 0.0
-                return {"CL":CL,"CD":CD,"CM":CM}
-            except Exception:
-                return {"CL":0.0,"CD":1e9,"CM":0.0}
-
+                        last = toks
+                        break
+                if not last:
+                    return {"CL": 0.0, "CD": 1e9, "CM": 0.0}
+                # adjust column mapping if needed
+                CL = float(last[1])
+                CD = float(last[2])
+                CM = float(last[3])
+                return {"CL": CL, "CD": CD, "CM": CM}
+            except Exception as e:
+                print(f"[CLUSTER-TM] Error parsing {path}: {e}", flush=True)
+                return {"CL": 0.0, "CD": 1e9, "CM": 0.0}
+        
+        # Collect results per design
         results = []
-        for i,_x in enumerate(X_list, 1):
+        for i, x in enumerate(X_list, 1):
             n_index = self._alloc_n_index(gen_num, i)
-            per_cond = [parse_one(_metrics_path(self.remote_root, n_index, t)) for t in tags]
+            per_cond = []
+            for nc in range(1, num_conds + 1):
+                path = _metrics_path(self.remote_root, n_index, nc)
+                m = parse_one(path)
+                per_cond.append(m)
             results.append(per_cond)
+        
         return results
 
-def main():    
+
+def main():
     if len(sys.argv) < 2:
-        print("usage: remote_opt.py <remote_run_dir>", flush=True)
+        print("Usage: remoteOpt.py <run_directory>", flush=True)
         sys.exit(2)
-    run_dir = sys.argv[1]
+    
+    run_dir = os.path.abspath(sys.argv[1])
     log_path = os.path.join(run_dir, "remote_opt.log")
-    _safe_mkdir(run_dir)
-
-    # Load configs written by the GUI
-    with open(os.path.join(run_dir, "bo_settings.json")) as f:
+    os.makedirs(run_dir, exist_ok=True)
+    
+    _log(f"[REMOTE-OPT] Starting in {run_dir}", log_path)
+    
+    # Load configurations
+    settings_path = os.path.join(run_dir, "bo_settings.json")
+    objective_path = os.path.join(run_dir, "objective.json")
+    
+    if not os.path.exists(settings_path):
+        _log(f"[ERROR] Settings file not found: {settings_path}", log_path)
+        sys.exit(1)
+    
+    if not os.path.exists(objective_path):
+        _log(f"[ERROR] Objective file not found: {objective_path}", log_path)
+        sys.exit(1)
+    
+    with open(settings_path) as f:
         settings_json = json.load(f)
-    with open(os.path.join(run_dir, "objective.json")) as f:
+    
+    with open(objective_path) as f:
         objective = json.load(f)
-
-    # Map strings → classes for kernel & acquisition (simple dispatch)
+        
+    morph_basis_json = settings_json.get("morph_basis_json", "")
+    
+    _log(f"[REMOTE-OPT] Loaded settings: {settings_json}", log_path)
+    _log(f"[REMOTE-OPT] Loaded objective: {objective}", log_path)
+    
+    # Import BO components
     from Optimisation.BayesianOptimisation.optimiser import BayesianOptimiser
     from Optimisation.BayesianOptimisation.kernels import (
-        RBFKernel, SquaredExponentialKernel, ExponentialKernel, Mat12Kern, Mat32Kern, Mat52Kern
+        RBFKernel, SquaredExponentialKernel, ExponentialKernel, 
+        Mat12Kern, Mat32Kern, Mat52Kern
     )
     from Optimisation.BayesianOptimisation.acquisition_functions import EI, POI, UCB
-
+    
+    # Map string names to classes
     kern_map = {
-        "RBFKernel": RBFKernel, "Squared Exponential Kernel": SquaredExponentialKernel,
-        "Exponential Kernel": ExponentialKernel, "Mat12Kern": Mat12Kern,
-        "Mat32Kern": Mat32Kern, "Mat52Kern": Mat52Kern
+        "RBFKernel": RBFKernel,
+        "Squared Exponential Kernel": SquaredExponentialKernel,
+        "Exponential Kernel": ExponentialKernel,
+        "Mat12Kern": Mat12Kern,
+        "Mat32Kern": Mat32Kern,
+        "Mat52Kern": Mat52Kern
     }
-    acq_map = {"Expected Improvement": EI, "Probability of Improvement": POI, "Upper Confidence Bound": UCB}
-
+    
+    acq_map = {
+        "Expected Improvement": EI,
+        "Probability of Improvement": POI,
+        "Upper Confidence Bound": UCB
+    }
+    
+    # Prepare settings
     settings = dict(settings_json)
     settings["kernel"] = kern_map[settings_json["kernel"]]
     settings["acquisition_function"] = acq_map[settings_json["acquisition_function"]]
-    settings["sim_dir"] = run_dir if settings.get("sim_dir","") == "" else settings["sim_dir"]
-
+    settings["sim_dir"] = run_dir
+    
+    # Get conditions and weights
     conds = objective.get("conditions", [])
     weights = [c.get("Weight", 1.0) for c in conds]
-
-    tm = HeadlessTestManager(remote_root=run_dir.rsplit("/postprocessed/",1)[0] if "/postprocessed/" in run_dir else run_dir)
-
+    
+    _log(f"[REMOTE-OPT] Conditions: {conds}", log_path)
+    _log(f"[REMOTE-OPT] Weights: {weights}", log_path)
+    
+    # Determine remote root (parent of run_dir usually)
+    # Adjust this based on your directory structure
+    remote_root = os.path.dirname(run_dir)
+    base_name = settings_json.get("base_name", "model")
+    input_dir = settings_json.get("input_dir", os.path.join(remote_root, "orig"))
+    cad_units = settings_json.get("units", "mm")
+    
+    # Executable paths (customize for your cluster)
+    executables = {
+        "parallel_domains": settings_json.get("parallel_domains", 1),
+        "surface_mesher": "/home/s.o.hassan/XieZ/work/Meshers/volume/src/a.Surf3D",
+        "volume_mesher": "/home/s.o.hassan/XieZ/work/Meshers/volume/src/a.Mesh3D",
+        "prepro_exe": "/home/s.o.hassan/bin/Gen3d_jj",
+        "solver_exe": "/home/s.o.hassan/bin/UnsMgnsg3d",
+        "combine_exe": "/home/s.engevabj/codes/utilities/makeplot2",
+        "ensight_exe": "/home/s.engevabj/codes/utilities/engen_tet",
+        "splitplot_exe": "/home/s.engevabj/codes/utilities/splitplot2",
+        "makeplot_exe": "/home/s.engevabj/codes/utilities/makeplot2",
+        "intel_module": "module load compiler/intel/2020/0",
+        "gnu_module": "module load compiler/gnu/12/1.0",
+        "mpi_intel_module": "module load mpi/intel/2020/0",
+    }
+    
+    # Create test manager (uses ClusterPipelineManager internally)
+    tm = ClusterTestManager(
+        remote_root=remote_root,
+        base_name=base_name,
+        input_dir=input_dir,
+        executables=executables,
+        poll_s=settings_json.get("poll_interval", 120),
+        morph_basis_json=morph_basis_json,
+        units = cad_units,
+    )
+    
+    # Define init and eval functions for BO
     def init_func(X_list, gen_num):
-        _log(f"[REMOTE-OPT] init gen {gen_num}: {len(X_list)} designs", log_path)
+        _log(f"[REMOTE-OPT] Initializing generation {gen_num}: {len(X_list)} designs", log_path)
         tm.init_generation(X_list, gen_num, conds)
-
+    
     def eval_func(X_list, gen_num):
-        _log(f"[REMOTE-OPT] eval gen {gen_num}", log_path)
+        _log(f"[REMOTE-OPT] Evaluating generation {gen_num}", log_path)
         per_design = tm.evaluate_generation(X_list, gen_num, conds)
-        # Reduce per-condition metrics → scalar objective using weights
+        
+        # Reduce per-condition metrics to scalar objective
         Y = []
         for metrics in per_design:
-            # Simple example: sum(weights * CD); customise as needed
             y = 0.0
             for w, m in zip(weights, metrics):
                 y += float(w) * float(m.get("CD", 1e9))
             Y.append(y)
+        
+        _log(f"[REMOTE-OPT] Generation {gen_num} objectives: {Y}", log_path)
         return np.array(Y, dtype=float)
-
+    
+    # Run Bayesian Optimization
+    _log("[REMOTE-OPT] Starting Bayesian Optimization...", log_path)
     bo = BayesianOptimiser(settings, eval_func=eval_func, init_func=init_func)
     X_best, Y_best = bo.optimise(cont=True)
-    _log(f"[REMOTE-OPT] DONE. Best X={X_best}  Y={Y_best}", log_path)
+    
+    _log(f"[REMOTE-OPT] OPTIMIZATION COMPLETE!", log_path)
+    _log(f"[REMOTE-OPT] Best X = {X_best}", log_path)
+    _log(f"[REMOTE-OPT] Best Y = {Y_best}", log_path)
+    
+    # Save final results
+    results_file = os.path.join(run_dir, "optimization_results.json")
+    with open(results_file, "w") as f:
+        json.dump({
+            "X_best": X_best.tolist() if hasattr(X_best, 'tolist') else X_best,
+            "Y_best": float(Y_best),
+            "settings": settings_json,
+            "objective": objective
+        }, f, indent=2)
+    
+    _log(f"[REMOTE-OPT] Results saved to {results_file}", log_path)
+
 
 if __name__ == "__main__":
     main()

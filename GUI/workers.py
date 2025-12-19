@@ -71,11 +71,17 @@ class VolumeWorker(QObject):
     def run(self):
         result = None
         try:
-            self.log.emit("[INFO] Starting volume mesh...")
-            if getattr(self.pipeline.viewer_geom.main_window, "run_mode", "Local") == "HPC":
-                self.pipeline.volume()
-            else:
-                self.pipeline.volume()
+            self.log.emit("[INFO] Starting surface mesh...")
+
+            # Handle both local (viewer_geom) and HPC (geo_viewer)
+            viewer_geom = getattr(self.pipeline, "viewer_geom", None)
+            if viewer_geom is None:
+                viewer_geom = getattr(self.pipeline, "geo_viewer", None)
+
+            run_mode = getattr(getattr(viewer_geom, "main_window", None), "run_mode", "Local")
+            # At the moment you call volume() in both branches anyway
+            self.pipeline.volume()
+
             self.finished.emit(result)
         except Exception as e:
             self.failed.emit(str(e))

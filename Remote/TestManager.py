@@ -174,8 +174,8 @@ class TestManager:
         # MAKE BO X DRIVE THE MORPH
         self.main_window.mesh_viewer.modal_coeffs = list(map(float, x))
 
-        pipe = HPCPipelineManager(self.main_window, n=n_index, debug=True)
-        pipe.morph()
+        pipe = HPCPipelineManager(self.main_window, n=gen_num, debug=True)
+        pipe.morph(n=n_index)
         vol_id = pipe.volume()
         pre_id = pipe.prepro()
 

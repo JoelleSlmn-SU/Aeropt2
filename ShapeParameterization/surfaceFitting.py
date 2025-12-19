@@ -16,6 +16,20 @@ sys.path.append(os.path.dirname('ConvertFileType'))
 sys.path.append(os.path.dirname('MeshGeneration'))
 from FileRW.saveDatFile import *
 
+def farthest_point_sampling(points, n):
+        points = np.asarray(points)
+        sampled = [np.random.randint(len(points))]  # start with a random point
+        distances = np.full(len(points), np.inf)
+
+        for _ in range(1, n):
+            last_point = points[sampled[-1]]
+            dist = np.linalg.norm(points - last_point, axis=1)
+            distances = np.minimum(distances, dist)
+            next_idx = np.argmax(distances)
+            sampled.append(next_idx)
+
+        return points[sampled]
+
 def evaluate_r2(x, y, z, surface):
     # Compute R2 value for fitting
     evalpts = np.array(surface.evalpts)
@@ -189,7 +203,7 @@ def runSurfaceFitting(path, output_dir):
 
     return points, interpolated_xyz, nurbs_surf
 
-def selectControlNodes(path, output_dir, num_control_nodes=20):
+'''def selectControlNodes(path, output_dir, num_control_nodes=20):
     
     def farthest_point_sampling(points, n):
         points = np.asarray(points)
@@ -211,5 +225,75 @@ def selectControlNodes(path, output_dir, num_control_nodes=20):
     
     controlNodes = farthest_point_sampling(points, num_control_nodes)
 
+    return points, controlNodes'''
+
+def selectControlNodes(path, output_dir, num_control_nodes=20):
+
+    def farthest_point_sampling(points, n):
+        print("Control Nodes selected using farthest point.")
+        points = np.asarray(points)
+        sampled = [np.random.randint(len(points))]
+        distances = np.full(len(points), np.inf)
+        for _ in range(1, n):
+            last_point = points[sampled[-1]]
+            dist = np.linalg.norm(points - last_point, axis=1)
+            distances = np.minimum(distances, dist)
+            next_idx = np.argmax(distances)
+            sampled.append(next_idx)
+        return points[sampled]
+
+    def bump_center_from_plane_residual(points: np.ndarray,
+                                        frac: float = 0.03,
+                                        min_pts: int = 30) -> np.ndarray:
+        """
+        Estimate bump center as weighted centroid of the most out-of-plane points.
+        - frac: fraction of points considered 'bump' (top |d|)
+        """
+        pts = np.asarray(points, dtype=float)
+        if pts.shape[0] < 10:
+            return pts.mean(axis=0)
+
+        c = pts.mean(axis=0)
+        X = pts - c
+
+        # PCA plane normal = smallest singular vector
+        _, _, vt = np.linalg.svd(X, full_matrices=False)
+        n = vt[-1]
+        n /= (np.linalg.norm(n) + 1e-15)
+
+        d = X @ n
+        ad = np.abs(d)
+
+        # choose top frac points by |distance|
+        k = max(int(frac * len(pts)), min_pts)
+        k = min(k, len(pts))
+        idx = np.argpartition(ad, -k)[-k:]
+
+        bump_pts = pts[idx]
+        w = ad[idx]
+        w = w / (w.sum() + 1e-15)
+
+        center = (bump_pts * w[:, None]).sum(axis=0)
+        return center
+
+    def nearest_point(points: np.ndarray, target: np.ndarray) -> np.ndarray:
+        pts = np.asarray(points, dtype=float)
+        t = np.asarray(target, dtype=float).reshape(1, 3)
+        # fast enough; if huge, use cKDTree
+        i = int(np.argmin(np.linalg.norm(pts - t, axis=1)))
+        return pts[i:i+1]
+
+
+    mesh = pv.read(path)
+    mesh = mesh.clean(tolerance=1e-8)
+    points = mesh.points
+
+    if int(num_control_nodes) == 1:
+        ctr = bump_center_from_plane_residual(points, frac=0.03, min_pts=30)
+        controlNodes = nearest_point(points, ctr)
+    else:
+        controlNodes = farthest_point_sampling(points, num_control_nodes)
+
     return points, controlNodes
+
 

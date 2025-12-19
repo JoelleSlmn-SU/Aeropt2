@@ -20,7 +20,7 @@ from Utilities.PointClouds import *
 
 class MorphModelBase:
     """Base class definition of all parameters required to define a morph"""
-    def __init__(self, f_name=None, con=False, pb=None, path=None, f=None, T=None, U=None, cn=[], dispVector=[]):
+    def __init__(self, f_name=None, con=False, pb=None, path=None, f=None, T=None, U=None, C=None, cn=[], dispVector=[]):
         self.f_name      = f_name
         self.path        = path
         self.constraint  = con
@@ -46,9 +46,13 @@ class MorphModelBase:
         self.u_surfaces  = U if U is not None else []
         
         self.c_surfaces = []
+        self.c_surfaces = C if C is not None else []
         
         self.control_nodes = [] if cn is None else cn
-        self.displacement_vector = [] if dispVector is None else dispVector        
+        self.displacement_vector = [] if dispVector is None else dispVector      
+        
+        self.alpha_support = 0.25  # fraction of T-surface size used as support radius (tune 0.1–0.5)
+        self.rbf_lambda = 1e-10   
         
         
 class MorphModel(MorphModelBase):
@@ -140,94 +144,190 @@ class MorphModel(MorphModelBase):
         retval += f"DV: Displacement Vector = {len(self.displacement_vector)}\n"
         return retval
     
-    def transformT(self, t_verts):
+    def get_tc_anchor_gids(self, ff):
+        t = set(self.get_t_node_gids(ff))
+        c = set(self.get_c_node_gids(ff))
+        anchors = sorted(t & c)
+        return anchors
+    
+    def get_tc_anchor_gids(self, ff):
+        t = set(self.get_t_node_gids(ff))
+        c = set(self.get_c_node_gids(ff))
+        anchors = sorted(t & c)
+        return anchors
+
+    def get_tc_boundary_only(self, ff):
+        """Get only the nodes that are BOTH in T AND in C (the actual boundary)"""
+        t_set = set(self.get_t_node_gids(ff))
+        c_set = set(self.get_c_node_gids(ff))
+        
+        print("len(t_set) =", len(t_set))
+        print("len(c_set) =", len(c_set))
+        print("overlap T∩C =", len(t_set & c_set))
+        
+        # Only nodes that are in T AND have at least one C neighbor
+        boundary = []
+        for t_node in t_set:
+            neighbors = ff.node_connections.get(t_node, [])
+            if any(n in c_set for n in neighbors):
+                boundary.append(t_node)
+        
+        return boundary
+    
+    def transformT(
+        self,
+        t_verts,
+        anchor_points=None,
+        tol=1e-9,
+        # Anchor “strength” controls (robust across geometries)
+        anchor_subsample=12,     # keep every Nth anchor (3 is a good default)
+        anchor_soft=0,       # 0 = hard zero anchors, 0.1 = allow 10% motion at anchors
+        anchor_strength=1,      # DO NOT duplicate anchors by default (over-damps easily)
+        # Optional displacement smoothing (helps residual ridges without clamping)
+        smooth_iters=0,         # 0 disables
+        smooth_k=12,
+        smooth_strength=0.20,   # 0..1
+    ):
+        """
+        Constrained/soft-anchored RBF morph for T surface.
+
+        Key idea:
+        - Control nodes impose the desired displacement
+        - Anchor points impose a *soft* (not necessarily zero) displacement, so they don't over-damp
+        - No post-mask ramp multiplication (avoids “ramp ridge” artefacts)
+
+        Defaults chosen to work well with 1–O(10) control nodes and O(100–1000) anchors.
+
+        Parameters:
+        anchor_subsample : keep every Nth anchor (reduces over-constraint)
+        anchor_soft      : fraction of mean control displacement used at anchors (0..1)
+        anchor_strength  : repeats anchor constraints (weighting). Keep at 1 unless you *need* stiffer seam.
+        """
         import numpy as np
-        from sklearn.neighbors import NearestNeighbors
 
-        if self.control_nodes is None or len(self.control_nodes) == 0:
-            raise ValueError("No control nodes defined in MorphModel")
+        if not self.control_nodes or self.displacement_vector is None:
+            return np.asarray(t_verts, float).tolist()
 
+        # ----- control sources -----
         source = np.asarray(self.control_nodes, dtype=float)
         disp   = np.asarray(self.displacement_vector, dtype=float)
 
         if source.ndim == 1:
             source = source.reshape(1, -1)
-        if source.shape[0] == 0:
-            raise ValueError("No control nodes available for transformation")
+        if disp.ndim == 1:
+            disp = disp.reshape(1, -1)
 
-        if disp.size == 0:
-            # nothing to do
-            return np.asarray(t_verts, float).tolist()
+        if source.shape[0] != disp.shape[0]:
+            raise ValueError(f"Control-node count ({source.shape[0]}) != displacement count ({disp.shape[0]})")
 
-        # --- choose basis & shape parameter consistently ---
+        T_raw = np.asarray(t_verts, float)
+        if T_raw.size == 0:
+            return []
+
+        # ----- anchor constraints (soft displacement) -----
+        source_aug = source
+        disp_aug   = disp
+
+        if anchor_points is not None and len(anchor_points) > 0:
+            B = np.asarray(anchor_points, float)
+            if B.ndim == 1:
+                B = B.reshape(1, -1)
+
+            # Subsample anchors to avoid over-constraining (VERY important when few control nodes)
+            if anchor_subsample and anchor_subsample > 1:
+                B = B[::int(anchor_subsample), :]
+
+            # Remove anchors that coincide with a control node to avoid contradictory constraints
+            try:
+                from scipy.spatial import cKDTree
+                treeS = cKDTree(source)
+                dmin, _ = treeS.query(B, k=1)
+                B = B[dmin > (10 * tol)]
+            except Exception:
+                pass
+
+            if len(B) > 0:
+                # Soft anchor displacement = anchor_soft * mean(control displacement)
+                # (keeps seam “mostly fixed” but prevents global over-damping)
+                anchor_soft = float(np.clip(anchor_soft, 0.0, 1.0))
+                disp_mean = np.mean(disp, axis=0, keepdims=True)   # (1,3)
+                Z = np.repeat(disp_mean, len(B), axis=0) * anchor_soft
+
+                # Optional extra weighting via duplication (keep = 1 by default)
+                if anchor_strength and anchor_strength > 1:
+                    rep = int(anchor_strength)
+                    B = np.repeat(B, rep, axis=0)
+                    Z = np.repeat(Z, rep, axis=0)
+
+                source_aug = np.vstack([source, B])
+                disp_aug   = np.vstack([disp,   Z])
+
+        # ---------------- Surface-dependent scaling ----------------
+        mins = T_raw.min(axis=0)
+        maxs = T_raw.max(axis=0)
+        L = float(np.linalg.norm(maxs - mins))
+        L = max(L, 1e-9)
+
+        center = T_raw.mean(axis=0)
+        S = (source_aug - center) / L
+        T = (T_raw     - center) / L
+
         bf = get_bf(self.bf_t)
-        bf_name = getattr(bf, "__name__", str(bf)).lower()
 
-        # spacing scale (robust to outliers): kth-NN distance averaged
-        N = len(source)
-        k_support = min(10, max(3, N - 1))
-        nn = NearestNeighbors(n_neighbors=k_support + 1).fit(source)
-        dists, _ = nn.kneighbors(source)       # (N, k+1) with col0=0
-        d_k = float(np.median(dists[:, k_support]))  # median is stabler than mean
-
-        # Normalize coordinates to improve conditioning
-        scale = max(d_k, 1e-9)
-        S = (source - source.mean(axis=0)) / scale
-        T = (np.asarray(t_verts, float) - source.mean(axis=0)) / scale
-
-        # kernel parameter (single coherent convention):
-        # assume bf expects φ(c * r). For compact kernels, set c = 1/R with R = α d_k
-        alpha = float(getattr(self, "alpha_support", 1.8))
-        if "wendland" in bf_name:
-            R = alpha  # in normalized space, R ≈ alpha (since d_k -> 1)
-            c = 1.0 / R
-        elif "gauss" in bf_name or "gaussian" in bf_name:
-            # Gaussian: φ(exp(-(c r)^2)). Use moderate width in normalized units
-            c = 1.5
-        elif "thin_plate" in bf_name or "tps" in bf_name:
-            c = 1.0  # ignored by TPS
-        else:
-            # e.g., multiquadric/inverse multiquadric: pick moderate c
-            c = 1.0
-
+        alpha = float(getattr(self, "alpha_support", 0.25))
+        c = 1.0 / max(alpha, 1e-6)
         c *= float(getattr(self, "c_mod_t", 1.0))
 
-        # Regularization (helps duplicates / near-singularity)
-        lam = float(getattr(self, "rbf_lambda", 1e-10))
+        bfs = [bf] * 3
+        cs  = [c]  * 3
 
-        # Try your custom trainer first, with consistent params
+        S_list = S.tolist()
+        D_list = disp_aug.tolist()
+
         try:
-            ls, bs, _ = train_3d(S, disp, [bf]*3, [c]*3, reg_lambda=lam)  # add reg if your train supports it
-            pred = predict_3d(ls, bs, S, T, [bf]*3, [c]*3)
-        except Exception as e:
-            # Fallback: SciPy’s RBFInterpolator (local + smoothing for robustness)
+            ls, bs, conds = train_3d(
+                S_list, D_list, bfs, cs,
+                reg_lambda=float(getattr(self, "rbf_lambda", 0.0))
+            )
+        except TypeError:
+            ls, bs, conds = train_3d(S_list, D_list, bfs, cs)
+
+        pred = predict_3d(ls, bs, S_list, T.tolist(), bfs, cs)
+        pred = np.asarray(pred, float)
+
+        # ---------------- Optional: smooth the displacement field ----------------
+        if smooth_iters and smooth_iters > 0 and smooth_strength and smooth_strength > 0:
             try:
-                from scipy.interpolate import RBFInterpolator
-                # local RBF: set neighbors to limit O(n^3) cost; smoothing avoids singularity
-                neighbors = min(64, max(10, S.shape[0]))
-                pred = np.zeros_like(T)
-                for d in range(3):
-                    rbf = RBFInterpolator(
-                        S, disp[:, d],
-                        kernel=("thin_plate_spline" if "thin" in bf_name else "cubic"),
-                        neighbors=neighbors,
-                        smoothing=max(lam, 1e-12)
-                    )
-                    pred[:, d] = rbf(T)
-            except Exception as e2:
-                raise RuntimeError(f"RBF fit failed (custom: {e}; scipy: {e2})")
+                from scipy.spatial import cKDTree
+                kdt = cKDTree(T_raw)
+                _, idx = kdt.query(T_raw, k=min(int(smooth_k) + 1, len(T_raw)))
+                idx = idx[:, 1:]  # drop self
+                lam = float(np.clip(smooth_strength, 0.0, 1.0))
+                for _ in range(int(smooth_iters)):
+                    nbr_mean = pred[idx].mean(axis=1)
+                    pred = (1.0 - lam) * pred + lam * nbr_mean
+            except Exception:
+                pass
 
-        # de-normalize displacements: displacement scales in the same units as coords
-        t_verts_t = (np.asarray(t_verts, float) + pred).tolist()
+        # ---------------- Optional: “nearly fixed” anchors (project to nearest T nodes) ----------------
+        # If you want anchors closer to the seam to be more fixed than soft anchors allow, set anchor_soft smaller
+        # or uncomment below to softly clamp a small subset.
+        # if anchor_points is not None and len(anchor_points) > 0:
+        #     try:
+        #         from scipy.spatial import cKDTree
+        #         treeT = cKDTree(T_raw)
+        #         B0 = np.asarray(anchor_points, float)
+        #         if B0.ndim == 1:
+        #             B0 = B0.reshape(1, -1)
+        #         d, j = treeT.query(B0, k=1)
+        #         # Hard clamp only very-close points
+        #         pred[j[d <= (10*tol)]] *= 0.0
+        #     except Exception:
+        #         pass
 
-        # quick sanity log (optional)
-        if hasattr(self, "logger"):
-            nz = np.count_nonzero(np.linalg.norm(pred, axis=1) > 1e-9)
-            self.logger.log(f"[Morph] transformT: nonzero {nz}/{len(pred)}; "
-                            f"||disp||_max={np.linalg.norm(pred,axis=1).max():.3e}; "
-                            f"c={c:.3g}, lam={lam:.1e}")
-        return t_verts_t
-        
+        return (T_raw + pred).tolist()
+
+
     def get_nodes(self, sections, surfaces, faces, nodes, ff):
         g_ids = []
 
@@ -540,3 +640,34 @@ class MorphModel(MorphModelBase):
         # Dict creation is slower; only do this if callers truly require a dict
         return dict(zip(b_idx.tolist(), b_xyz.tolist()))
 
+class MorphModelCAD(MorphModelBase):
+    """
+    CAD-oriented morph model.
+
+    Same basic parameters as MorphModel but without any FroFile-specific
+    helpers. This will be used alongside a CAD-FFD layer that knows how
+    to interpret the control-node displacements on the CAD surfaces.
+    """
+    def __init__(self, f_name=None, con=False, pb=None, path=None,
+                 T=None, U=None, cn=None, displacement_vector=None):
+        super().__init__(
+            f_name=f_name,
+            con=con,
+            pb=pb if pb is not None else [],
+            path=path,
+            T=T if T is not None else [],
+            U=U if U is not None else [],
+            cn=cn if cn is not None else [],
+            dispVector=displacement_vector if displacement_vector is not None else [],
+        )
+        self.face_roles = {}   # e.g. {face_id: FaceRole.T/C/U}
+        self.logger = None
+
+    def set_control_data(self, control_nodes, displacement_vector):
+        self.control_nodes = control_nodes or []
+        self.displacement_vector = displacement_vector or []
+
+    def validate_control_data(self):
+        if not self.control_nodes or not self.displacement_vector:
+            return False
+        return len(self.control_nodes) == len(self.displacement_vector)

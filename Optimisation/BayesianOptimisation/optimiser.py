@@ -38,8 +38,8 @@ class BayesianOptimiser:
         
         self.n_dim   = settings.get('n_dim', 1)
         self.n_obj   = settings.get('n_obj', 1)
-        self.lb      = settings.get('lb', np.zeros(self.n_dim))
-        self.ub      = settings.get('ub', np.ones(self.n_dim))
+        raw_lb = settings.get('lb', None)
+        raw_ub = settings.get('ub', None)
         self.sim_dir = settings.get("sim_dir", "")
         self.kernel  = settings.get("kernel", Mat52Kern)
         self.count_limit = settings.get("count_limit", 5)
@@ -47,6 +47,16 @@ class BayesianOptimiser:
         self.acquisition_function = settings.get("acquisition_function", EI)
         self.mll_maxfevals = settings.get("mll_maxfevals", 10000)
         self.af_maxfevals = settings.get("af_maxfevals", 10000)
+
+        if raw_lb is None:
+            self.lb = np.zeros(self.n_dim, dtype=float)
+        else:
+            self.lb = np.asarray(raw_lb, dtype=float)
+
+        if raw_ub is None:
+            self.ub = np.ones(self.n_dim, dtype=float)
+        else:
+            self.ub = np.asarray(raw_ub, dtype=float)
 
         self.mac = MultiArrayCsvFile(f"{self.sim_dir}bo_data.mcsv")
         kern    = self.kernel(lengthscale=1.0, noise_variance=1.0)
@@ -60,7 +70,13 @@ class BayesianOptimiser:
         if not os.path.exists(self.sim_dir):
             os.makedirs(self.sim_dir)
 
-        self.logger = GuiLogger(output_dir_func=f"{self.sim_dir}output.log")
+        log_path = os.path.join(self.sim_dir, "aeropt.log")
+        self.logger = GuiLogger(
+            text_widget=None,                      # no Qt widget in remote_opt
+            output_dir_func=lambda: log_path,      # where to write the log file
+            is_hpc_func=lambda: False,             # treat as local FS, no SFTP
+            sftp_client_func=lambda: None          # no SSH client in this context
+        )
         self.logger.log("Optimising using Bayesian Optimisation with settings: ")
         self.logger.log(f"Number of dimensions: {settings['n_dim']}")
         self.logger.log(f"Number of objectives: {settings['n_obj']}")

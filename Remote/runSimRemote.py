@@ -98,10 +98,10 @@ class RemoteClient:
         finally:
             sftp.close()
 
-        # absolute interpreter in your env (login & batch safe)
-        self.python_local = f"/scratch/{username}/mamba-root/envs/aeropt-py310/bin/python"
+        self.python_local = posixpath.join(self.remote_home, ".conda/envs/aeropt-hpc/bin/python")
         self.server = posixpath.join(self.remote_home, "aeropt", "Scripts")
 
+        # Environment is already created by `conda env create -f environment.yml`
         self.install_remote_requirements()
 
     def _ensure_remote_dir(self, sftp, path):
@@ -113,59 +113,37 @@ class RemoteClient:
                 sftp.stat(cur)
             except IOError:
                 sftp.mkdir(cur)
-
+    
     def install_remote_requirements(self):
-        # quick no-op if you're on the conda env already
-        if "/envs/aeropt-py310/bin/python" in self.python_local:
-            if self.logger:
-                self.logger.log(f"[HPC] Using env python: {self.python_local} (skip pip install)")
-            return
-
-        req_path = posixpath.join(self.server, "requirements_hpc.txt")
-        pip_cmd = (
-            f"{self.python_local} -m pip install -U 'pip<24.1' wheel setuptools && "
-            f"{self.python_local} -m pip install -r {req_path} --upgrade --no-cache-dir"
-        )
         if self.logger:
-            self.logger.log("[HPC] Installing requirements...")
-        wrapped = f'bash -lc "source ~/.bashrc; {pip_cmd}"'
-        _stdin, _stdout, _stderr = self.ssh_client.exec_command(wrapped)
-        err = _stderr.read().decode().strip()
-        out = _stdout.read().decode().strip()
-        if err:
-            if self.logger: self.logger.log(f"[HPC] Pip error:\n{err}")
-        else:
-            if self.logger: self.logger.log(f"[HPC] Installed:\n{out}")
-
-        # also drop a helper installer
-        installer = f"""#!/bin/bash
-set -euo pipefail
-source ~/.bashrc
-\"{self.python_local}\" -m pip install -U pip==23.2.1 wheel setuptools
-\"{self.python_local}\" -m pip install -r \"{req_path}\" --upgrade --no-cache-dir
-"""
-        sftp = self.ssh_client.open_sftp()
-        try:
-            self._ensure_remote_dir(sftp, self.server)
-            script_path = posixpath.join(self.server, "install_hpc_reqs.sh")
-            with sftp.open(script_path, "w") as f:
-                f.write(installer)
-            sftp.chmod(script_path, 0o755)
-        finally:
-            sftp.close()
-
-        self.ssh_client.exec_command(f'bash -lc "{posixpath.join(self.server, "install_hpc_reqs.sh")}"')
-
+            self.logger.log("[HPC] install_remote_requirements: skipped (using pre-built aeropt-hpc conda env).")
+        return
 
 # ----------------------------
 # core upload + config writer
 # ----------------------------
 def _ensure_remote_dirs_and_upload_mesh(viewer, remoteCli, n, logger):
-    """Creates $HOME/aeropt/aeropt_out/<run>/surfaces/n_<n>, uploads VTK/VTM/FRO."""
+    """
+    Creates $HOME/aeropt/aeropt_out/<run>/surfaces/n_<n>, uploads VTK/VTM/FRO.
+
+    Robust to MeshViewer variants that store the mesh path as either
+    `input_filepath` (old) or `mesh_path` (new).
+    """
     username = viewer.main_window.ssh_creds["username"]
     ssh = viewer.main_window.ssh_client
 
-    # ensure base remote output dir on the GUI side
+    # --- figure out where the baseline mesh is on the GUI side ---
+    mesh_path = getattr(viewer, "input_filepath", None)
+    if not mesh_path:
+        mesh_path = getattr(viewer, "mesh_path", None)
+
+    if not mesh_path:
+        raise AttributeError(
+            "MeshViewer has no 'input_filepath' or 'mesh_path'. "
+            "Load a baseline surface mesh in the Mesh tab before running morph."
+        )
+
+    # --- ensure base remote output dir on the GUI side ---
     if not hasattr(viewer.main_window, "remote_output_dir"):
         from datetime import datetime
         run_id = datetime.now().strftime("auto_%Y%m%d_%H%M%S")
@@ -177,23 +155,22 @@ def _ensure_remote_dirs_and_upload_mesh(viewer, remoteCli, n, logger):
 
     ssh.exec_command(f"bash -lc 'mkdir -p {rdir_sh}'")
 
-    # upload mesh (supports .vtm + sidecar)
-    base_name = os.path.basename(viewer.input_filepath)
+    base_name = os.path.basename(mesh_path)
     ext = os.path.splitext(base_name)[1].lower()
 
     if ext == ".vtm":
-        tgz_local = _tar_vtm_dataset(viewer.input_filepath)
+        tgz_local = _tar_vtm_dataset(mesh_path)
         remote_tgz = posixpath.join(rdir_abs, "mesh_bundle.tar.gz")
         sftp = ssh.open_sftp()
         sftp.put(tgz_local, remote_tgz)
         sftp.close()
         ssh.exec_command(f"bash -lc 'cd {rdir_sh} && tar -xzf mesh_bundle.tar.gz'")
-        vtk_upload_name = base_name  # crm.vtm is now present in rdir
+        vtk_upload_name = base_name  # e.g. crm.vtm now present in rdir
         _in, _out, _err = ssh.exec_command(f"bash -lc 'ls -l {rdir_sh}'")
         logger.log(f"[HPC DEBUG] After extract, {rdir_sh}:\n{_out.read().decode()}")
     elif ext in (".vtu", ".vtk", ".fro"):
         sftp = ssh.open_sftp()
-        sftp.put(viewer.input_filepath, posixpath.join(rdir_abs, base_name))
+        sftp.put(mesh_path, posixpath.join(rdir_abs, base_name))
         sftp.close()
         vtk_upload_name = base_name
         _in, _out, _err = ssh.exec_command(f"bash -lc 'ls -l {rdir_sh}'")
@@ -314,12 +291,16 @@ def _build_local_displacements_like_local(viewer, logger):
 def _write_and_upload_config(viewer, ssh, rdir_sh, rdir_abs, vtk_upload_name, ext,
                              n, out_dir, cn_aug, d_aug, t_ids, u_ids, c_ids, logger):
     """Write morph_config locally and upload to remote n_<n> directory."""
+    source = getattr(viewer.main_window, "control_node_source", "mesh")
+    morph_kind = "cad" if source == "cad" else "mesh"
+
     morph_config = {
         "mesh filetype": ext,
         "vtk_name": vtk_upload_name,
-        "output_directory": out_dir,      # may contain $HOME; remoteMorph reconstructs path
+        "output_directory": out_dir,
         "n": int(n),
         "debug": bool(True),
+        "morph_kind": morph_kind,
         "t_surfaces": t_ids,
         "u_surfaces": u_ids,
         "c_surfaces": c_ids,
@@ -355,16 +336,6 @@ def _submit_batch(viewer, ssh, remoteCli, rdir_sh, vtk_upload_name, remote_json_
     project_root = "$HOME/aeropt/Scripts"
     fro_target   = posixpath.join(rdir_sh, os.path.splitext(vtk_upload_name)[0] + ".fro")
 
-    bf.lines.append('#!/bin/bash -l')
-    bf.lines.append('source ~/.bashrc')
-    bf.lines.append(': "${PROMPT_COMMAND:=}"   # avoid bashrc appends tripping -u')
-    bf.lines.append(': "${PYTHONPATH:=}"       # seed PYTHONPATH if unset')
-    bf.lines.append('set -euo pipefail')
-
-    bf.lines.append('export SSL_CERT_FILE=/etc/pki/tls/certs/ca-bundle.crt')
-
-    # Use ${PYTHONPATH:-} so set -u doesn't explode when PYTHONPATH is unset.
-    # Avoid f-strings here (or escape braces) to keep ${...} literal.
     bf.lines.append('export PYTHONPATH="' + project_root + ':${PYTHONPATH:-}"')
 
     bf.lines.append('cd "' + project_root + '/Remote"')
@@ -460,6 +431,34 @@ def runSurfMorph(viewer, n=0, debug=True, run_as_batch=False):
     if err: logger.log(f"[HPC] Morph stderr: {err}")
 
     return None  # immediate path returns None (like before)
+
+
+def runCadMorph(geo_viewer, n=0, debug=True, run_as_batch=True):
+    """
+    CAD-driven morph on the cluster.
+
+    The CAD FFD machinery has already populated control nodes and other
+    parameters onto the MeshViewer via Geometry → 'Save control-node settings'.
+
+    We simply delegate to runSurfMorph using the MeshViewer, but we
+    tag morph_kind='cad' in the JSON (see _write_and_upload_config).
+    """
+    main = geo_viewer.main_window
+    mesh_viewer = getattr(main, "mesh_viewer", None)
+
+    if mesh_viewer is None:
+        raise RuntimeError("[HPC][CAD] runCadMorph: main_window.mesh_viewer is None; cannot run CAD-driven morph.")
+
+    logger = getattr(geo_viewer, "logger", None) or getattr(mesh_viewer, "logger", None)
+    if logger:
+        logger.log("[HPC][CAD] runCadMorph: using MeshViewer baseline mesh with CAD-derived control nodes.")
+
+    # This will:
+    #  1) upload the mesh,
+    #  2) build displacements from mesh_viewer.control_nodes + T/U/C,
+    #  3) write morph_config_n_<n>.json (with morph_kind='cad'),
+    #  4) submit sbatch on remoteMorph.py and return jobid if run_as_batch=True.
+    return runSurfMorph(mesh_viewer, n=n, debug=debug, run_as_batch=run_as_batch)
 
 
 # ----------------------------

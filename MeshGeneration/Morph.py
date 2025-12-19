@@ -128,7 +128,7 @@ class DummyLogger:
     def log(self, msg):
         print(msg)
 
-def MorphMesh(m_0:FroFile, base_name, morph_model, viewer, output_dir, debug=True, rb="original"):
+def MorphMesh(m_0:FroFile, base_name, morph_model, viewer, output_dir, debug=True, rb="original", n=0, gen = 0):
     """
         m_0   : FroFile 
         m     : MorphModel
@@ -159,7 +159,27 @@ def MorphMesh(m_0:FroFile, base_name, morph_model, viewer, output_dir, debug=Tru
     # Step 2 - f(t)
     logger.log(f"STEP 2 - Translating ")
     t_gtl, t_verts = morph_model.get_t_node_vertices(m_0)
-    t_verts_t      = morph_model.transformT(t_verts)
+    b_ct = morph_model.GetTIndepBoundaries(m_0)  # {boundary_id: [gids]}
+
+    # Get ONLY the T nodes that actually touch C (the real boundary)
+    anchor_gids = morph_model.get_tc_boundary_only(m_0)
+    anchor_points = [m_0.nodes[g] for g in anchor_gids]
+    logger.log(f"[STEP2] anchors (T∩C boundary) = {len(anchor_gids)} / |T|={len(t_gtl)}")
+
+    # Debug: check if we have proper anchors
+    if len(anchor_gids) == 0:
+        logger.log(f"[WARNING] No T-C boundary nodes found! All T nodes will be free to move.")
+    elif len(anchor_gids) == len(t_gtl):
+        logger.log(f"[WARNING] All T nodes are on boundary! No interior nodes to displace.")
+        
+    t_set = set(morph_model.get_t_node_gids(m_0))
+    c_set = set(morph_model.get_c_node_gids(m_0))
+    anchor_gids = [g for g in t_set 
+                if any(n in c_set for n in m_0.node_connections.get(g, []))]
+    anchor_points = [m_0.nodes[g] for g in anchor_gids]
+    logger.log(f"[STEP2] anchors (T boundary) = {len(anchor_gids)} / |T|={len(t_gtl)}")
+
+    t_verts_t = morph_model.transformT(t_verts, anchor_points=anchor_points)
     cp_before = np.array(center_point_of_vertices(t_verts))
     cp_after  = np.array(center_point_of_vertices(t_verts_t))
     cp_diff   = cp_after-cp_before
@@ -284,82 +304,92 @@ def MorphMesh(m_0:FroFile, base_name, morph_model, viewer, output_dir, debug=Tru
     # Step 4 - if u - propogate into u, fixing boundarys and limits?
     u_gtl = {}          # ensure defined even if there are no U nodes
     u_verts_m = []
-    logger.log(f"STEP 4 - Propogate into u.")
+    logger.log(f"STEP 4 - Propagate into u.")
     if len(morph_model.get_u_node_gids(m_0)) > 0:
         u_gtl, u_verts = morph_model.get_u_node_vertices(m_0)
+        u_verts = np.asarray(u_verts, float)
         u_verts_m = u_verts.copy()
-        
-        b_c  = morph_model.GetIndepBoundaries(m_0)
 
-        logger.log(f"STEP 4 - b_c keys = {b_c.keys()}")
-        b_c_verts_t = [] # VIS
-        S = []
-        F = []
-        
+        # --- Build training set from T displacement field ---
+        t_verts_np   = np.asarray(t_verts, float)
+        t_verts_m_np = np.asarray(t_verts_m, float)
+        T_disp = (t_verts_m_np - t_verts_np)   # (Nt,3)
 
-        # work out which nodes lay on constrained boundarys
-        for x in b_c.keys():
-            for g_id in b_c[x]:
-                if g_id in u_gtl:
-                    S = S + [u_verts[u_gtl[g_id]]]
-                    F = F + [[0.0,0.0,0.0]]
-        
-        # work out displacement for each node on unconstrained boundarys. 
-        b_ct  = morph_model.GetTIndepBoundaries(m_0)
-        logger.log(f"STEP 4 - b_ct keys = {b_ct.keys()}")
-        for x in b_ct.keys():
-            for g_id in b_ct[x]:
-                s = [t_verts[t_gtl[g_id]]]
-                fk = [[a-b for a,b in zip(t_verts_m[t_gtl[g_id]],t_verts[t_gtl[g_id]])]]
-                S = S + s
-                F = F + fk
-                b_c_verts_t.append(t_verts_m[t_gtl[g_id]]) # VIS
-                    
-        if len(F) > 0:
-            logger.log(f"Morphing hhhh N = {len(S)}")
-            dims = ["x", "y", "z"]
-            bfs = []
-            cs = []
-
-            # Compute distance-based scaling once
-            distances = pdist(np.array(S))
-            min_dist = np.min(distances)
-            if min_dist < 1e-8:
-                min_dist = 1e-8  # prevent division by zero or overly large c
-            logger.log(f"[DEBUG] RBF control-point pairwise distances: min={min_dist:.3e}, max={np.max(distances):.3e}")
-
-            # Choose scaling factor based on basis function
-            bf_name = step_4_bf.__name__
-            if "wendland" in bf_name:
-                c_val = 2.5 / min_dist
-            elif "thin_plate" in bf_name:
-                c_val = 50.0 / min_dist
-            elif "gaussian" in bf_name:
-                c_val = 100.0 / min_dist
+        Nt = len(t_verts_np)
+        if Nt == 0:
+            logger.log("[STEP4][WARN] No T vertices available; skipping U propagation.")
+        else:
+            # If T is large, thin it to keep training stable/fast (FPS gives good coverage)
+            n_keep = int(min(2500, Nt))   # 1000–3000 is a good general range
+            if Nt > n_keep:
+                idx = farthest_point_sampling(t_verts_np, n_keep=n_keep, seed=0)
+                S = t_verts_np[idx]
+                F = T_disp[idx]
             else:
-                c_val = np.mean(pdist(np.array(S)))
+                S = t_verts_np
+                F = T_disp
 
-            logger.log(f"[INFO] Using scaled shape parameter c = {c_val:.3e} for basis function '{bf_name}'")
+            # Deduplicate to avoid tiny-distance issues
+            S, F = dedup_sf(S, F, tol=1e-6)
 
-            # One RBF per dimension, same shape parameter
-            for i, fk in enumerate(np.array(F).T):
-                bf = step_4_bf
-                bfs.append(bf)
-                cs.append(c_val)
-                logger.log(f"  → {dims[i]}-axis: BF = {bf.__name__}, C = {c_val:.3e}")
+            # --- Scale in a geometry-robust way (use combined T+U region) ---
+            SU = np.vstack([S, u_verts])
+            mins = SU.min(axis=0)
+            maxs = SU.max(axis=0)
+            L = float(np.linalg.norm(maxs - mins))
+            L = max(L, 1e-9)
+            center = SU.mean(axis=0)
 
-            S, F = deduplicate_points(S, F)
-            logger.log(f"[INFO] Deduplicated control points: {len(S)} remain")
-                        
-            ls, bs, conds = train_3d(S, F, bfs, cs)
-            ds        = predict_3d(ls, bs, S, u_verts, bfs, cs)
-            u_verts_m = [(np.array(a)+np.array(b)).tolist() for a,b in zip(u_verts, ds)]
-            for ii in range(3):
-                eval_func   = lambda x: predict(ls[ii], bs[ii], S, [x], bf=bfs[ii], c=cs[ii])
-                avg_error_abssp, avg_error_pcsp, sd_error_pcsp, spearsp, kendalsp, rmsesp = rbf_stats(S, np.array(F).T[ii], eval_func)
-                logger.log(f"RBF: Using manually selected parameters for {dims[ii]}:")
-                logger.log(f"BF: {bfs[ii].__name__}, C: {cs[ii]}, RMSE: {rmsesp}, Spear: {spearsp}")
-                logger.log(f"matrix condition vals = {conds[ii]}")
+            S_s = (S - center) / L
+            U_s = (u_verts - center) / L
+
+            # --- Choose a NON-tiny support radius (this is the big fix) ---
+            # For compact support bf, c ≈ 1/R where R is support radius in *scaled* space.
+            # R=0.35 means a point influences ~35% of region size → smooth propagation.
+            R = float(getattr(morph_model, "u_support_radius", 0.35))   # tune 0.25–0.60
+            R = np.clip(R, 0.10, 1.50)
+            c_val = 1.0 / max(R, 1e-6)
+            c_val *= float(getattr(morph_model, "c_mod_u", 1.0))
+
+            step_4_bf = get_bf(morph_model.bf_u)
+            bfs = [step_4_bf] * 3
+            cs  = [c_val]    * 3
+
+            # Light regularisation helps avoid ripples / overshoot
+            reg = float(getattr(morph_model, "rbf_lambda_u", 1e-8))
+
+            logger.log(f"[STEP4] Training sources: {len(S_s)} (from T)")
+            logger.log(f"[STEP4] BF={step_4_bf.__name__}, R(scaled)={R:.3f}, c={c_val:.3e}, lambda={reg:.1e}")
+
+            # Train/predict
+            try:
+                ls, bs, conds = train_3d(S_s.tolist(), F.tolist(), bfs, cs, reg_lambda=reg)
+            except TypeError:
+                ls, bs, conds = train_3d(S_s.tolist(), F.tolist(), bfs, cs)
+
+            dU = np.asarray(predict_3d(ls, bs, S_s.tolist(), U_s.tolist(), bfs, cs), float)
+
+            # Optional: smooth the predicted displacement on U to remove any residual “crease”
+            smooth_iters = int(getattr(morph_model, "u_smooth_iters", 2))
+            smooth_k     = int(getattr(morph_model, "u_smooth_k", 12))
+            smooth_lam   = float(getattr(morph_model, "u_smooth_strength", 0.20))
+            if smooth_iters > 0 and smooth_lam > 0:
+                try:
+                    from scipy.spatial import cKDTree
+                    kdt = cKDTree(u_verts)
+                    _, nn = kdt.query(u_verts, k=min(smooth_k + 1, len(u_verts)))
+                    nn = nn[:, 1:]
+                    lam = np.clip(smooth_lam, 0.0, 1.0)
+                    for _ in range(smooth_iters):
+                        dU_mean = dU[nn].mean(axis=1)
+                        dU = (1.0 - lam) * dU + lam * dU_mean
+                except Exception:
+                    pass
+
+            u_verts_m = (u_verts + dU)
+
+            # Convert back to list-of-lists expected downstream
+            u_verts_m = u_verts_m.tolist()
 
 
     if debug and hasattr(viewer, "debug_plot_requested"):
@@ -387,12 +417,19 @@ def MorphMesh(m_0:FroFile, base_name, morph_model, viewer, output_dir, debug=Tru
         u_arr = np.asarray(u_verts_m, dtype=m_m.nodes.dtype)
         m_m.nodes[u_g] = u_arr[u_l]
 
+    
     print("Check 1")
-    # Recover boundary motion (this can still be heavy depending on implementation)
-    b_idx, b_xyz = morph_model.recover_boundaries_array(m_m, bt, rb=rb)
-    print("Check 2")
-    if b_idx.size:
-        m_m.nodes[b_idx] = b_xyz
+    if getattr(morph_model, "rigid_boundary_translation", False):
+        # Recover boundary motion: rigidly move C components with their attached boundaries
+        logger.log("[Morph] rigid_boundary_translation = True → applying rigid C translation")
+        b_idx, b_xyz = morph_model.recover_boundaries_array(m_m, bt, rb=rb)
+        print("Check 2")
+        if b_idx.size:
+            m_m.nodes[b_idx] = b_xyz
+    else:
+        logger.log("[Morph] rigid_boundary_translation = False → leaving C nodes fixed")
+        print("Check 2 (skipped rigid C translation)")
+
         
     
     if debug and hasattr(viewer, "debug_plot_requested"):
@@ -400,12 +437,11 @@ def MorphMesh(m_0:FroFile, base_name, morph_model, viewer, output_dir, debug=Tru
         
     logger.log("Morphing Function Complete")
     
-    n = 1
-    filename = f"{base_name}.fro"
+    filename = f"{base_name}_{n}.fro"
     
     if viewer is None:
         remote_dir = output_dir  # now guaranteed to be correct, even if viewer is None
-        remote_subdir = os.path.join(remote_dir, "surfaces", f"n_{n}")
+        remote_subdir = os.path.join(remote_dir, "surfaces", f"n_{gen}")
         os.makedirs(remote_subdir, exist_ok=True)
 
         m_m.write_file(os.path.join(remote_subdir, filename))
@@ -415,6 +451,29 @@ def MorphMesh(m_0:FroFile, base_name, morph_model, viewer, output_dir, debug=Tru
 
 def MorphVolume(m_0, morph_model, debug=False):
     pass
+
+def MorphCAD(cad_path, ffd_lattice, ffd_ctrl_disp, face_roles, out_dir, debug=False):
+    """
+    Placeholder CAD morph function.
+
+    Intended future behaviour:
+      - load CAD from cad_path,
+      - use ffd_lattice + ffd_ctrl_disp and face_roles (T/U/C)
+        to deform the model,
+      - write morphed CAD into out_dir and return its path.
+
+    For now this is a no-op: it just copies the original CAD into out_dir.
+    """
+    import os, shutil
+
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.basename(cad_path)
+    out_step = os.path.join(out_dir, base)
+    shutil.copyfile(cad_path, out_step)
+
+    print(f"[MorphCAD] WARNING: CAD morph not implemented; copied '{cad_path}' to '{out_step}'")
+    return out_step
+
 
 if __name__ == "__main__":
     print("hello?")

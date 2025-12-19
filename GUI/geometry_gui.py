@@ -2,13 +2,14 @@
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QLabel, QTableWidget, QTableWidgetItem, QDialogButtonBox, QDialog, QSlider, QListWidget,
                              QDockWidget, QAbstractItemView, QHBoxLayout, QPushButton, QMessageBox, QFileDialog, QPlainTextEdit, QLineEdit,
                              QDoubleSpinBox, QSpinBox, QListWidgetItem, QListWidget, QGroupBox, QCheckBox)
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal, QThread, QTimer, pyqtSlot, QMetaObject, Q_ARG
 import pyvista as pv
 from pyvistaqt import BackgroundPlotter
 import os, sys
 import numpy as np
-sys.path.append(os.path.dirname("FileRW"))
-from FileRW.StpFile import OCCViewer
+
+from GUI.workers import MorphWorker
+from FileRW.StpFile import OCCViewer, face_to_bspline
 from FileRW.BacFile import BacFile
 from FileRW.BppFile import BppFile
 from GUI.mesh_gui import SurfaceEditDialog
@@ -341,7 +342,7 @@ class GeometryPanel(QWidget):
 
         # State
         self.cad_path = None
-        self.cad_ffd: Optional[CADFFDManager] = None
+        self.cad_ffd = None
         self.dat_path = None
         self.dat_generated = False
         self.bpp_generated = False
@@ -436,8 +437,6 @@ class GeometryPanel(QWidget):
         self.btn_bpp.clicked.connect(self._generate_bpp)
         self.btn_surf.clicked.connect(self.run_surface_mesher)
         self.btn_vol.clicked.connect(self.run_volume_mesher)
-        
-        self.layout = QVBoxLayout(self)
 
     def _face_role_from_ui(self, face_id: int) -> FaceRole:
         """
@@ -445,39 +444,47 @@ class GeometryPanel(QWidget):
         Face names in the table are like 'Face 0', 'Face 1', ...
         """
         name = f"Face {face_id}"
-        if name in getattr(self, "T_names", []):
+        T = getattr(self, "T_names", [])
+        C = getattr(self, "C_names", [])
+        U = getattr(self, "U_names", [])
+
+        if name in T:
             return FaceRole.T
-        elif name in getattr(self, "C_names", []):
+        elif name in C:
             return FaceRole.C
-        elif name in getattr(self, "U_names", []):
+        elif name in U:
             return FaceRole.U
         else:
             # default: treat as U if not explicitly tagged
             return FaceRole.U
 
-
     def _init_cad_ffd_manager(self):
         """
         Create and initialise CADFFDManager once CAD is loaded and T/C/U are set.
+        Uses self.viewer.shape and self.viewer.faces.
         """
-        from FileRW.StpFile import StpFile
-
-        if not getattr(self, "cad_path", None):
+        if not hasattr(self, "viewer") or self.viewer.shape is None:
             if hasattr(self.main_window, "logger"):
-                self.main_window.logger.log("[CAD-FFD] No CAD file loaded.")
+                self.main_window.logger.log("[CAD-FFD] No CAD shape in viewer.")
             return
 
-        # Load STEP and get shape + faces
-        stp = StpFile(self.cad_path)
-        shape = stp.shape
-        faces = stp.get_faces()   # you already iterate faces elsewhere
+        shape = self.viewer.shape
+        faces = self.viewer.faces  # list[TopoDS_Face]
+
+        if not faces:
+            if hasattr(self.main_window, "logger"):
+                self.main_window.logger.log("[CAD-FFD] Viewer has no faces.")
+            return
 
         # Create manager
         self.cad_ffd = CADFFDManager(shape)
 
         for face_id, face in enumerate(faces):
             role = self._face_role_from_ui(face_id)
-            bspline = stp.as_bspline(face)   # you’ll need a helper that returns Geom_BSplineSurface
+            bspline = face_to_bspline(face)
+            if bspline is None:
+                # Skip non-BSpline surfaces for now
+                continue
             self.cad_ffd.register_face(face_id, face, role, bspline)
 
         # Build FFD around T faces and embed T poles
@@ -486,8 +493,7 @@ class GeometryPanel(QWidget):
 
         if hasattr(self.main_window, "logger"):
             self.main_window.logger.log("[CAD-FFD] FFD lattice built and T poles embedded.")
-
-    
+  
     def set_input_filepath(self, path):
         self.input_filepath = path
         
@@ -525,6 +531,7 @@ class GeometryPanel(QWidget):
         )
         self.use_cad_param = (reply == QMessageBox.Yes)
         self.control_nodes_ready = False
+        self.main_window.control_node_source = "cad"
 
         if self.use_cad_param:
             # Show the CAD parameterisation panel, hide mesher controls for now
@@ -548,15 +555,6 @@ class GeometryPanel(QWidget):
             if hasattr(self.main_window, "logger"):
                 self.main_window.logger.log("[GeomParam] CAD parameterisation disabled (original workflow).")
 
-    def _on_param_toggled(self, checked: bool):
-        self.param_mesh_enabled = self.cb_mesh_param.isChecked()
-        self.param_cad_enabled  = self.cb_cad_param.isChecked()
-
-        enable = (self.param_mesh_enabled or self.param_cad_enabled) and bool(
-            getattr(self, "cad_path", None)
-        )
-        self.btn_param_surfaces.setEnabled(enable)
-
     def _build_face_summary(self):
         names = [f"Face {i}" for i in range(len(self.viewer.faces))]
         self.all_cad_surface_names = names
@@ -577,22 +575,7 @@ class GeometryPanel(QWidget):
             self.main_window.addDockWidget(Qt.RightDockWidgetArea, dock)
 
         table.itemSelectionChanged.connect(self._on_row_selected)
-    
-    def _face_role_from_ui(self, face_id: int) -> FaceRole:
-        """
-        Map face index -> FaceRole using the T_names, C_names, U_names lists.
-        Face names in the table are like 'Face 0', 'Face 1', ...
-        """
-        name = f"Face {face_id}"  # matches _build_face_summary() naming
-        if name in self.T_names:
-            return FaceRole.T
-        elif name in self.C_names:
-            return FaceRole.C
-        elif name in self.U_names:
-            return FaceRole.U
-        else:
-            # default: treat as U (unaffected) if not explicitly tagged
-            return FaceRole.U
+        
     
     # ---------- CAD parameterisation helpers ----------
 
@@ -731,7 +714,7 @@ class GeometryPanel(QWidget):
             return
 
  
-                # --- CAD control-node extraction ---
+        # --- CAD control-node extraction ---
         cn_all, face_ids, face_slices = self.viewer.get_control_nodes_from_faces(T_indices)
 
         if cn_all is None or len(cn_all) == 0:
@@ -755,13 +738,20 @@ class GeometryPanel(QWidget):
             
         # ---- Now show the modal-basis + bump window forms, like plot_T_surfaces ----
         self._show_basis_form()
-        self.preview_cad_control_nodes()
-
         self.control_nodes_ready = True
         
         try:
+            # This creates CADFFDManager(shape), registers faces with T/C/U roles,
+            # builds the FFD lattice around T faces, and embeds T poles.
             self._init_cad_ffd_manager()
-            self.preview_cad_ffd_lattice()
+
+            # Precompute FFD param coords (ξ,η,ζ) for the chosen control nodes
+            if self.cad_ffd is not None and self.cad_ffd.ffd is not None:
+                cn = np.asarray(self.control_nodes, float)
+                self.control_nodes_param = self.cad_ffd.ffd.world_to_param(cn)
+
+                # Optional: show lattice + all surfaces + control nodes
+                self.preview_cad_ffd_lattice()
         except Exception as e:
             if hasattr(self.main_window, "logger"):
                 self.main_window.logger.log(f"[CAD-FFD] Init/preview failed: {e}")
@@ -950,11 +940,96 @@ class GeometryPanel(QWidget):
         plt.tight_layout()
         plt.show()
 
+    def preview_cad_control_displacements(self, dP_lattice):
+        """
+        Visualise displacements of CAD control nodes under a given
+        FFD lattice displacement field dP_lattice.
+
+        dP_lattice:
+            array with shape (nξ, nη, nζ, 3) or flat equivalent,
+            same convention as CADFFDManager.apply_design().
+        """
+        if self.cad_ffd is None or self.cad_ffd.ffd is None:
+            QMessageBox.information(self, "CAD FFD", "CAD FFD manager not initialised yet.")
+            return
+
+        if not hasattr(self, "control_nodes") or self.control_nodes is None or len(self.control_nodes) == 0:
+            QMessageBox.information(self, "CAD FFD", "No CAD control nodes to plot.")
+            return
+
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+        ffd = self.cad_ffd.ffd
+
+        # Apply the lattice displacement (temporarily)
+        ffd.reset()
+        ffd.apply_displacements(dP_lattice)
+
+        # Original control nodes in world coords
+        cn = np.asarray(self.control_nodes, float)
+
+        # Param coordinates of control nodes inside the FFD box
+        # (use precomputed if available, otherwise compute on the fly)
+        if hasattr(self, "control_nodes_param") and self.control_nodes_param is not None:
+            uvw = np.asarray(self.control_nodes_param, float)
+        else:
+            uvw = ffd.world_to_param(cn)
+
+        # Evaluate displaced positions via FFD
+        new_pts = []
+        for (xi, eta, zeta) in uvw:
+            Xd = ffd.evaluate_deformed(float(xi), float(eta), float(zeta))
+            new_pts.append(Xd)
+        new_pts = np.asarray(new_pts, float)
+
+        disp = new_pts - cn  # displacement vectors
+
+        # --------------------------------------------------------------
+        # Plot original vs displaced control nodes + arrows
+        # --------------------------------------------------------------
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection="3d")
+        fig.canvas.manager.set_window_title("CAD Control-Node Displacements")
+
+        # Original positions (grey)
+        ax.scatter(cn[:, 0], cn[:, 1], cn[:, 2],
+                s=25, c="lightgrey", edgecolors="k", linewidths=0.5,
+                label="original control nodes")
+
+        # Displaced positions (green)
+        ax.scatter(new_pts[:, 0], new_pts[:, 1], new_pts[:, 2],
+                s=30, c="lime", edgecolors="k", linewidths=0.5,
+                label="displaced control nodes")
+
+        # Arrows showing displacement vectors (magenta)
+        ax.quiver(
+            cn[:, 0], cn[:, 1], cn[:, 2],
+            disp[:, 0], disp[:, 1], disp[:, 2],
+            length=1.0, normalize=False, color="magenta", linewidth=0.8
+        )
+
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+        ax.legend()
+        ax.view_init(elev=20, azim=45)
+        ax.set_box_aspect([1, 1, 1])
+
+        plt.tight_layout()
+        plt.show()
+
+
     def preview_cad_ffd_lattice(self):
         """
         Show a Matplotlib 3D plot with:
-        - FFD lattice control points/lines in grey
-        - selected CAD control nodes in red
+        - FFD lattice cells (grey) and lattice control points (orange)
+        - all CAD BSpline surface poles:
+            T faces in black
+            C faces in red
+            U faces in blue
+        - selected CAD control nodes in bright green
         """
         if self.cad_ffd is None or self.cad_ffd.ffd is None:
             QMessageBox.information(self, "CAD FFD", "CAD FFD manager not initialised yet.")
@@ -966,6 +1041,7 @@ class GeometryPanel(QWidget):
 
         import matplotlib.pyplot as plt
         from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+        import numpy as np
 
         ffd = self.cad_ffd.ffd
         ctrl = ffd.ctrl_pts  # shape (nξ, nη, nζ, 3)
@@ -977,31 +1053,82 @@ class GeometryPanel(QWidget):
         ax = fig.add_subplot(111, projection="3d")
         fig.canvas.manager.set_window_title("CAD FFD Lattice + Control Nodes")
 
-        # --- Plot lattice as wireframe (grey) ---
+        # ------------------------------------------------------------------
+        # 1) FFD lattice as wireframe (dim grey) + lattice CPs (orange)
+        # ------------------------------------------------------------------
+        line_kwargs = dict(linewidth=1.0, color="dimgray", alpha=0.9)
+
         # Lines varying in zeta (k) for each (i,j)
         for i in range(n_xi):
             for j in range(n_eta):
                 pts = ctrl[i, j, :, :]
-                ax.plot(pts[:, 0], pts[:, 1], pts[:, 2], linewidth=0.5, color="lightgrey")
+                ax.plot(pts[:, 0], pts[:, 1], pts[:, 2], **line_kwargs)
 
         # Lines varying in eta (j) for each (i,k)
         for i in range(n_xi):
             for k in range(n_zeta):
                 pts = ctrl[i, :, k, :]
-                ax.plot(pts[:, 0], pts[:, 1], pts[:, 2], linewidth=0.5, color="lightgrey")
+                ax.plot(pts[:, 0], pts[:, 1], pts[:, 2], **line_kwargs)
 
         # Lines varying in xi (i) for each (j,k)
         for j in range(n_eta):
             for k in range(n_zeta):
                 pts = ctrl[:, j, k, :]
-                ax.plot(pts[:, 0], pts[:, 1], pts[:, 2], linewidth=0.5, color="lightgrey")
+                ax.plot(pts[:, 0], pts[:, 1], pts[:, 2], **line_kwargs)
 
-        # --- Plot selected control nodes in red ---
+        # Lattice control points themselves (orange dots)
+        ctrl_flat = ctrl.reshape(-1, 3)
+        ax.scatter(ctrl_flat[:, 0], ctrl_flat[:, 1], ctrl_flat[:, 2],
+                s=15, c="orange", alpha=0.9, label="FFD CPs")
+
+        # ------------------------------------------------------------------
+        # 2) CAD surfaces – poles colour-coded by T / C / U
+        # ------------------------------------------------------------------
+        pts_T, pts_C, pts_U = [], [], []
+
+        from ShapeParameterization.cadd_ffd import FaceRole  # avoid circular import at top
+
+        # use the same faces the viewer uses, and the roles from cad_ffd
+        for fid, finfo in self.cad_ffd.faces.items():
+            # sample the *trimmed* face via OCCViewer helper
+            pts = self.viewer.get_face_control_net(fid)
+            if pts is None or len(pts) == 0:
+                continue
+
+            if finfo.role == FaceRole.T:
+                pts_T.append(pts)
+            elif finfo.role == FaceRole.C:
+                pts_C.append(pts)
+            else:  # FaceRole.U
+                pts_U.append(pts)
+
+        if pts_T:
+            pts_T = np.vstack(pts_T)
+            ax.scatter(pts_T[:, 0], pts_T[:, 1], pts_T[:, 2],
+                       s=5, c="black", alpha=0.9, label="T surfaces")
+
+        if pts_C:
+            pts_C = np.vstack(pts_C)
+            ax.scatter(pts_C[:, 0], pts_C[:, 1], pts_C[:, 2],
+                       s=5, c="red", alpha=0.9, label="C surfaces")
+
+        if pts_U:
+            pts_U = np.vstack(pts_U)
+            ax.scatter(pts_U[:, 0], pts_U[:, 1], pts_U[:, 2],
+                       s=5, c="blue", alpha=0.9, label="U surfaces")
+
+        # ------------------------------------------------------------------
+        # 3) Selected control nodes in a distinct colour (bright green)
+        # ------------------------------------------------------------------
         ax.scatter(
             pts_cn[:, 0], pts_cn[:, 1], pts_cn[:, 2],
-            s=40, c="red", label="control nodes"
+            s=40, c="lime", edgecolors="k", linewidths=0.5,
+            label="control nodes"
         )
 
+        # ------------------------------------------------------------------
+        # Axes / view
+        # ------------------------------------------------------------------
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
@@ -1076,6 +1203,46 @@ class GeometryPanel(QWidget):
 
         QMessageBox.information(self, "Done", "Control-node settings saved.")
 
+    def morphCAD(self):
+        """
+        Launch morph via MorphWorker, but from the CAD/geometry side.
+        Uses the same PipelineManager/HPCPipelineManager underneath.
+        """
+
+        # Make sure we have a pipeline
+        if not getattr(self.main_window, "pipeline", None):
+            self.logger.log("[CAD-FFD][ERROR] No pipeline attached. Set output directory / connect HPC first.")
+            return
+
+        # If pipeline was attached directly to geo_viewer, we can use it
+        if not hasattr(self, "pipeline"):
+            # fall back to main_window.pipeline, to be safe
+            self.pipeline = self.main_window.pipeline
+
+        # Spin up worker thread
+        self._morph_thread = QThread(self)
+        self._morph_worker = MorphWorker(self, debug=True)
+        self._morph_worker.moveToThread(self._morph_thread)
+
+        self._morph_thread.started.connect(self._morph_worker.run)
+        self._morph_worker.log.connect(self.logger.log)
+        self._morph_worker.finished.connect(self._on_morph_finished)
+        self._morph_worker.failed.connect(self._on_morph_failed)
+
+        self._morph_worker.finished.connect(self._morph_thread.quit)
+        self._morph_worker.failed.connect(self._morph_thread.quit)
+        self._morph_worker.finished.connect(self._morph_worker.deleteLater)
+        self._morph_thread.finished.connect(self._morph_thread.deleteLater)
+
+        self.logger.log("[CAD-FFD] Starting morph via MorphWorker (CAD-driven)…")
+        self._morph_thread.start()
+
+    def _on_morph_finished(self, result):
+        self.logger.log("[CAD-FFD] Morph completed.")
+        # TODO later: trigger CAD-morphed preview, reload STEP, etc.
+
+    def _on_morph_failed(self, msg):
+        self.logger.log(f"[CAD-FFD][ERROR] Morph failed: {msg}")
 
     def _on_row_selected(self):
         row = self.summary_table.currentRow()
