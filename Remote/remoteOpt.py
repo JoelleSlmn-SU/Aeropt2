@@ -35,14 +35,15 @@ def _cond_tag(cond):
     return f"AoA{cond.get('AoA',0)}_M{cond.get('Mach',1.0)}_Re{int(cond.get('Re',0))}_T{cond.get('TurbModel',0)}"
 
 
-def _metrics_path(remote_root, n, cond_index: int):
+def _metrics_path(remote_root, n, gen, cond_index: int, base_name):
     """Path to metrics file for a given test and condition index (1-based)"""
     return os.path.join(
         remote_root,
         "solutions",
-        f"n_{n}",
+        f"n_{gen}",
         f"cond_{cond_index}",
-        "corner.rsd",
+        f"{n}",
+        f"{base_name}_{n}.rsd",
     )
 
 class ClusterTestManager:
@@ -66,51 +67,50 @@ class ClusterTestManager:
     
     def _alloc_n_index(self, gen_num, local_idx):
         """Generate unique n-index for (generation, design) pair"""
-        return int(gen_num) * 1_000_000 + int(local_idx)
+        return int(local_idx)
     
-    def _start_one(self, n_index, x, conds):
+    def _start_one(self, gen_num, n_index, x, conds):
         """Start pipeline for one design point"""
-        print(f"[CLUSTER-TM] Starting n={n_index} with x={x}", flush=True)
-        
+        print(f"[CLUSTER-TM] Starting gen={gen_num} n={n_index} with x={x}", flush=True)
+
         self.remote_output = self.remote_root
-        # Build config for ClusterPipelineManager
+
         config = {
             "remote_output": self.remote_output,
             "base_name": self.base_name,
             "input_dir": self.input_dir,
-            "modal_coeffs": list(map(float, x)),  # BO design vector
+            "modal_coeffs": list(map(float, x)),
             "morph_basis_json": self.morph_basis_json,
             "cad_units": self.units,
             **self.executables,
         }
 
-        # Use n_index as the pipeline's "gen"/n-directory
-        pipe = ClusterPipelineManager(config, gen=0, n=n_index)
-        
-        # Submit jobs in sequence with dependencies
+        # IMPORTANT: gen must be the BO generation number
+        pipe = ClusterPipelineManager(config, gen=int(gen_num), n=int(n_index))
+
         try:
-            morph_id = pipe.morph(n=n_index)           # <- pass n_index through
-            vol_id = pipe.volume(runafter=morph_id)
-            pre_id = pipe.prepro(runafter=vol_id)
-            
-            # Submit solver for each condition
+            morph_id = pipe.morph(n=n_index)
+            vol_id   = pipe.volume(runafter=morph_id)
+            pre_id   = pipe.prepro(runafter=vol_id)
+
             sol_ids = []
             for i, cond in enumerate(conds, 1):
                 jid = pipe.solver(cond, nc=i)
                 sol_ids.append(jid)
-            
+
             self.jobs[n_index] = {
+                "gen": int(gen_num),
                 "morph": morph_id,
                 "volume": vol_id,
                 "prepro": pre_id,
-                "solvers": sol_ids
+                "solvers": sol_ids,
             }
-            
-            print(f"[CLUSTER-TM] Submitted n={n_index} â†’ jobs={self.jobs[n_index]}", flush=True)
-            return sol_ids[-1]  # Return last solver job for dependency chaining
-            
+
+            print(f"[CLUSTER-TM] Submitted gen={gen_num} n={n_index} -> jobs={self.jobs[n_index]}", flush=True)
+            return sol_ids[-1] if sol_ids else None
+
         except Exception as e:
-            print(f"[CLUSTER-TM] ERROR starting n={n_index}: {e}", flush=True)
+            print(f"[CLUSTER-TM] ERROR starting gen={gen_num} n={n_index}: {e}", flush=True)
             import traceback
             traceback.print_exc()
             return None
@@ -118,42 +118,57 @@ class ClusterTestManager:
     def init_generation(self, X_list, gen_num, conds):
         """Submit all designs for a generation"""
         print(f"[CLUSTER-TM] Initializing generation {gen_num} with {len(X_list)} designs", flush=True)
-        
+
         for i, x in enumerate(X_list):
-            n_index = self._alloc_n_index(gen_num, i+1)
-            self._start_one(n_index, x, conds)
+            n_index = self._alloc_n_index(gen_num, i + 1)
+            self._start_one(gen_num, n_index, x, conds)
     
     def evaluate_generation(self, X_list, gen_num, conds):
-        """Wait for all results and parse them"""
+        """Wait for solver completion markers (not rsd existence), then parse rsd."""
         num_conds = len(conds)
-        tags = [_cond_tag(c) for c in conds]  # still useful for logging if you want
-        
-        # Build list of required result files
-        need = []
-        for i, x in enumerate(X_list, 1):
+
+        def _sol_dir(n_index: int, nc: int) -> str:
+            # matches pipeline_cluster.py: solutions/n_{gen}/cond_{nc}/{n_index}/
+            return os.path.join(
+                self.remote_root,
+                "solutions",
+                f"n_{gen_num}",
+                f"cond_{nc}",
+                f"{n_index}",
+            )
+
+        def _done_path(n_index: int, nc: int) -> str:
+            return os.path.join(_sol_dir(n_index, nc), "SOLVER_DONE")
+
+        def _rsd_path(n_index: int, nc: int) -> str:
+            # your solver writes BASE.rsd where BASE = f"{base_name}_{n_index}"
+            return os.path.join(_sol_dir(n_index, nc), f"{self.base_name}_{n_index}.rsd")
+
+        # Build list of required DONE markers
+        need_done = []
+        for i, _x in enumerate(X_list, 1):
             n_index = self._alloc_n_index(gen_num, i)
             for nc in range(1, num_conds + 1):
-                path = _metrics_path(self.remote_root, n_index, nc)
-                need.append((path, n_index, nc))
-        
-        print(f"[CLUSTER-TM] Waiting for {len(need)} result files...", flush=True)
-        
-        # Poll until all files exist
-        unfinished = set(p for (p, _, _) in need)
+                need_done.append(( _done_path(n_index, nc), n_index, nc ))
+
+        print(f"[CLUSTER-TM] Waiting for {len(need_done)} SOLVER_DONE markers.", flush=True)
+
+        unfinished = set(p for (p, _, _) in need_done)
         while unfinished:
-            done = {p for p in list(unfinished) if os.path.exists(p)}
-            unfinished -= done
+            done_now = {p for p in list(unfinished) if os.path.exists(p)}
+            unfinished -= done_now
             if unfinished:
-                print(f"[CLUSTER-TM] Still waiting for {len(unfinished)} files...", flush=True)
+                # print one example path for debugging
+                example = next(iter(unfinished))
+                print(f"[CLUSTER-TM] Still waiting for {len(unfinished)} markers... e.g. {example}", flush=True)
                 time.sleep(self.poll_s)
-        
-        print(f"[CLUSTER-TM] All results ready!", flush=True)
-        
+
+        print("[CLUSTER-TM] All SOLVER_DONE markers present. Parsing RSD files.", flush=True)
+
         def parse_one(path):
             try:
                 with open(path, "r") as f:
                     lines = f.read().splitlines()
-                # Find last valid line with numbers
                 last = None
                 for raw in reversed(lines):
                     toks = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", raw)
@@ -162,28 +177,25 @@ class ClusterTestManager:
                         break
                 if not last:
                     return {"CL": 0.0, "CD": 1e9, "CM": 0.0}
-                # adjust column mapping if needed
-                CL = float(last[1])
-                CD = float(last[2])
-                CM = float(last[3])
+                CL = float(last[2])
+                CD = float(last[3]) # TODO: FIX THIS
+                CM = float(last[4])
                 return {"CL": CL, "CD": CD, "CM": CM}
             except Exception as e:
                 print(f"[CLUSTER-TM] Error parsing {path}: {e}", flush=True)
                 return {"CL": 0.0, "CD": 1e9, "CM": 0.0}
-        
-        # Collect results per design
+
+        # Collect results per design in X_list order
         results = []
-        for i, x in enumerate(X_list, 1):
+        for i, _x in enumerate(X_list, 1):
             n_index = self._alloc_n_index(gen_num, i)
             per_cond = []
             for nc in range(1, num_conds + 1):
-                path = _metrics_path(self.remote_root, n_index, nc)
-                m = parse_one(path)
-                per_cond.append(m)
+                rsd = _rsd_path(n_index, nc)
+                per_cond.append(parse_one(rsd))
             results.append(per_cond)
-        
-        return results
 
+        return results
 
 def main():
     if len(sys.argv) < 2:
@@ -258,7 +270,7 @@ def main():
     
     # Determine remote root (parent of run_dir usually)
     # Adjust this based on your directory structure
-    remote_root = os.path.dirname(run_dir)
+    remote_root = settings_json.get("remote_root", os.path.dirname(run_dir))
     base_name = settings_json.get("base_name", "model")
     input_dir = settings_json.get("input_dir", os.path.join(remote_root, "orig"))
     cad_units = settings_json.get("units", "mm")

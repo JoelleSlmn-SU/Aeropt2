@@ -74,6 +74,9 @@ class HPCPipelineManager:
         # surfacedir/vol/pre/sol roots
         self.job_ids = {}
         self.sol_parallel_domains = 1
+        
+        self.gen = int(n)     # generation / folder index
+        self.n   = 0          # design/case index (set per morph)
 
         # probe input-folder assets (highest precedence)
         def _probe(p): return p if (p and os.path.exists(p)) else None
@@ -585,10 +588,14 @@ class HPCPipelineManager:
     
     # ---------------------------- stages -------------------------------
 
-    def morph(self, predir=None, runafter=None):
+    def morph(self, n=0, predir=None, runafter=None):
+        assert self.remote_output and self.ssh_client
+        self.n = int(n)
+        
         assert self.remote_output and self.ssh_client
         surf_dir = posixpath.join(self.remote_output, "surfaces", f"n_{self.n}/")
         self._mkdir_p_remote(surf_dir)
+        
 
         if getattr(self.main_window, "control_node_source", "cad"):
             jobid = runCadMorph(self.geo_viewer, n=self.n, debug=True, run_as_batch=True)
@@ -642,7 +649,7 @@ class HPCPipelineManager:
         self._log(f"[HPC] Surface job {jobid}")
         return jobid
 
-    def volume(self, predir=None, units="mm", runafter=None):
+    def volume(self, n=None, predir=None, units="mm", runafter=None):
         """
         Submit volume mesher.
         - If a surface or morph stage ran, copy data from surfaces/n_<n>.
@@ -659,6 +666,10 @@ class HPCPipelineManager:
         assert self.remote_output and self.ssh_client
         
         units = self.main_window.cad_units
+        
+        assert self.remote_output and self.ssh_client
+        if n is not None:
+            self.n = int(n)
         
 
         vol_dir  = posixpath.join(self.remote_output, "volumes",  f"n_{self.n}/")

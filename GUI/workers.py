@@ -14,23 +14,33 @@ class MorphWorker(QObject):
         self.debug = debug
 
     def run(self):
-        result = None
         try:
-            self.log.emit("[INFO] Starting mesh deformation...")
-            # Resolve the pipeline robustly
-            pipeline = getattr(self.viewer, "pipeline", None)
-            if pipeline is None:
-                pipeline = getattr(self.viewer.main_window, "pipeline", None)
-            if pipeline is None:
-                raise RuntimeError("HPCPipelineManager not initialised (viewer.pipeline is missing).")
-            if getattr(self.viewer.main_window, "run_mode", "Local") == "HPC":
-                pipeline.morph()
-                pipeline.volume()
-            else:
-                self.log.emit("[INFO] Running morph via Local PipelineManager...")
-                pipeline.morph()
-                 
-            self.finished.emit(result)
+            main = self.viewer.main_window
+
+            # sanity
+            if getattr(main, "run_mode", "LOCAL") != "HPC":
+                raise RuntimeError("This Morph button mode is intended for HPC runs only.")
+
+            # Use your pipeline manager that talks to the cluster from the GUI machine
+            from Remote.pipeline_remote import HPCPipelineManager
+
+            submitted = []
+            for i in range(self.n_morphs):
+                pipe = HPCPipelineManager(main_window=main, n=0)  # n here is “gen” in some places; see note below
+
+                self.log.emit(f"[MORPH] Submitting morph case n={i} ...")
+                morph_job = pipe.morph(n=i)
+
+                vol_job = None
+                if self.do_volume:
+                    self.log.emit(f"[VOLUME] Submitting volume for n={i} (after morph={morph_job}) ...")
+                    vol_job = pipe.volume(runafter=morph_job)
+
+                submitted.append({"n": i, "morph": morph_job, "volume": vol_job})
+
+            self.log.emit(f"[DONE] Submitted {len(submitted)} morph(s).")
+            self.finished.emit(submitted)
+
         except Exception as e:
             self.failed.emit(str(e))
 

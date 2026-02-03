@@ -293,12 +293,20 @@ def _write_and_upload_config(viewer, ssh, rdir_sh, rdir_abs, vtk_upload_name, ex
     """Write morph_config locally and upload to remote n_<n> directory."""
     source = getattr(viewer.main_window, "control_node_source", "mesh")
     morph_kind = "cad" if source == "cad" else "mesh"
+    gen = 0
+    # runSimRemote.py  (inside _write_and_upload_config)
+
+    rigid_translation = bool(getattr(viewer, "rigid_boundary_translation", False))
 
     morph_config = {
         "mesh filetype": ext,
         "vtk_name": vtk_upload_name,
         "output_directory": out_dir,
+
+        # IMPORTANT: remoteMorph.py expects BOTH n and gen
         "n": int(n),
+        "gen": int(gen),  # for UI batch, simplest is gen == n so each case has its own surfaces/n_<gen> folder
+
         "debug": bool(True),
         "morph_kind": morph_kind,
         "t_surfaces": t_ids,
@@ -306,7 +314,11 @@ def _write_and_upload_config(viewer, ssh, rdir_sh, rdir_abs, vtk_upload_name, ex
         "c_surfaces": c_ids,
         "control_nodes": cn_aug.tolist(),
         "displacement_vector": d_aug.tolist(),
+
+        # IMPORTANT: remoteMorph.py expects this
+        "rigid_translation": rigid_translation,
     }
+
     local_json = os.path.join(viewer.output_dir, f"morph_config_n_{n}.json")
     with open(local_json, "w") as f:
         json.dump(morph_config, f)

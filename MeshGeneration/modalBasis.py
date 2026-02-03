@@ -6,11 +6,23 @@ import scipy.sparse.linalg as spla
 from scipy.spatial import cKDTree
 
 
-def laplacian_smooth(points, disp, iters=5, knn=6):
+def laplacian_smooth(points, disp, iters=2, knn=6):
+    points = np.asarray(points, float)
+    disp = np.asarray(disp, float)
+    N = len(points)
+    if N <= 2 or iters <= 0:
+        return disp
+
+    # Use at most N-1 neighbors (excluding self)
+    k_excl = min(max(1, knn), N - 1)
+    k_query = min(N, k_excl + 1)  # include self in query result
+
     tree = cKDTree(points)
     for _ in range(iters):
-        _, idx = tree.query(points, k=knn)
-        disp = np.array([disp[nbrs].mean(axis=0) for nbrs in idx])
+        _, idx = tree.query(points, k=k_query)
+        # idx[:,0] is self → drop it
+        nbrs = idx[:, 1:] if idx.ndim == 2 else idx[1:]
+        disp = np.array([disp[row].mean(axis=0) for row in nbrs])
     return disp
 
 def _knn_graph(X, k=6):
@@ -72,7 +84,9 @@ def build_laplacian_basis(control_nodes, k_modes=10, knn=6):
     from sklearn.neighbors import NearestNeighbors
     
     # Find k-nearest neighbors
-    nbrs = NearestNeighbors(n_neighbors=min(knn+1, len(points))).fit(points)
+    N = len(points)
+    n_neighbors = min(knn + 1, max(2, N - 1))  # must be < N
+    nbrs = NearestNeighbors(n_neighbors=n_neighbors).fit(points)
     distances, indices = nbrs.kneighbors(points)
     
     # Build adjacency matrix

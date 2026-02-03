@@ -633,29 +633,105 @@ class MainWindow(QMainWindow):
         self.run_opt_btn.pressed.connect(self.run_optimisation)
         self.run_opt_btn.setEnabled(False)
         self.button_layout.addWidget(self.run_opt_btn)
-        
+
     def run_morph(self):
-        if not self.run_morph_btn.isEnabled():
-            missing_items = []
-            if not self.control_nodes_saved:
-                missing_items.append("control nodes and bounds need to be saved")
-            if not self.output_directory_set:
-                missing_items.append("output directory needs to be set")
-            
-            self.logger.log(f"[ERROR] Cannot run morph: {' and '.join(missing_items)}.")
+        """
+        Run ONLY morph + volume on the cluster, via a cluster-side orchestrator (remoteMorph.py),
+        matching the same pattern as run_optimisation().
+        """
+        if not getattr(self, "ssh_client", None):
+            self.logger.log("[MORPH][ERROR] Not connected to HPC.")
             return
-        
-                # Decide which viewer to use based on where CNs came from
-        src = getattr(self, "control_node_source", "mesh")
 
-        if src == "cad":
-            self.logger.log("[MORPH] Using CAD-based control nodes → GeometryPanel.morphCAD().")
-            self.geo_viewer.morphCAD()
+        # --- ask how many morphs ---
+        from PyQt5.QtWidgets import QInputDialog
+        n_cases, ok = QInputDialog.getInt(self, "Morph", "How many morphed meshes would you like?", 5, 1, 1000, 1)
+        if not ok:
+            return
+
+        import os, json, posixpath, tempfile
+        from datetime import datetime
+
+        remote_run = posixpath.join(self.remote_output_dir, "morph/")
+        base = getattr(self, "base_name", None) or self.get_project_basename()
+
+        # 1) Export & upload morph_basis.json
+        # NOTE: export_morph_basis_for_opt appends /morph/ internally (designed for the
+        # opt flow where remote_run=.../opt).  Pass the BASE output dir here so the
+        # file lands at .../morph/morph_basis.json — not .../morph/morph/morph_basis.json.
+        remote_basis_path = self.export_morph_basis_for_opt(self.remote_output_dir)
+        if not remote_basis_path:
+            self.logger.log("[MORPH][WARN] Morph basis not available; displacements may be zero.")
         else:
-            self.logger.log("[MORPH] Using mesh-based control nodes → MeshViewer.morphMesh().")
-            self.mesh_viewer.morphMesh()
+            self.logger.log(f"[MORPH] Using morph basis: {remote_basis_path}")
 
-        
+        # 2) mkdir -p remote_run
+        self.ssh_client.exec_command(f"bash -lc 'mkdir -p \"{remote_run}\"'")
+
+        # 3) write morph_settings.json locally then upload
+        local_tmp = tempfile.mkdtemp()
+        morph_json = os.path.join(local_tmp, "morph_settings.json")
+
+        settings = {
+            "remote_output": self.remote_output_dir,  # <- base AerOpt out dir on cluster
+            "run_dir": remote_run,                   # <- this run folder (where logs go)
+            "base_name": base,
+            "input_dir": posixpath.join(self.remote_output_dir, "orig"),
+            "morph_basis_json": remote_basis_path or "",
+            "cad_units": getattr(self, "cad_units", "mm"),
+            "parallel_domains": int(getattr(self, "parallel_domains", 80)),
+            "n_cases": int(n_cases),
+
+            # optional knobs (remoteMorph will default if missing)
+            "coeff_sigma": 0.5,   # random coeff distribution
+            "seed": None,         # or an int for repeatability
+        }
+
+        with open(morph_json, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+
+        sftp = self.ssh_client.open_sftp()
+        try:
+            sftp.put(morph_json, posixpath.join(remote_run, "morph_settings.json"))
+        finally:
+            sftp.close()
+
+        # 4) Create & sbatch orchestrator (same pattern as run_optimisation)
+        batch = "\n".join([
+            "#!/bin/bash -l",
+            "#SBATCH --job-name=morph_orch",
+            "#SBATCH --output=morph_orch.%J.out",
+            "#SBATCH --error=morph_orch.%J.err",
+            "#SBATCH --time=1-00:00",
+            "#SBATCH --nodes=1",
+            "#SBATCH --ntasks=1",
+            "source ~/.bashrc",
+            "set -euo pipefail",
+            f"cd \"{remote_run}\"",
+            f"/home/{self.ssh_creds['username']}/.conda/envs/aeropt-hpc/bin/python "
+            f"/home/{self.ssh_creds['username']}/aeropt/Scripts/Remote/pipelineMorph.py \"{remote_run}\"",
+        ])
+
+        local_batch = os.path.join(local_tmp, "batchfile_morph_orchestrator")
+        with open(local_batch, "w", newline="\n") as f:
+            f.write(batch + "\n")
+
+        sftp = self.ssh_client.open_sftp()
+        try:
+            sftp.put(local_batch, posixpath.join(remote_run, "batchfile_morph_orchestrator"))
+        finally:
+            sftp.close()
+
+        _in, _out, _err = self.ssh_client.exec_command(
+            f"bash -lc 'cd \"{remote_run}\"; sbatch batchfile_morph_orchestrator'"
+        )
+        out = _out.read().decode().strip()
+        err = _err.read().decode().strip()
+        if err:
+            self.logger.log(f"[MORPH][HPC][WARN] sbatch stderr: {err}")
+        self.logger.log(f"[MORPH][HPC] sbatch: {out}")
+
+
     def run_simulation(self):
         if not self.run_sim_btn.isEnabled():
             missing_items = []

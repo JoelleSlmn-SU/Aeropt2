@@ -11,21 +11,20 @@ from vtk.util import numpy_support as ns
 
 # ---------- CONFIG ----------
 folder = [
-    "Corner Bump Surface",
-    "Corner Bump Surface Opt",
-    "Corner Bump Surface Coarse Optimisation",
-    "Corner Bump Surface Optimisation",
-    "CB Opt 15.12"
+    "CB Opt 18.12",
+    "CB Opt 21.12",
+    "CB Opt 07.01",
+    "CB Opt 09.01",
+    "CB Orig"
 ]
 
 x_case = 1
+gen = 0
 base = Path(r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples")
 case_root = base / folder[3]
 
-CASE_FILE = str(case_root / "postprocessed" / str(x_case) / f"ENSIGHTcorner_{x_case}.case")
-OUT_DIR   = str(case_root / "postprocessed" / str(x_case) / f"x_sweep_out")
-#CASE_FILE = str(case_root / f"ENSIGHTcorner.case")
-#OUT_DIR   = str(case_root / f"x_sweep_out")
+CASE_FILE = str(case_root / "postprocessed" / f"n_{gen}" / str(x_case) / f"ENSIGHTcorner_{str(x_case)}.case")
+OUT_DIR   = str(case_root / "postprocessed" / f"n_{gen}" / str(x_case) / f"x_sweep_out")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 IMAGE_SIZE = (1200, 600)
@@ -48,7 +47,7 @@ ETA_RANGE  = (0.75, 1.00)
 
 # Matplotlib discrete rainbow
 CMAP_NAME = "rainbow"
-N_STEPS   = 12
+N_STEPS   = 24
 
 WRITE_PDFS = True
 
@@ -506,6 +505,35 @@ def _ensure_speed_on(proxy):
     UpdatePipeline(proxy=calc)
     return calc, "U_mag"
 
+def _ensure_P0AIP_on(proxy):
+    """
+    Ensures a point-data array 'P0_AIP' exists on the given proxy.
+    Uses isentropic relation based on local Mach:
+      M = |U| / sqrt(gamma * p / rho)
+      P0 = p * (1 + 0.5*(gamma-1)*M^2)^(gamma/(gamma-1))
+    Returns: (proxy_with_P0, "P0_AIP")
+    """
+    # Ensure p, rho, U are available on the proxy
+    p_src, p_arr   = _ensure_pressure_on(proxy)          # yields Calc with p_arr
+    rho_src, rho   = ensure_pointdata(p_src, NAME_RHO)
+    u_src,   u     = ensure_pointdata(rho_src, NAME_U)
+
+    # Local Mach number
+    calc_M = Calculator(Input=u_src)
+    calc_M.ResultArrayName = "M_local"
+    calc_M.Function = f"mag({u})/sqrt({GAMMA}*{p_arr}/{rho})"
+    UpdatePipeline(proxy=calc_M)
+
+    # Total pressure on AIP
+    calc_P0 = Calculator(Input=calc_M)
+    calc_P0.ResultArrayName = "P0_AIP"
+    calc_P0.Function = (
+        f"{p_arr} * pow(1 + 0.5*({GAMMA}-1)*M_local*M_local, {GAMMA}/({GAMMA}-1))"
+    )
+    UpdatePipeline(proxy=calc_P0)
+
+    return calc_P0, "P0_AIP"
+
 def _threshold_set_local(thr, loc, arr_name, lo, hi):
     """Configure Threshold filter across ParaView versions."""
     try:
@@ -678,7 +706,7 @@ def isolate_aip_surface(root, cx, cy, cz, r):
     
     # Method 3: Geometric picking (most robust)
     print("[INFO] Method 3: Attempting geometric picking...")
-    surf = _pick_aip_geometric_local(root, cx, cy, cz, r, dx=0.02, cos_tol=0.90)
+    surf = _pick_aip_geometric_local(root, cx, cy, cz, r, dx=0.01, cos_tol=0.90)
     if surf:
         return surf
     
@@ -801,7 +829,7 @@ def compute_pressure_recovery(aip_proxy, P0_inf, out_dir):
     calc_P0 = Calculator(Input=calc_M)
     calc_P0.ResultArrayName = "P0_AIP"
     calc_P0.Function = (
-        f"0.9*{p_arr} * pow(1 + 0.5*({GAMMA}-1)*M_local*M_local, {GAMMA}/({GAMMA}-1))"
+        f"{p_arr} * pow(1 + 0.5*({GAMMA}-1)*M_local*M_local, {GAMMA}/({GAMMA}-1))"
     )
     UpdatePipeline(proxy=calc_P0)
 
@@ -844,7 +872,7 @@ def compute_pressure_recovery(aip_proxy, P0_inf, out_dir):
 
 # ========== MAIN AIP PLOTTING ==========
 
-def plot_aip_fields(root, out_dir, cx, cy, cz, r):
+def plot_aip_fields(root, out_dir, cx, cy, cz, r, P0_inf=None):
     """Plot pressure and velocity on AIP surface."""
     
     # 1) Isolate AIP geometry
@@ -896,34 +924,55 @@ def plot_aip_fields(root, out_dir, cx, cy, cz, r):
     
     # ---- PLOT 1: PRESSURE ----
     print("\n[INFO] Plotting pressure...")
+    print("\n[INFO] Plotting pressure recovery on AIP (P0/P0_inf).")
     try:
-        p_src, p_arr = _ensure_pressure_on(sampled)
-        UpdatePipeline(proxy=p_src)
+        p0_src, p0_arr = _ensure_P0AIP_on(sampled)
+        UpdatePipeline(proxy=p0_src)
+
+        if P0_inf is None:
+            # If not provided, just plot P0_AIP (still useful)
+            field_src = p0_src
+            field_arr = p0_arr
+            title = "Total Pressure P0 [Pa]"
+            label = f"AIP Surface (x={cx:.2f}) - Total Pressure"
+            fixed_range = None
+        else:
+            # Build recovery field: PR_AIP = P0_AIP / P0_inf
+            rec = Calculator(Input=p0_src)
+            rec.ResultArrayName = "PR_AIP"
+            rec.Function = f"{p0_arr} / {float(P0_inf)}"
+            UpdatePipeline(proxy=rec)
+
+            field_src = rec
+            field_arr = "PR_AIP"
+            title = "Pressure Recovery (P0/P0_inf) [-]"
+            label = f"AIP Surface (x={cx:.2f}) - Pressure Recovery"
+            fixed_range = (0.9, 0.96)  # tweak if you want; or set None for auto
 
         # --- Compute range on AIP surface ---
-        p_min, p_max = compute_range(p_src, p_arr)
-        print(f"[INFO] Pressure range on AIP: {p_min:.3f} – {p_max:.3f}")
+        vmin, vmax = compute_range(field_src, field_arr)
+        print(f"[INFO] Pressure recovery range on AIP: {vmin:.4f} – {vmax:.4f}")
 
         px, arr, rep = render_colorfield(
-            rv, p_src, p_arr,
-            title="Pressure [Pa]",
-            fixed_range=(245000, p_max)
+            rv, field_src, field_arr,
+            title=title,
+            fixed_range=fixed_range
         )
-        
+
         txt = Text()
-        txt.Text = f"AIP Surface (x={cx:.2f}) - Static Pressure"
+        txt.Text = label
         txtrep = Show(txt)
         txtrep.WindowLocation = "Upper Left Corner"
         txtrep.FontSize = 16
         txtrep.Color = [0, 0, 0]
-        
+
         rv.StillRender()
-        save_png(rv, "AIP_pressure")
+        save_png(rv, "AIP_pressure_recovery")
         Hide(txt); Delete(txt); Hide(px)
-        print("[OK] AIP_pressure.png saved")
-        
+        print("[OK] AIP_pressure_recovery.png saved")
+
     except Exception as e:
-        print(f"[ERROR] Pressure plot failed: {e}")
+        print(f"[ERROR] Pressure recovery plot failed: {e}")
         import traceback
         traceback.print_exc()
     
@@ -940,7 +989,7 @@ def plot_aip_fields(root, out_dir, cx, cy, cz, r):
         px, arr, rep = render_colorfield(
             rv, u_src, u_arr,
             title="Velocity [m/s]",
-            fixed_range=(85, u_max)
+            fixed_range=(u_min, 300)
         )
         
         txt = Text()
@@ -981,7 +1030,7 @@ def plot_aip_fields(root, out_dir, cx, cy, cz, r):
 
 # ========== RUN IT ==========
 try:
-    aip_sampled = plot_aip_fields(src_aip, OUT_DIR, cx, cy, cz, AIP_RADIUS)
+    aip_sampled = plot_aip_fields(src_aip, OUT_DIR, cx, cy, cz, AIP_RADIUS, P0_inf=P0_inf)
     print("\n" + "="*60)
     print("AIP PLOTTING COMPLETE SUCCESS")
     print("="*60)

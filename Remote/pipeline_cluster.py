@@ -80,9 +80,9 @@ class ClusterPipelineManager:
         
         self.job_ids = {}
         if config_dict.get("parallel_domains") == 1:
-            self.sol_parallel_domains = 80
+            self.sol_parallel_domains = 160
         else:
-            self.sol_parallel_domains = config_dict.get("parallel_domains", 80)
+            self.sol_parallel_domains = config_dict.get("parallel_domains", 160)
         
         # Setup logging
         log_dir = os.path.join(self.remote_output, "logs")
@@ -94,6 +94,32 @@ class ClusterPipelineManager:
         print(msg, flush=True)
         with open(self.log_file, "a") as f:
             f.write(f"{datetime.now().isoformat()} - {msg}\n")
+            
+        # -------------------- STATE (resume / status) --------------------
+    def _state_path(self) -> str:
+        st_dir = os.path.join(self.remote_output, "logs", "state", f"n_{self.gen}")
+        os.makedirs(st_dir, exist_ok=True)
+        return os.path.join(st_dir, f"sample_{self.n}.json")
+
+    def _load_state(self) -> dict:
+        p = self._state_path()
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
+
+    def _save_state(self, **updates):
+        st = self._load_state()
+        st.update(updates)
+        st.setdefault("gen", self.gen)
+        st.setdefault("n", self.n)
+        st["updated"] = datetime.now().isoformat()
+        with open(self._state_path(), "w", encoding="utf-8") as f:
+            json.dump(st, f, indent=2)
+
     
     def _submit_batch(self, batchfile_path: str, cwd: str) -> str:
         """Submit a batch file and return job ID"""
@@ -363,7 +389,10 @@ class ClusterPipelineManager:
                 else:
                     self._log("[PIPELINE] morph_basis_json has no control_nodes; leaving morph zero.")
             except Exception as e:
-                self._log(f"[PIPELINE] Failed to use morph_basis_json '{basis_path}': {e}")
+                import traceback
+                tb = traceback.format_exc()
+                self._log(f"[PIPELINE][ERROR] Failed morph basis '{basis_path}': {e}\n{tb}")
+                raise 
 
         # ------------------------------------------------------
         # 4) Write final morph config
@@ -407,6 +436,12 @@ class ClusterPipelineManager:
         config_path, mesh_name = self._write_morph_config(surf_dir)
         fro_target = os.path.join(surf_dir, f"{self.base_name}_{n}.fro")
         
+        if os.path.exists(fro_target) and os.path.getsize(fro_target) > 1024:
+            self._log(f"[CLUSTER] Morph output exists, skipping submit: {fro_target}")
+            self.job_ids["morph"] = None
+            self._save_state(stage="morph_done", morph_output=fro_target)
+            return None
+        
         # Create batch file
         batch_name = f"morph_n{self.gen}_{n}"
         bf = Batchfile(batch_name)
@@ -420,7 +455,7 @@ class ClusterPipelineManager:
         with open(batch_path, "w") as f:
             f.write(str(bf))
         
-        dep_arg = f"--dependency=afterok:{runafter}" if runafter else ""
+        dep_arg = f"--dependency=afterany:{runafter}" if runafter else ""
         cmd = f"sbatch {dep_arg} {batch_path}"
         result = subprocess.run(cmd, shell=True, cwd=surf_dir, capture_output=True, text=True)
         
@@ -429,6 +464,8 @@ class ClusterPipelineManager:
         
         self.job_ids["morph"] = jobid
         self._log(f"[CLUSTER] Morph job {jobid}")
+        self._save_state(stage="morph_submitted", morph_job=jobid)
+
         return jobid
     
     def volume(self, predir=None, units="mm", runafter=None):
@@ -463,28 +500,62 @@ class ClusterPipelineManager:
         bf.lines.append(f"cp {self.orig_dir}/{self.base_name}.bpp {vol_dir}/{self.base_name}_{self.n}.bpp || true")
         bf.lines.append(f"cp {self.orig_dir}/{self.base_name}.bac {vol_dir}/{self.base_name}_{self.n}.bac || true")
         bf.lines.append(f"cp {self.orig_dir}/Mesh3D_v50.ctl {vol_dir}/Mesh3D_v50.ctl || true")
-        bf.lines.append(f"srun {self.volume_mesher} {self.base_name}_{self.n} &> volume_output_{self.n}")
+        base = f"{self.base_name}_{self.n}"
         
+        plt_path = os.path.join(vol_dir, f"{base}.plt")
+        if os.path.exists(plt_path) and os.path.getsize(plt_path) > 1024:
+            self._log(f"[CLUSTER] Volume output exists, skipping submit: {plt_path}")
+            self.job_ids["volume"] = None
+            self._save_state(stage="volume_done", volume_output=plt_path)
+            return None
+
+        # ---- Run volume mesher (allow non-zero exit but keep outputs) ----
+        bf.lines.append("")
+        bf.lines.append("# ---- RUN VOLUME MESHER ----")
+        bf.lines.append("set +e")  # do not abort batchfile if Mesh3D returns non-zero after writing outputs
+        bf.lines.append(f"srun {self.volume_mesher} {base} &> volume_output_{self.n}")
+        bf.lines.append("MESH_RC=$?")
+        bf.lines.append("set -e")
+        bf.lines.append("echo \"[VOL] Mesh3D return code: ${MESH_RC}\"")
+
+        # ---- UNIT CONVERSION (mm -> m or whatever your converter does) ----
         if (self.units or "").lower() == "mm":
             self._log("[PIPELINE] CAD units = mm → adding PLT conversion to volume batchfile")
 
             bf.lines.append("")
-            bf.lines.append("# ---- UNIT CONVERSION: convert mesh to mm ----")
-            bf.lines.append(f"{self.hyb_plt_converter} <<INPUT1")
-            bf.lines.append(f"{self.base_name}_{self.n}")   # base name ONLY (no extension)
+            bf.lines.append("# ---- UNIT CONVERSION: run converter if PLT exists ----")
+            bf.lines.append(f"if [ -f \"{base}.plt\" ]; then")
+            bf.lines.append(f"  echo \"[VOL] Found {base}.plt -> running hyb_plt_converter\"")
+            bf.lines.append(f"  {self.hyb_plt_converter} <<INPUT1")
+            bf.lines.append(f"{base}")   # base name ONLY (no extension)
             bf.lines.append("INPUT1")
             bf.lines.append("")
+            bf.lines.append(f"  mv {base}.plt {base}_mm.plt || true")
+            bf.lines.append(f"  mv {base}_new.plt {base}.plt || true")
+            bf.lines.append("else")
+            bf.lines.append(f"  echo \"[VOL][ERROR] Missing {base}.plt; not converting. Mesh3D rc=${{MESH_RC}}\"")
+            bf.lines.append("  exit ${MESH_RC}")
+            bf.lines.append("fi")
 
-            # rename outputs
-            bf.lines.append(f"mv {self.base_name}_{self.n}.plt {self.base_name}_{self.n}_mm.plt || true")
-            bf.lines.append(f"mv {self.base_name}_{self.n}_new.plt {self.base_name}_{self.n}.plt || true")
+        # Decide final exit code behavior:
+        # - If you want the pipeline to treat this as SUCCESS when PLT exists & converted, force exit 0.
+        # - If you want SLURM dependency afterok to fail when Mesh3D rc!=0, exit with MESH_RC.
+        #
+        # Recommendation for optimisation stability: exit 0 if PLT exists (so downstream can run).
+        bf.lines.append("")
+        bf.lines.append("# ---- FINALIZE ----")
+        bf.lines.append(f"if [ -f \"{base}.plt\" ]; then")
+        bf.lines.append("  exit 0")
+        bf.lines.append("else")
+        bf.lines.append("  exit ${MESH_RC}")
+        bf.lines.append("fi")
         
         batch_path = os.path.join(vol_dir, f"batchfile_{self.gen}_{batch_name}")
         with open(batch_path, "w") as f:
             f.write(str(bf))
         
         dep_id = runafter or self.job_ids.get("morph")
-        dep_arg = f"--dependency=afterok:{dep_id}" if dep_id else ""
+        dep_arg = f"--dependency=afterany:{dep_id}" if dep_id else ""
         cmd = f"sbatch {dep_arg} {batch_path}"
         result = subprocess.run(cmd, shell=True, cwd=vol_dir, capture_output=True, text=True)
         
@@ -493,6 +564,7 @@ class ClusterPipelineManager:
         
         self.job_ids["volume"] = jobid
         self._log(f"[CLUSTER] Volume job {jobid}")
+        self._save_state(stage="volume_submitted", volume_job=jobid)
 
         return jobid
     
@@ -501,6 +573,15 @@ class ClusterPipelineManager:
         pre_dir = os.path.join(self.remote_output, "preprocessed", f"n_{self.gen}", f"{self.n}")
         vol_dir = os.path.join(self.remote_output, "volumes", f"n_{self.gen}")
         os.makedirs(pre_dir, exist_ok=True)
+        
+        sol_glob_ok = any(
+            fn.startswith(f"{self.base_name}_{self.n}.sol") for fn in os.listdir(pre_dir)
+        )
+        if sol_glob_ok:
+            self._log(f"[CLUSTER] Prepro outputs exist, skipping submit: {pre_dir}")
+            self.job_ids["prepro"] = None
+            self._save_state(stage="prepro_done", prepro_dir=pre_dir)
+            return None
         
         # Copy necessary files
         '''for fname in [f"{self.base_name}_{self.n}.bco", "rungen.inp"]:
@@ -530,7 +611,7 @@ class ClusterPipelineManager:
             f.write(str(bf))
         
         dep_id = runafter or self.job_ids.get("volume")
-        dep_arg = f"--dependency=afterok:{dep_id}" if dep_id else ""
+        dep_arg = f"--dependency=afterany:{dep_id}" if dep_id else ""
         cmd = f"sbatch {dep_arg} {batch_path}"
         result = subprocess.run(cmd, shell=True, cwd=pre_dir, capture_output=True, text=True)
         
@@ -539,6 +620,8 @@ class ClusterPipelineManager:
         
         self.job_ids["prepro"] = jobid
         self._log(f"[CLUSTER] Prepro job {jobid}")
+        self._save_state(stage="prepro_submitted", prepro_job=jobid)
+        
         return jobid
     
     def solver(self, cond: dict = None, nc=1):
@@ -690,7 +773,15 @@ class ClusterPipelineManager:
         # safer than reading half-written files: stage .res into temp and run utilities there
         bf.lines.append("  stage=\"$PR_DIR/stage_${it}\"")
         bf.lines.append("  rm -rf \"$stage\" && mkdir -p \"$stage\"")
-        bf.lines.append("  rsync -a --include='*.res' --include='plotreg.reg' --exclude='*' ./ \"$stage/\" || true")
+
+        # --- SYMLINKS (ADD THESE) ---
+        bf.lines.append("  # Link split-domain outputs into the stage dir (no copying)")
+        bf.lines.append("  ln -sf \"$(pwd)/${BASE}.res_\"* \"$stage/\" 2>/dev/null || true")
+        bf.lines.append("  ln -sf \"$(pwd)/base.plt\"* \"$stage/${BASE}.plt\" 2>/dev/null || true")
+        bf.lines.append("  ln -sf \"$(pwd)/plotreg.reg\" \"$stage/\" 2>/dev/null || true")
+        # (optional but useful if engen/makeplot expects other aux files)
+        bf.lines.append("  ln -sf \"$(pwd)/${BASE}.rsd\" \"$stage/\" 2>/dev/null || true")
+
         bf.lines.append("  pushd \"$stage\" >/dev/null")
 
         # 1) combine region res -> unk
@@ -702,6 +793,15 @@ class ClusterPipelineManager:
         bf.lines.append("T")
         bf.lines.append("INPUT1")
 
+        bf.lines.append(f"  \"{self.ensight_exe}\" <<INPUT2 > makeplot2_${{it}}.log 2>&1")
+        bf.lines.append("${BASE}")
+        bf.lines.append("T")
+        bf.lines.append(f"{float(mach):.8f}")
+        bf.lines.append("298")
+        bf.lines.append("106000")
+        bf.lines.append("1006")
+        bf.lines.append("INPUT2")
+        
         # 2) unk -> ensight
         bf.lines.append(f"  \"{self.ensight_exe}\" \"${{BASE}}.unk\" > engen_${{it}}.log 2>&1")
 
@@ -757,7 +857,7 @@ class ClusterPipelineManager:
             f.write(str(bf))
         
         dep_id = self.job_ids.get("prepro")
-        dep_arg = f"--dependency=afterok:{dep_id}" if dep_id else ""
+        dep_arg = f"--dependency=afterany:{dep_id}" if dep_id else ""
         cmd = f"sbatch {dep_arg} {batch_path}"
         result = subprocess.run(cmd, shell=True, cwd=sol_dir, capture_output=True, text=True)
         
@@ -777,6 +877,7 @@ class ClusterPipelineManager:
             residual_csv=f"{self.base_name}.rsd",
         )
         self.job_ids[f"solver_guard_{tag_slug}"] = guard_job
+        self._save_state(stage="solver_submitted", solver_job=jobid, solver_guard_job=guard_job)
 
         return jobid
     

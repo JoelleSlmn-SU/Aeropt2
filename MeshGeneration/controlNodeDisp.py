@@ -165,11 +165,22 @@ def getDisplacements(output_dir,
         
         # --- NEW: always derive a CAD-based target amplitude from local spacing ---
         from sklearn.neighbors import NearestNeighbors
-        nn = NearestNeighbors(n_neighbors=min(8, len(control_nodes))).fit(control_nodes)
-        d8 = nn.kneighbors(return_distance=True)[0][:, -1].mean()
-        frac = 0.15  # fraction of mean 8th-neighbour spacing to target as coeff RMS
-        target_amp = frac * d8
-        print(f"[DEBUG] Local spacing d8={d8:.6f}, target_amp={target_amp:.6f}")
+        X = np.asarray(control_nodes, float)
+        Ncn = len(X)
+
+        # want "up to 8th neighbor excluding self" -> query K+1 including self
+        # but sklearn on some versions requires n_neighbors < Ncn, so cap at Ncn-1
+        K_excl = min(8, max(1, Ncn - 1))           # neighbors excluding self
+        n_query = min(K_excl + 1, max(1, Ncn - 1)) # include self, but still < Ncn
+
+        nn = NearestNeighbors(n_neighbors=n_query).fit(X)
+        dists, _ = nn.kneighbors(X, return_distance=True)
+
+        # dists includes self at column 0; use last column as "furthest available neighbor"
+        d_ref = dists[:, -1].mean() if dists.shape[1] > 1 else 1.0
+        frac = 0.15
+        target_amp = frac * d_ref
+        print(f"[DEBUG] Local spacing d_ref={d_ref:.6f}, target_amp={target_amp:.6f}")
 
         if coeffs is None:
             print("[DEBUG] No coeffs provided, generating random coefficients")
@@ -226,6 +237,6 @@ def getDisplacements(output_dir,
         
         print(f"[DEBUG] 3D basis: using {coeffs.size} coefficients")
         d_ctrl = expand_modal_coeffs(phi, coeffs, normals=None)
-        d_ctrl = laplacian_smooth(control_nodes, d_ctrl, iters=3)
+        #d_ctrl = laplacian_smooth(control_nodes, d_ctrl, iters=3)
 
     return d_ctrl  # shape (N,3)

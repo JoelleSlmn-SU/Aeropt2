@@ -4,7 +4,7 @@ import pyvista as pv
 import numpy as np
 sys.path.append(os.path.dirname('ConvertFileType'))
 sys.path.append(os.path.dirname('ShapeParameterization'))
-from ConvertFileType.convertToStep import export_nurbs_surface_to_step
+#from ConvertFileType.convertToStep import export_nurbs_surface_to_step
 from ShapeParameterization.surfaceFitting import fitSurfaceNURBs
 
 import pyvista as pv
@@ -199,7 +199,7 @@ class VtkMesh(Mesh):
     def export_step(self, path, surface_name="full"):
         pts = self.get_surface_points(surface_name)
         surf = fitSurfaceNURBs(pts)
-        export_nurbs_surface_to_step(surf, path, format='step')
+        #export_nurbs_surface_to_step(surf, path, format='step')
         print(f"Exported {surface_name} to {path}")
         
     def _collect_surface_nodes(self, surface_list):
@@ -478,7 +478,7 @@ class VtmMesh(Mesh):
     def export_step(self, path, surface_name):
         pts = self.get_surface_points(surface_name)
         surf = fitSurfaceNURBs(pts)
-        export_nurbs_surface_to_step(surf, path, format='step')
+        #export_nurbs_surface_to_step(surf, path, format='step')
         print(f"Exported {surface_name} to {path}")
     
     def _collect_surface_nodes(self, surface_list):

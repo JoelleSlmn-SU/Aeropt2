@@ -58,7 +58,7 @@ class BayesianOptimiser:
         else:
             self.ub = np.asarray(raw_ub, dtype=float)
 
-        self.mac = MultiArrayCsvFile(f"{self.sim_dir}bo_data.mcsv")
+        self.mac = MultiArrayCsvFile(f"{self.sim_dir}/bo_data.mcsv")
         kern    = self.kernel(lengthscale=1.0, noise_variance=1.0)
         self.gp = GP(kernel=kern, noise_variance=0.0001)
 
@@ -190,51 +190,121 @@ class BayesianOptimiser:
         return af
 
     def optimise(self, cont=True):
+        """
+        Optimisation loop.
+
+        Fixes:
+        - CMA-ES is unstable/unsupported in 1D -> use bounded 1D search for n_dim==1
+        - Ensure acquisition function returns a scalar float for CMA in n_dim>=2
+        """
         self.get_training_data()
         start = self.gen_num
-        if start > self.count_limit:
-            print("All Finished")
-            sys.exit()
+        if start >= self.count_limit:
+            self.logger.log("[INFO] All Finished")
+            return self.X_best, self.Y_best
 
-        for gen_num in range(start,self.count_limit):
+        def _af_to_scalar(val):
+            """Force any af output to a Python float."""
+            return float(np.asarray(val).reshape(-1)[0])
+
+        def _minimise_af_1d(af, lb, ub, n_grid=81, n_refine=4):
+            """
+            Robust 1D minimisation on [lb, ub] without CMA/SciPy.
+            Grid search + iterative local refinement. Returns float x_best.
+            """
+            lb = float(np.asarray(lb).reshape(-1)[0])
+            ub = float(np.asarray(ub).reshape(-1)[0])
+            if ub <= lb:
+                return lb
+
+            # coarse grid
+            xs = np.linspace(lb, ub, int(n_grid))
+            vals = np.empty_like(xs, dtype=float)
+            for i, x in enumerate(xs):
+                vals[i] = _af_to_scalar(af(np.array([x], dtype=float)))
+            x_best = float(xs[int(np.argmin(vals))])
+
+            # refine around best
+            span = (ub - lb)
+            for _ in range(int(n_refine)):
+                w = span / 10.0
+                a = max(lb, x_best - w)
+                b = min(ub, x_best + w)
+                xs = np.linspace(a, b, int(max(21, n_grid // 4)))
+                vals = np.empty_like(xs, dtype=float)
+                for i, x in enumerate(xs):
+                    vals[i] = _af_to_scalar(af(np.array([x], dtype=float)))
+                x_best = float(xs[int(np.argmin(vals))])
+                span = (b - a)
+
+            return x_best
+
+        for gen_num in range(start, self.count_limit):
             self.gen_num = gen_num
             self.logger.log(f"[INFO] Evaluating generation {self.gen_num}")
+
+            # evaluate any pending samples for this generation
             self.eval_sample()
+
+            # fit GP
             self.gp.X = self.X_scaled
             self.gp.Y = self.Y_scaled
             self.gp.minimise_log_likelihood(maxiter=self.mll_maxfevals)
-            # evaluate new sample points
+
+            # acquisition function
             af = self.get_af()
-            
-            # minimise af
-            cma_options  = {'bounds':[list(self.lb), list(self.ub)],
-                            'maxfevals':self.af_maxfevals,
-                            'verb_log': 0,
-                            'CMA_stds': np.abs(self.ub - self.lb)}
-            xinit = self.lb + (np.random.random(self.n_dim) * (self.ub - self.lb))
-            sigma0 = 0.25
-            with suppress_stdout():
-                res = fmin(af, xinit, sigma0, options=cma_options, bipop=True, restarts=9)
-            x_opt = res[0]
+
+            # ---- acquire next point ----
+            if self.n_dim == 1:
+                # CMA-ES is unstable in 1D -> bounded 1D search
+                x_best = _minimise_af_1d(af, self.lb, self.ub)
+                x_opt = np.array([x_best], dtype=float)
+                ei_val = _af_to_scalar(af(x_opt))
+            else:
+                # CMA-ES for n_dim >= 2
+                cma_options = {
+                    'bounds': [list(self.lb), list(self.ub)],
+                    'maxfevals': self.af_maxfevals,
+                    'verb_log': 0,
+                    'CMA_stds': np.abs(self.ub - self.lb),
+                }
+
+                xinit = self.lb + (np.random.random(self.n_dim) * (self.ub - self.lb))
+                xinit = np.atleast_1d(np.asarray(xinit, dtype=float))
+                sigma0 = 0.25
+
+                def af_scalar(x):
+                    return _af_to_scalar(af(np.asarray(x, dtype=float)))
+
+                with suppress_stdout():
+                    res = fmin(af_scalar, xinit, sigma0, options=cma_options, bipop=True, restarts=9)
+
+                x_opt = np.asarray(res[0], dtype=float).reshape(-1)
+                ei_val = af_scalar(x_opt)
+
             print(self.gp.kernel)
             print(f"Optimal x from minimising af: {x_opt}")
-            print(f"EI at this point: {af(x_opt)}")
-            
-            # start evaluate new test.
+            print(f"EI at this point: {ei_val}")
+
+            # start evaluating the new test (this is what creates surfaces/n_<gen_num>/...)
             self.X_uneval = [x_opt]
             self.init_sample()
+
             self.logger.log(f"Generation {self.gen_num} complete...")
             if not cont:
                 self.logger.log(f"[INFO] Generation {self.gen_num} started - continuous mode disabled. Exiting.")
                 sys.exit()
-        
+
         self.logger.log("[INFO] Final generation complete.")
         self.eval_sample()
         self.logger.log(f"[INFO] Best: X = {self.X_best} | Y = {self.Y_best}")
 
         return self.X_best, self.Y_best
 
+
     def visualise_generation(self):
+        if self.init_func is not None:
+            return
         if self.n_obj == 1 and self.n_dim > 1:
             pass
         elif self.n_obj == 1 and self.n_dim == 1:
@@ -250,7 +320,7 @@ class BayesianOptimiser:
             plt.cla()
             tx = np.linspace(self.lb, self.ub, 1000).reshape(1000)
             # exact func
-            ty = self.eval_func(tx)
+            ty = self.eval_func(tx, self.gen_num)
             plt.plot(tx, ty, ls='dashed', color="black", alpha=0.5, label="Analytical")
             
             # predicted function
@@ -319,3 +389,4 @@ class BayesianOptimiser:
         plt.savefig(f"{self.sim_dir}/bo_conv_hist_n_{training_data}_g_{self.gen_num}.png")
         plt.savefig(f"{self.sim_dir}/bo_conv_hist_n_{training_data}_g_{self.gen_num}.pdf")
         plt.close("all")
+

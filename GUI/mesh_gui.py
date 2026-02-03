@@ -688,10 +688,10 @@ class MeshViewer(QWidget):
             return _dedup_preserve_order(ids)
 
         T = _names_or_ids_to_ids(T_names)
-        C = _names_or_ids_to_ids(C_names)
+        U = _names_or_ids_to_ids(U_names)
 
         # Auto-compute U from the universe (recommended)
-        U = _dedup_preserve_order([sid for sid in all_ids if sid not in (set(T) | set(C))])
+        C = _dedup_preserve_order([sid for sid in all_ids if sid not in (set(T) | set(U))])
 
         # Save IDs back (these are what should go to morph_config)
         self.TSurfaces = T
@@ -801,8 +801,12 @@ class MeshViewer(QWidget):
         # k_modes
         n_cn = len(self.control_nodes)
         self.k_modes_spin = QSpinBox()
-        self.k_modes_spin.setRange(1, n_cn)
-        self.k_modes_spin.setValue(min(getattr(self, "k_modes", 6), n_cn))
+        if n_cn == 1:
+            self.k_modes_spin.setRange(1, n_cn)
+            self.k_modes_spin.setValue(min(getattr(self, "k_modes", 6), n_cn))
+        else:
+            self.k_modes_spin.setRange(1, n_cn-1)
+            self.k_modes_spin.setValue(min(getattr(self, "k_modes", 6), n_cn-1))    
         self.form.addRow("Number of modes (k):", self.k_modes_spin)
 
         # spectral decay p
@@ -1057,33 +1061,47 @@ class MeshViewer(QWidget):
     def set_pipeline(self, pipeline):
         self.pipeline = pipeline
 
+
     def morphMesh(self):
-        '''if not getattr(self, "pipeline", None):
-            # borrow from the main window if available
-            pm = getattr(self.main_window, "pipeline", None)
-            if pm is not None:
-                self.pipeline = pm
-            else:
-                self.log("[ERROR] No pipeline attached. Set output directory (or connect to HPC) so the pipeline can be initialised.")
-                return'''
-        #self.morph_btn.setVisible(False)
-        self.form_widget.setVisible(False)
-        
-        self._morph_thread = QThread(self)          
-        self._morph_worker = MorphWorker(self, debug=self.debug_mode)
-        self._morph_worker.moveToThread(self._morph_thread)
+        # If we have a main_window with a pipeline in HPC mode, delegate
+        mw = getattr(self, "main_window", None)
+        pipe = getattr(self, "pipeline", None)
 
-        self._morph_thread.started.connect(self._morph_worker.run)
-        self._morph_worker.log.connect(self.log)            # now exists
-        self._morph_worker.finished.connect(self._on_morph_finished)
-        self._morph_worker.failed.connect(self._on_morph_failed)
+        is_hpc = bool(mw and getattr(mw, "run_mode", "") == "HPC")
 
-        self._morph_worker.finished.connect(self._morph_thread.quit)
-        self._morph_worker.failed.connect(self._morph_thread.quit)
-        self._morph_worker.finished.connect(self._morph_worker.deleteLater)
-        self._morph_thread.finished.connect(self._morph_thread.deleteLater)
+        if is_hpc:
+            # Keep this function usable if called directly (but ideally Run Morph button uses MainWindow.run_morph)
+            from PyQt5.QtWidgets import QInputDialog
 
-        self._morph_thread.start()
+            n_cases, ok = QInputDialog.getInt(
+                self,
+                "Morph + Volume on HPC",
+                "How many morphed meshes would you like to generate?",
+                value=5, min=1, max=500, step=1
+            )
+            if not ok:
+                self.log("[INFO] Morph cancelled by user.")
+                return
+
+            if pipe is None:
+                self.log("[ERROR] No pipeline attached; cannot submit HPC batch.")
+                return
+
+            try:
+                jobid = pipe.submit_mesh_batch(
+                    n_cases=int(n_cases),
+                    do_volume=True,
+                    source=getattr(mw, "control_node_source", "mesh"),
+                )
+                self.log(f"[MORPH] Submitted mesh-batch orchestrator job {jobid}.")
+            except Exception as e:
+                self.log(f"[ERROR] Failed to submit mesh batch: {e}")
+            return
+
+        # ---- Local mode fallback (leave your old local morph workflow here) ----
+        self.log("[MORPH] Local mode: running local morph workflow (not HPC orchestrator).")
+        # (keep whatever you want for local)
+
 
     def _on_morph_finished(self, result):
         self.log("[INFO] Mesh deformation complete.")

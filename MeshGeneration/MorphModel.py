@@ -25,7 +25,7 @@ class MorphModelBase:
         self.path        = path
         self.constraint  = con
         self.phi_bounds  = pb if pb is not None else []
-        self.bf_t        = "wendland_c_0"
+        self.bf_t        = "wendland_c_2"
         self.c_t         = "radius"
         self.c_mod_t     = 1.0
         self.bf_u        = "wendland_c_0"
@@ -51,7 +51,7 @@ class MorphModelBase:
         self.control_nodes = [] if cn is None else cn
         self.displacement_vector = [] if dispVector is None else dispVector      
         
-        self.alpha_support = 0.25  # fraction of T-surface size used as support radius (tune 0.1–0.5)
+        self.alpha_support = 0.3  # fraction of T-surface size used as support radius (tune 0.1–0.5)
         self.rbf_lambda = 1e-10   
         
         
@@ -179,154 +179,227 @@ class MorphModel(MorphModelBase):
         t_verts,
         anchor_points=None,
         tol=1e-9,
-        # Anchor “strength” controls (robust across geometries)
-        anchor_subsample=12,     # keep every Nth anchor (3 is a good default)
-        anchor_soft=0,       # 0 = hard zero anchors, 0.1 = allow 10% motion at anchors
-        anchor_strength=1,      # DO NOT duplicate anchors by default (over-damps easily)
-        # Optional displacement smoothing (helps residual ridges without clamping)
-        smooth_iters=0,         # 0 disables
-        smooth_k=12,
-        smooth_strength=0.20,   # 0..1
+        # ---- control influence radius (PASS 1) ----
+        min_R_frac=0.2,
+        fallback_R_frac=0.85,
+        R_scale=2.75,
+
+        # ---- legacy taper (DISABLE for new method) ----
+        anchor_taper=False,
+        dc_ramp_frac=0.08,
+
+        # ---- control mapping ----
+        snap_tol_frac=1e-10,
+
+        # ---- NEW: boundary correction (PASS 2) ----
+        boundary_recover=True,
+        corr_R_frac=0.03,          # smaller radius than pass-1 (fraction of patch length)
+        corr_R_scale=1.0,          # additional scaling
+        corr_lambda=1e-8,          # regularization for correction solve
+        corr_band_frac=0.06,       # correction decays to ~0 after this band thickness
+        max_corr_sources=1200,     # thin boundary sources if too many (keeps solve tractable)
+        corr_chunk=5000,           # chunk size for evaluating correction field
+        seed=0,
     ):
         """
-        Constrained/soft-anchored RBF morph for T surface.
+        Two-pass morph:
 
-        Key idea:
-        - Control nodes impose the desired displacement
-        - Anchor points impose a *soft* (not necessarily zero) displacement, so they don't over-damp
-        - No post-mask ramp multiplication (avoids “ramp ridge” artefacts)
+        PASS 1:
+        U1(x) = sum_i phi(||x-ci||/Ri) * disp_i        (your current behaviour)
 
-        Defaults chosen to work well with 1–O(10) control nodes and O(100–1000) anchors.
+        PASS 2 (boundary correction):
+        Solve weights W on boundary samples S such that:
+            sum_j phi(||S_k - S_j||/Rc) * W_j = -U1(S_k)
+        Then:
+            Uc(x) = sum_j phi(||x - S_j||/Rc) * W_j
+        Apply locally near boundary using distance-band weight w(d):
+            U(x) = U1(x) + w(d(x)) * Uc(x)
 
-        Parameters:
-        anchor_subsample : keep every Nth anchor (reduces over-constraint)
-        anchor_soft      : fraction of mean control displacement used at anchors (0..1)
-        anchor_strength  : repeats anchor constraints (weighting). Keep at 1 unless you *need* stiffer seam.
+        This avoids the ridge created by multiplying U1 by a decay ramp near anchors.
         """
         import numpy as np
 
         if not self.control_nodes or self.displacement_vector is None:
             return np.asarray(t_verts, float).tolist()
 
-        # ----- control sources -----
-        source = np.asarray(self.control_nodes, dtype=float)
-        disp   = np.asarray(self.displacement_vector, dtype=float)
+        T = np.asarray(t_verts, dtype=float)
+        if T.size == 0:
+            return []
 
-        if source.ndim == 1:
-            source = source.reshape(1, -1)
+        ctrl = np.asarray(self.control_nodes, dtype=float)
+        disp = np.asarray(self.displacement_vector, dtype=float)
+        if ctrl.ndim == 1:
+            ctrl = ctrl.reshape(1, -1)
         if disp.ndim == 1:
             disp = disp.reshape(1, -1)
 
-        if source.shape[0] != disp.shape[0]:
-            raise ValueError(f"Control-node count ({source.shape[0]}) != displacement count ({disp.shape[0]})")
+        if ctrl.shape[0] != disp.shape[0]:
+            raise ValueError(f"Control-node count ({ctrl.shape[0]}) != displacement count ({disp.shape[0]})")
 
-        T_raw = np.asarray(t_verts, float)
-        if T_raw.size == 0:
-            return []
-
-        # ----- anchor constraints (soft displacement) -----
-        source_aug = source
-        disp_aug   = disp
-
-        if anchor_points is not None and len(anchor_points) > 0:
-            B = np.asarray(anchor_points, float)
-            if B.ndim == 1:
-                B = B.reshape(1, -1)
-
-            # Subsample anchors to avoid over-constraining (VERY important when few control nodes)
-            if anchor_subsample and anchor_subsample > 1:
-                B = B[::int(anchor_subsample), :]
-
-            # Remove anchors that coincide with a control node to avoid contradictory constraints
-            try:
-                from scipy.spatial import cKDTree
-                treeS = cKDTree(source)
-                dmin, _ = treeS.query(B, k=1)
-                B = B[dmin > (10 * tol)]
-            except Exception:
-                pass
-
-            if len(B) > 0:
-                # Soft anchor displacement = anchor_soft * mean(control displacement)
-                # (keeps seam “mostly fixed” but prevents global over-damping)
-                anchor_soft = float(np.clip(anchor_soft, 0.0, 1.0))
-                disp_mean = np.mean(disp, axis=0, keepdims=True)   # (1,3)
-                Z = np.repeat(disp_mean, len(B), axis=0) * anchor_soft
-
-                # Optional extra weighting via duplication (keep = 1 by default)
-                if anchor_strength and anchor_strength > 1:
-                    rep = int(anchor_strength)
-                    B = np.repeat(B, rep, axis=0)
-                    Z = np.repeat(Z, rep, axis=0)
-
-                source_aug = np.vstack([source, B])
-                disp_aug   = np.vstack([disp,   Z])
-
-        # ---------------- Surface-dependent scaling ----------------
-        mins = T_raw.min(axis=0)
-        maxs = T_raw.max(axis=0)
+        # patch scale
+        mins = T.min(axis=0)
+        maxs = T.max(axis=0)
         L = float(np.linalg.norm(maxs - mins))
-        L = max(L, 1e-9)
+        L = max(L, 1e-12)
 
-        center = T_raw.mean(axis=0)
-        S = (source_aug - center) / L
-        T = (T_raw     - center) / L
-
-        bf = get_bf(self.bf_t)
-
-        alpha = float(getattr(self, "alpha_support", 0.25))
-        c = 1.0 / max(alpha, 1e-6)
-        c *= float(getattr(self, "c_mod_t", 1.0))
-
-        bfs = [bf] * 3
-        cs  = [c]  * 3
-
-        S_list = S.tolist()
-        D_list = disp_aug.tolist()
-
+        # snap controls to actual mesh vertices
         try:
-            ls, bs, conds = train_3d(
-                S_list, D_list, bfs, cs,
-                reg_lambda=float(getattr(self, "rbf_lambda", 0.0))
-            )
-        except TypeError:
-            ls, bs, conds = train_3d(S_list, D_list, bfs, cs)
+            from scipy.spatial import cKDTree
+            treeT = cKDTree(T)
+            dmin, idx0 = treeT.query(ctrl, k=1)
+            dmin = np.asarray(dmin, float)
+            idx0 = np.asarray(idx0, int)
+        except Exception:
+            idx0 = np.array([int(np.argmin(np.linalg.norm(T - p[None, :], axis=1))) for p in ctrl], dtype=int)
+            dmin = np.array([float(np.linalg.norm(T[idx0[i]] - ctrl[i])) for i in range(len(idx0))], dtype=float)
 
-        pred = predict_3d(ls, bs, S_list, T.tolist(), bfs, cs)
-        pred = np.asarray(pred, float)
+        snap_tol = max(float(snap_tol_frac) * L, 1e-12)
+        ctrl_snap = np.array(ctrl, copy=True)
+        need_snap = dmin > snap_tol
+        if np.any(need_snap):
+            ctrl_snap[need_snap] = T[idx0[need_snap]]
 
-        # ---------------- Optional: smooth the displacement field ----------------
-        if smooth_iters and smooth_iters > 0 and smooth_strength and smooth_strength > 0:
+        n_ctrl = int(ctrl_snap.shape[0])
+
+        # Wendland C4 kernel (compact support, C4 smooth)
+        def phi(s):
+            s = np.asarray(s, dtype=float)
+            out = np.zeros_like(s)
+            m = s < 1.0
+            sm = s[m]
+            out[m] = (1.0 - sm) ** 6 * (35.0 * sm**2 + 18.0 * sm + 3.0)
+            return out
+
+        # PASS 1: compute U1 from control nodes
+        if anchor_points is not None and len(anchor_points) > 0:
+            A = np.asarray(anchor_points, dtype=float)
+            if A.ndim == 1:
+                A = A.reshape(1, -1)
             try:
                 from scipy.spatial import cKDTree
-                kdt = cKDTree(T_raw)
-                _, idx = kdt.query(T_raw, k=min(int(smooth_k) + 1, len(T_raw)))
-                idx = idx[:, 1:]  # drop self
-                lam = float(np.clip(smooth_strength, 0.0, 1.0))
-                for _ in range(int(smooth_iters)):
-                    nbr_mean = pred[idx].mean(axis=1)
-                    pred = (1.0 - lam) * pred + lam * nbr_mean
+                treeA = cKDTree(A)
+                Ri, _ = treeA.query(ctrl_snap, k=1)
+                Ri = np.asarray(Ri, float)
             except Exception:
-                pass
+                Ri = np.array([np.min(np.linalg.norm(A - p[None, :], axis=1)) for p in ctrl_snap], dtype=float)
 
-        # ---------------- Optional: “nearly fixed” anchors (project to nearest T nodes) ----------------
-        # If you want anchors closer to the seam to be more fixed than soft anchors allow, set anchor_soft smaller
-        # or uncomment below to softly clamp a small subset.
-        # if anchor_points is not None and len(anchor_points) > 0:
-        #     try:
-        #         from scipy.spatial import cKDTree
-        #         treeT = cKDTree(T_raw)
-        #         B0 = np.asarray(anchor_points, float)
-        #         if B0.ndim == 1:
-        #             B0 = B0.reshape(1, -1)
-        #         d, j = treeT.query(B0, k=1)
-        #         # Hard clamp only very-close points
-        #         pred[j[d <= (10*tol)]] *= 0.0
-        #     except Exception:
-        #         pass
+            R_min = max(float(min_R_frac) * L, 1e-9)
+            Ri = np.maximum(Ri, R_min) * float(R_scale)
+        else:
+            Ri = np.full((n_ctrl,), float(R_scale) * max(float(fallback_R_frac) * L, 1e-9), dtype=float)
 
-        return (T_raw + pred).tolist()
+        N = T.shape[0]
+        U1 = np.zeros((N, 3), dtype=float)
+        for i in range(n_ctrl):
+            r = np.linalg.norm(T - ctrl_snap[i][None, :], axis=1)
+            wi = phi(r / Ri[i])
+            U1 += wi[:, None] * disp[i][None, :]
 
+        # Legacy anchor taper multiply (leave available but default OFF)
+        if anchor_taper and anchor_points is not None and len(anchor_points) > 0:
+            A = np.asarray(anchor_points, dtype=float)
+            if A.ndim == 1:
+                A = A.reshape(1, -1)
+            try:
+                from scipy.spatial import cKDTree
+                treeA = cKDTree(A)
+                db, _ = treeA.query(T, k=1)
+                db = np.asarray(db, float)
+            except Exception:
+                db = np.min(np.linalg.norm(T[:, None, :] - A[None, :, :], axis=2), axis=1)
+
+            ramp = max(float(dc_ramp_frac) * L, 1e-12)
+            t = np.clip(db / ramp, 0.0, 1.0)
+            wA = t**3 * (t * (t * 6.0 - 15.0) + 10.0)  # smootherstep
+            wA[db <= tol] = 0.0
+            U1 *= wA[:, None]
+
+        # PASS 2: boundary correction (recommended ON)
+        if boundary_recover and anchor_points is not None and len(anchor_points) > 0:
+            A = np.asarray(anchor_points, dtype=float)
+            if A.ndim == 1:
+                A = A.reshape(1, -1)
+
+            # map anchors to indices in T
+            try:
+                from scipy.spatial import cKDTree
+                treeT = cKDTree(T)
+                dB, idxB = treeT.query(A, k=1)
+                dB = np.asarray(dB, float)
+                idxB = np.asarray(idxB, int)
+            except Exception:
+                idxB = np.array([int(np.argmin(np.linalg.norm(T - p[None, :], axis=1))) for p in A], dtype=int)
+                dB = np.array([float(np.linalg.norm(T[idxB[i]] - A[i])) for i in range(len(idxB))], dtype=float)
+
+            # keep only anchors that truly lie on T (numerical safety)
+            B_tol = max(1e-10 * L, 1e-12)
+            keep = dB <= B_tol
+            idxB = idxB[keep]
+            if idxB.size > 0:
+                # unique boundary indices
+                idxB = np.unique(idxB)
+
+                S = T[idxB]                 # boundary source points
+                F = -U1[idxB]               # boundary targets (cancel U1 at boundary)
+
+                # thin sources if too many (keeps solve stable/fast)
+                if S.shape[0] > max_corr_sources:
+                    rng = np.random.default_rng(seed)
+                    # farthest-point sampling (simple)
+                    Ns = S.shape[0]
+                    pick = [int(rng.integers(Ns))]
+                    d2 = np.full(Ns, np.inf)
+                    for _ in range(max_corr_sources - 1):
+                        last = pick[-1]
+                        dist2 = np.sum((S - S[last])**2, axis=1)
+                        d2 = np.minimum(d2, dist2)
+                        pick.append(int(np.argmax(d2)))
+                    pick = np.array(pick, dtype=int)
+                    S = S[pick]
+                    F = F[pick]
+
+                # correction radius and band
+                Rc = max(float(corr_R_frac) * L, 1e-9) * float(corr_R_scale)
+                Rband = max(float(corr_band_frac) * L, 1e-12)
+
+                # build (K + λI) and solve for weights W in R^3
+                # K_ij = phi(||Si - Sj|| / Rc)
+                dSS = np.linalg.norm(S[:, None, :] - S[None, :, :], axis=2)
+                K = phi(dSS / Rc)
+                K.flat[:: K.shape[0] + 1] += float(corr_lambda)  # add λ on diagonal
+
+                # solve for W: (M,M) x (M,3) = (M,3)
+                W = np.linalg.solve(K, F)
+
+                # distance-to-boundary for band weight
+                try:
+                    from scipy.spatial import cKDTree
+                    treeS = cKDTree(S)
+                    d_to_B, _ = treeS.query(T, k=1)
+                    d_to_B = np.asarray(d_to_B, float)
+                except Exception:
+                    d_to_B = np.min(np.linalg.norm(T[:, None, :] - S[None, :, :], axis=2), axis=1)
+
+                # band weight: 1 at boundary, 0 after Rband
+                t = np.clip(d_to_B / Rband, 0.0, 1.0)
+                w = 1.0 - (t**3 * (t * (t * 6.0 - 15.0) + 10.0))  # 1 - smootherstep
+
+                # evaluate correction field in chunks: Uc = K(T,S) @ W
+                Uc = np.zeros_like(U1)
+                for i0 in range(0, N, corr_chunk):
+                    i1 = min(N, i0 + corr_chunk)
+                    Tc = T[i0:i1]
+                    dTS = np.linalg.norm(Tc[:, None, :] - S[None, :, :], axis=2)
+                    Kts = phi(dTS / Rc)
+                    Uc[i0:i1] = Kts @ W
+
+                # apply locally-weighted correction
+                U = U1 + (w[:, None] * Uc)
+
+                return (T + U).tolist()
+
+        # default: pass-1 only
+        return (T + U1).tolist()
 
     def get_nodes(self, sections, surfaces, faces, nodes, ff):
         g_ids = []
