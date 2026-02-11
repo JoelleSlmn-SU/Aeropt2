@@ -444,9 +444,9 @@ class MainWindow(QMainWindow):
                 try:
                     import os
 
-                    base = getattr(self, "base_name", None) or self.get_project_basename()
+                    base = getattr(self, "base", None) or self.get_project_basename()
 
-                    local_output_dir = self.output_dir  # your local output directory
+                    local_output_dir = self.output_directory  # your local output directory
                     remote_orig_dir = f"{base_hpc_dir}/orig"
 
                     # 1) Ensure remote orig directory exists
