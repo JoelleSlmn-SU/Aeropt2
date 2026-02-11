@@ -392,6 +392,7 @@ class MainWindow(QMainWindow):
             os.makedirs(self.rbf_original, exist_ok=True)
                 
     def save_file(self):
+        import os
         # 1) Pick output dir (local)
         output_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory")
         if not output_dir:
