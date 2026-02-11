@@ -382,7 +382,7 @@ class ClusterPipelineManager:
                             pca_coeffs=coeffs,
                             normal_project=bool(basis.get("normal_project", True)),
                             t_patch_scale=basis.get("t_patch_scale", None),
-                            amp_alpha=float(basis.get("amp_alpha", 0.002)),
+                            amp_alpha=float(basis.get("amp_alpha", 0.005)),
                         )
                     else:
                         k_modes = int(basis.get("k_modes", max(1, coeffs.size)))
@@ -400,7 +400,7 @@ class ClusterPipelineManager:
                             k_modes=k_modes,
                             normal_project=bool(basis.get("normal_project", True)),
                             t_patch_scale=basis.get("t_patch_scale", None),
-                            amp_alpha=float(basis.get("amp_alpha", 0.002)),
+                            amp_alpha=float(basis.get("amp_alpha", 0.005)),
                         )
 
                     d_ctrl = np.asarray(d_ctrl, dtype=float)
