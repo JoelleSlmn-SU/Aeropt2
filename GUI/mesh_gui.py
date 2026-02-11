@@ -1,19 +1,17 @@
 import os, sys
 import numpy as np
 import matplotlib.cm as cm
-from PyQt5.QtCore import Qt, pyqtSignal, QThread, QTimer, pyqtSlot, QMetaObject, Q_ARG
+from PyQt5.QtCore import Qt, pyqtSignal, QThread, QTimer, pyqtSlot, QMetaObject, Q_ARG, QObject, QEvent
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QPushButton, QLabel, QSizePolicy, QDialog, QComboBox,
-    QFileDialog, QLineEdit, QHBoxLayout, QInputDialog, QCheckBox, QListWidget
+    QWidget, QVBoxLayout, QPushButton, QLabel, QSizePolicy, QDialog, QComboBox, QSpinBox,
+    QFileDialog, QLineEdit, QHBoxLayout, QInputDialog, QCheckBox, QListWidget, QDialogButtonBox
 )
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
 import pyvista as pv
+import vtk
 from pyvistaqt import QtInteractor
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d import Axes3D  # Needed for 3D plots
-import pyqtgraph.opengl as gl
 
 for dir in ["FileRW", "ShapeParameterization", "MeshGeneration", "ConvertFileType", "Remote", "Local", "GUI"]:
     sys.path.append(os.path.dirname(dir))
@@ -24,6 +22,9 @@ from Local.runSimLocal import *
 from ConvertFileType.convertToStep import *
 from GUI.workers import MorphWorker
 import pickle
+from MeshGeneration.pcaBasis import (
+    make_signature, load_pca_basis, save_pca_basis, build_pca_basis
+)
 
 def _dedup_preserve_order(seq):
         """Deduplicate while preserving order."""
@@ -34,6 +35,21 @@ def _dedup_preserve_order(seq):
                 seen.add(x)
                 out.append(x)
         return out
+    
+    
+class VtkRightClickFilter(QObject):
+    def __init__(self, parent, on_click):
+        super().__init__(parent)
+        self._on_click = on_click
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton:
+            # Qt gives x,y in widget coords (origin top-left)
+            x = event.pos().x()
+            y = event.pos().y()
+            self._on_click(x, y)
+            return True  # consume
+        return False
 
 class MeshViewer(QWidget):
     control_ready = pyqtSignal()
@@ -294,7 +310,6 @@ class MeshViewer(QWidget):
                 opacity=1.0,
                 pickable=False
             )
-            # optional: gently fly camera to the surface center (keeps user interaction)
             try:
                 self.plotter.fly_to(mesh.center)
             except Exception:
@@ -466,8 +481,6 @@ class MeshViewer(QWidget):
         
     def _surface_id_from_actor_name(self, name: str) -> str:
         """Extract the surface ID you use elsewhere from the actor's name."""
-        # Keep exactly the identifier your downstream expects.
-        # Your code already uses: last token if "Surface" is in label, else the full name
         return name.split()[-1] if "Surface" in name else name
 
     def reset_surfaces(self):
@@ -603,9 +616,9 @@ class MeshViewer(QWidget):
             if act == actor:
                 sid = self.mesh_obj.get_surface_id(name)
                 if sid not in self.TSurfaces:
-                    self.TSurfaces.append(sid)   # backend
+                    self.TSurfaces.append(sid)   
                     if not hasattr(self, "T_names"): self.T_names = []
-                    self.T_names.append(name)    # display
+                    self.T_names.append(name)    
                 break
 
     def _remove_selected(self, list_widget, backing_list):
@@ -626,9 +639,9 @@ class MeshViewer(QWidget):
             if act == actor:
                 sid = self.mesh_obj.get_surface_id(name)
                 if sid not in self.CSurfaces:
-                    self.CSurfaces.append(sid)   # backend
+                    self.CSurfaces.append(sid)   
                     if not hasattr(self, "C_names"): self.C_names = []
-                    self.C_names.append(name)    # display
+                    self.C_names.append(name)    
                 break
 
     def mark_U_surface(self, actor):
@@ -636,10 +649,203 @@ class MeshViewer(QWidget):
             if act == actor:
                 sid = self.mesh_obj.get_surface_id(name)
                 if sid not in self.USurfaces:
-                    self.USurfaces.append(sid)   # backend
+                    self.USurfaces.append(sid)   
                     if not hasattr(self, "U_names"): self.U_names = []
-                    self.U_names.append(name)    # display
+                    self.U_names.append(name)    
                 break
+
+    def manual_select_control_nodes(self, t_mesh: pv.PolyData, n_pick: int):
+        import vtk
+        from PyQt5.QtCore import Qt
+
+        # reset view
+        try:
+            self.plotter.close()
+        except Exception:
+            pass
+        self.plotter = QtInteractor(self)
+        self.main_layout.addWidget(self.plotter)
+
+        self._manual_pick_targets = int(n_pick)
+        self._manual_pick_ids = []
+        self._manual_pick_pts = []
+        self._manual_pick_actors = []
+
+        # Keep reference to the mesh we are picking on
+        self._manual_t_poly = t_mesh
+        self._manual_t_points = np.asarray(t_mesh.points, float)
+
+        # Render as a proper surface (cells exist)
+        self.plotter.add_mesh(t_mesh, color="#52b7ba", style="points", show_edges=False, pickable=True)
+        self.plotter.add_text(
+            f"Manual CN pick: RIGHT click {n_pick} points on T surface\n"
+            f"Press 'Finish Manual Pick' when done",
+            name="manual_pick_label",
+            position="upper_left",
+            font_size=10,
+        )
+        self.plotter.reset_camera()
+        self.plotter.render()
+
+        # ensure widget takes mouse events
+        self.plotter.setFocusPolicy(Qt.StrongFocus)
+        self.plotter.setFocus()
+        self.plotter.setMouseTracking(True)
+
+        # VTK picker
+        self._vtk_picker = vtk.vtkCellPicker()
+        self._vtk_picker.SetTolerance(0.05)
+
+        def _qt_right_click(x, y):
+            self.log(f"[DEBUG] Qt Right click at ({x},{y})")
+
+            ren = self.plotter.renderer
+            dpr = 1.0
+            try:
+                dpr = float(self.plotter.devicePixelRatioF())
+            except Exception:
+                try:
+                    dpr = float(self.plotter.devicePixelRatio())
+                except Exception:
+                    dpr = 1.0
+
+            xp = int(round(x * dpr))
+            yp = int(round((self.plotter.height() - y) * dpr))  # flip Y for VTK
+
+            ok = self._vtk_picker.Pick(xp, yp, 0, self.plotter.renderer)
+            
+            if not ok:
+                self.log("[DEBUG] Picker: no hit.")
+                return
+
+            pos = np.array(self._vtk_picker.GetPickPosition(), float)
+            pid = int(self._manual_t_poly.find_closest_point(pos))
+            if pid < 0:
+                self.log("[DEBUG] Picker hit but no closest point.")
+                return
+
+            picked_pt = np.array(self._manual_t_poly.points[pid], float)
+            self._on_manual_point_picked(picked_pt)
+
+        # remove old filter (if any) + install new
+        try:
+            if hasattr(self, "_vtk_rc_filter") and self._vtk_rc_filter is not None:
+                self.plotter.removeEventFilter(self._vtk_rc_filter)
+        except Exception:
+            pass
+
+        self._vtk_rc_filter = VtkRightClickFilter(self.plotter, _qt_right_click)
+        self.plotter.installEventFilter(self._vtk_rc_filter)
+        self.log("[INFO] Manual pick: Qt right-click filter installed.")
+
+        # buttons
+        self._manual_finish_btn = QPushButton("Finish Manual Pick")
+        self._manual_finish_btn.clicked.connect(self._finalize_manual_pick)
+        self.main_layout.addWidget(self._manual_finish_btn)
+
+        self._manual_clear_btn = QPushButton("Clear Picks")
+        self._manual_clear_btn.clicked.connect(self._clear_manual_pick)
+        self.main_layout.addWidget(self._manual_clear_btn)
+
+        self.log("[INFO] Manual picking enabled: RIGHT click on the surface mesh.")
+
+
+    def _on_manual_point_picked(self, picked_point):
+        if picked_point is None:
+            self.log("[INFO] No point detected.")
+            return
+        if len(self._manual_pick_ids) >= self._manual_pick_targets:
+            self.log("[INFO] Already picked required number of control nodes.")
+            return
+
+        p = np.asarray(picked_point, float).reshape(1, 3)
+        # snap to nearest actual T node
+        dif = self._manual_t_points - p
+        i = int(np.argmin(np.einsum("ij,ij->i", dif, dif)))
+
+        if i in self._manual_pick_ids:
+            return  # prevent duplicates
+
+        self._manual_pick_ids.append(i)
+        pt = self._manual_t_points[i]
+        self._manual_pick_pts.append(pt)
+
+        # draw a marker
+        marker = pv.Sphere(radius=0.01 * (np.linalg.norm(self._manual_t_points.max(0)-self._manual_t_points.min(0)) + 1e-12),
+                        center=pt)
+        act = self.plotter.add_mesh(marker, color="black")
+        if not hasattr(self, "_manual_pick_actors"):
+            self._manual_pick_actors = []
+        self._manual_pick_actors.append(act)
+
+        self.log(f"[INFO] Picked {len(self._manual_pick_ids)}/{self._manual_pick_targets} control nodes.")
+        if len(self._manual_pick_ids) == self._manual_pick_targets:
+            self.log("[INFO] Required picks reached. Click 'Finish Manual Pick' to continue.")
+
+    def _clear_manual_pick(self):
+        self._manual_pick_ids = []
+        self._manual_pick_pts = []
+        for a in getattr(self, "_manual_pick_actors", []):
+            try:
+                self.plotter.remove_actor(a)
+            except Exception:
+                pass
+        self._manual_pick_actors = []
+        self.plotter.render()
+        self.log("[INFO] Manual picks cleared.")
+
+    def _finalize_manual_pick(self):
+        if len(self._manual_pick_pts) == 0:
+            self.log("[WARN] No points selected.")
+            return
+        if len(self._manual_pick_pts) != self._manual_pick_targets:
+            self.log(f"[WARN] Selected {len(self._manual_pick_pts)} but expected {self._manual_pick_targets}.")
+            return
+
+        self.points = self._manual_t_points
+        self.control_nodes = np.asarray(self._manual_pick_pts, float)
+
+        # compute normals like auto path
+        surf_normals = _surface_normals(self.points, knn=16)
+        self.control_normals = _map_normals_to_control(self.control_nodes, self.points, surf_normals, k=12)
+
+        # compute patch scale (same as plot_T_surfaces)
+        try:
+            pts = np.asarray(self.points, float)
+            d = pts.max(axis=0) - pts.min(axis=0)
+            self.t_patch_scale = float(np.linalg.norm(d))
+            self.log(f"[INFO] T-patch scale (manual pick) = {self.t_patch_scale:.6g}")
+        except Exception as e:
+            self.t_patch_scale = None
+            self.log(f"[WARN] Failed to compute T-patch scale: {e}")
+
+        # remove manual pick buttons
+        try:
+            self._manual_finish_btn.setParent(None)
+            self._manual_clear_btn.setParent(None)
+        except Exception:
+            pass
+
+        
+        self.plot_T_surfaces()
+        
+    def auto_select_control_nodes(self, output_path, num_input):
+        self.points, self.control_nodes = selectControlNodes(output_path, self.output_dir, num_input)
+        surf_normals = _surface_normals(self.points, knn=16)
+        self.control_normals = _map_normals_to_control(self.control_nodes, self.points, surf_normals, k=12)
+
+        try:
+            pts = np.asarray(self.points, float)
+            d = pts.max(axis=0) - pts.min(axis=0)
+            self.t_patch_scale = float(np.linalg.norm(d))  # bbox diagonal
+            self.log(f"[INFO] T-patch scale (from plot_T_surfaces points) = {self.t_patch_scale:.6g}")
+        except Exception as e:
+            self.t_patch_scale = None
+            self.log(f"[WARN] Failed to compute T-patch scale in plot_T_surfaces: {e}")
+        
+        self.plotter.close()
+        
+        self.plot_T_surfaces()
 
     # --- finish selection ---
     def finish_selection(self):
@@ -667,8 +873,6 @@ class MeshViewer(QWidget):
         # --- Universe of surfaces as IDs ---
         all_ids = _as_int_list([self.mesh_obj.get_surface_id(nm) for nm in self.surface_actors.keys()])
 
-        # Convert selected name lists to ID lists (if they’re names, get_surface_id will be safer)
-        # If self.TSurfaces already stores ids, int() will handle it; if it stores names, use get_surface_id.
         def _names_or_ids_to_ids(seq):
             ids = []
             for item in (seq or []):
@@ -712,31 +916,38 @@ class MeshViewer(QWidget):
             except Exception:
                 pass
 
-        # Prompt user for number of control nodes (unchanged)
-        num_input, ok = QInputDialog.getInt(
-            self, "Control Node Count",
-            "How many control nodes would you like to use?",
-            min=1, max=100
-        )
-        if not ok:
+        dlg = ControlNodeSelectionDialog(self)
+        if dlg.exec_() != QDialog.Accepted:
             return
+        mode, num_input = dlg.get_choice()
 
         # --- Build preview PolyData from T surface NAMES ---
-        append = pv.PolyData()
-        for nm in T_names:
-            pts = self.mesh_obj.get_surface_points(nm)
-            if pts is None or len(pts) == 0:
-                self.log(f"[WARN] No points found for T surface '{nm}'")
+        t_mesh = None
+        for nm in getattr(self, "T_names", []):   # IMPORTANT: use names, not IDs
+            surf = self.mesh_obj.get_surface_mesh(nm)
+            if surf is None or surf.n_cells == 0:
                 continue
-            append = append.merge(pv.PolyData(pts))
+            t_mesh = surf.copy() if t_mesh is None else t_mesh.merge(surf)
 
+        if t_mesh is None or t_mesh.n_cells == 0:
+            self.log("[WARN] No T-surface cells available for manual selection.")
+            return
+
+        # Make it “picker-friendly”
+        t_mesh = t_mesh.extract_surface().triangulate().clean()
+
+        # If you still want to save for downstream, save the real surface mesh
         output_path = os.path.join(self.output_dir, "surfaces", "output.vtk")
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        if append.n_points > 0:
-            append.save(output_path)
-            self.plot_T_surfaces(output_path, num_input)
+        t_mesh.save(output_path)
+        
+        
+        if mode == "auto":
+            self.auto_select_control_nodes(output_path, num_input)
         else:
-            self.log("[WARN] No T-surface points to save; output.vtk not written.")
+            # manual selection from T mesh nodes
+            self.manual_select_control_nodes(t_mesh, num_input)
+
 
     def open_edit_dialog(self):
         # Use stored name lists (fall back to empty if not set yet)
@@ -758,26 +969,17 @@ class MeshViewer(QWidget):
         self.CSurfaces = [self.mesh_obj.friendly_names[nm] for nm in C_names]
         self.log(f"[EDIT] Updated surfaces: T={self.TSurfaces}, U={self.USurfaces}, C={self.CSurfaces}")
 
-    def plot_T_surfaces(self, vtk_path, num_control_nodes):
-        self.points, self.control_nodes = selectControlNodes(vtk_path, self.output_dir, num_control_nodes)
-        surf_normals = _surface_normals(self.points, knn=16)
-        self.control_normals = _map_normals_to_control(self.control_nodes, self.points, surf_normals, k=12)
-
+    def plot_T_surfaces(self):
         try:
-            pts = np.asarray(self.points, float)
-            d = pts.max(axis=0) - pts.min(axis=0)
-            self.t_patch_scale = float(np.linalg.norm(d))  # bbox diagonal
-            self.log(f"[INFO] T-patch scale (from plot_T_surfaces points) = {self.t_patch_scale:.6g}")
-        except Exception as e:
-            self.t_patch_scale = None
-            self.log(f"[WARN] Failed to compute T-patch scale in plot_T_surfaces: {e}")
+            self.plotter.close()
+        except Exception:
+            pass
         
-        self.plotter.close()
         self.plotter = QtInteractor(self)
         self.main_layout.addWidget(self.plotter)
 
         polydata = pv.PolyData(self.points)
-        self.plotter.add_mesh(polydata, show_edges=True, opacity=0.3)
+        self.plotter.add_mesh(polydata, color="#52b7ba", show_edges=True, opacity=0.3)
 
         # Plot control nodes directly
         cn = pv.PolyData()
@@ -840,14 +1042,46 @@ class MeshViewer(QWidget):
         # Persist last choice if present
         self.rigid_c_cb.setChecked(getattr(self, "rigid_boundary_translation", False))
         self.form.addRow(self.rigid_c_cb)
+        
+        
+        from PyQt5.QtWidgets import QLineEdit, QLabel
+        # ---------- PCA reduced-space controls ----------
+        self.use_pca_cb = QCheckBox("Use PCA reduced space")
+        default_use_pca = bool(getattr(self.main_window, "use_pca_reduced", False))
+        self.use_pca_cb.setChecked(default_use_pca)
 
-        # ---- Optional bump window controls
+        self.pca_M_spin = QSpinBox()
+        self.pca_M_spin.setRange(20, 5000)
+        self.pca_M_spin.setValue(300)
+        self.pca_M_spin.setSingleStep(50)
+
+        self.pca_energy_spin = QDoubleSpinBox()
+        self.pca_energy_spin.setDecimals(3)
+        self.pca_energy_spin.setRange(0.50, 0.999)
+        self.pca_energy_spin.setValue(0.99)
+        self.pca_energy_spin.setSingleStep(0.01)
+
+        self.pca_k_spin = QSpinBox()
+        self.pca_k_spin.setRange(0, 5000)  # 0 => auto from energy
+        self.pca_k_spin.setValue(0)
+
+        pca_row = QHBoxLayout()
+        pca_row.addWidget(self.use_pca_cb)
+        pca_row.addWidget(QLabel("PCA M"))
+        pca_row.addWidget(self.pca_M_spin)
+        pca_row.addWidget(QLabel("Energy"))
+        pca_row.addWidget(self.pca_energy_spin)
+        pca_row.addWidget(QLabel("k (0=auto)"))
+        pca_row.addWidget(self.pca_k_spin)
+
+        self.form.addRow(pca_row)
+
+        # Optional bump window controls
         self.bump_enable_cb = QCheckBox("Enable bump window")
         self.bump_enable_cb.setChecked(getattr(self, "bump_enable", False))
         self.form.addRow(self.bump_enable_cb)
 
         bump_row = QHBoxLayout()
-        from PyQt5.QtWidgets import QLineEdit, QLabel
         self.bump_cx = QLineEdit(); self.bump_cx.setPlaceholderText("cx")
         self.bump_cy = QLineEdit(); self.bump_cy.setPlaceholderText("cy")
         self.bump_cz = QLineEdit(); self.bump_cz.setPlaceholderText("cz")
@@ -890,8 +1124,6 @@ class MeshViewer(QWidget):
             self.log(f"[ERROR] Could not go back: {e}")
 
     def save_controlnodes(self):
-        #saveSelectedControlNodes(self.control_nodes, os.path.join(self.output_dir, "Control Nodes"))
-
         self.cn_btn.setVisible(False)
 
         self.k_modes = int(self.k_modes_spin.value())
@@ -914,45 +1146,123 @@ class MeshViewer(QWidget):
                 self.bump_center = (cx, cy, cz)
                 self.bump_radius = r
             except Exception:
-                # If parsing fails, disable bump safely
                 self.bump_enable = False
                 self.bump_center = None
                 self.bump_radius = None
 
-        #self.plotter.close()
-        #self.back_btn.setVisible(False)
-        #self.form_widget.setVisible(False)
-        
-        '''self.morph_btn = QPushButton("Morph Mesh")
-        self.morph_btn.clicked.connect(self.morphMesh)
-        self.main_layout.addWidget(self.morph_btn)'''
-        
-        # Notify the main window that controls are ready
-        self.control_ready.emit()
-        '''try:
-            self._preview_small_morph()
+        # PCA settings
+        self.use_pca = bool(self.use_pca_cb.isChecked())
+        self.pca_train_M = int(self.pca_M_spin.value())
+        self.pca_energy = float(self.pca_energy_spin.value())
+        k_tmp = int(self.pca_k_spin.value())
+        self.pca_k_red = None if k_tmp <= 0 else k_tmp
+
+        # ---- Persist control nodes + normals to output directory ----
+        try:
+            cn_dir = os.path.join(self.output_dir, "Control Nodes")
+            os.makedirs(cn_dir, exist_ok=True)
+
+            cn = np.asarray(self.control_nodes, float).reshape((-1, 3))
+            nn = np.asarray(self.control_normals, float).reshape((-1, 3)) if getattr(self, "control_normals", None) is not None else None
+
+            np.save(os.path.join(cn_dir, "control_nodes.npy"), cn)
+            if nn is not None:
+                np.save(os.path.join(cn_dir, "control_normals.npy"), nn)
+
+            import json
+            cn_meta = {
+                "k_modes": int(self.k_modes),
+                "spectral_p": float(self.spectral_p),
+                "coeff_frac": float(self.coeff_frac),
+                "seed": int(self.seed),
+                "normal_project": bool(self.normal_project),
+                "rigid_boundary_translation": bool(self.rigid_boundary_translation),
+                "t_patch_scale": None if getattr(self, "t_patch_scale", None) is None else float(self.t_patch_scale),
+                "use_pca": bool(self.use_pca),
+                "pca_train_M": int(self.pca_train_M),
+                "pca_energy": float(self.pca_energy),
+                "pca_k_red": (None if self.pca_k_red is None else int(self.pca_k_red)),
+            }
+            with open(os.path.join(cn_dir, "control_nodes_meta.json"), "w", encoding="utf-8") as f:
+                json.dump(cn_meta, f, indent=2)
+
         except Exception as e:
-            self.log(f"[WARN] Preview morph failed: {e}")
-
-    def _preview_small_morph(self):
-        import copy
-        from pyvista import PolyData
-
-        if not hasattr(self, "control_nodes") or not len(self.control_nodes):
+            self.log(f"[WARN] Failed to save control node files: {e}")
+            # still emit ready so UI doesn't deadlock
+            self.control_ready.emit()
             return
 
-        # tiny displacement along x (2mm)
-        disp = np.array(self.control_nodes) + np.array([0.002, 0, 0])
+        # ---- Build PCA cache if enabled ----
+        if self.use_pca:
+            if nn is None:
+                self.log("[WARN] PCA enabled but control_normals missing; disabling PCA.")
+                self.use_pca = False
+            else:
+                pca_dir = os.path.join(cn_dir, "pca")
+                os.makedirs(pca_dir, exist_ok=True)
+                pca_path = os.path.join(pca_dir, "pca_basis.npz")
 
-        # Overlay preview
-        orig = PolyData(np.array(self.control_nodes))
-        morphed = PolyData(disp)
+                sig = make_signature(
+                    control_nodes=cn,
+                    control_normals=nn,
+                    normal_project=bool(self.normal_project),
+                    k_modes=int(self.k_modes),
+                    knn=12,
+                    spectral_p=float(self.spectral_p),
+                    coeff_frac=float(self.coeff_frac),
+                    amp_alpha=0.0005,
+                    t_patch_scale=getattr(self, "t_patch_scale", None),
+                    train_M=int(self.pca_train_M),
+                    energy=float(self.pca_energy),
+                    k_red=self.pca_k_red,
+                )
 
-        self.plotter.add_mesh(orig, color="blue", point_size=10, render_points_as_spheres=True, label="Original CNs")
-        self.plotter.add_mesh(morphed, color="red", point_size=10, render_points_as_spheres=True, opacity=0.5, label="Preview CNs")
+                need_build = True
+                if os.path.exists(pca_path):
+                    try:
+                        pca_existing = load_pca_basis(pca_path)  # PCABasis object
+                        if pca_existing.meta.get("signature") == sig:
+                            need_build = False
+                    except Exception:
+                        need_build = True
 
-        self.plotter.add_legend()
-        self.log("[INFO] Sensitivity preview added (tiny displacements shown).")'''
+                if need_build:
+                    from MeshGeneration.controlNodeDisp import getDisplacements
+
+                    X = []
+                    for i in range(int(self.pca_train_M)):
+                        d = getDisplacements(
+                            output_dir=self.output_dir,          # IMPORTANT (not cn_dir)
+                            seed=int(self.seed) + i,
+                            control_nodes=cn,
+                            normals=nn,
+                            coeffs=None,
+                            k_modes=int(self.k_modes),
+                            normal_project=bool(self.normal_project),
+                            t_patch_scale=getattr(self, "t_patch_scale", None),
+                            amp_alpha=0.02,
+                        )
+                        X.append(np.asarray(d, float).reshape(-1))
+                    X = np.vstack(X)
+
+                    mean, V, sigma, explained = build_pca_basis(
+                        X, energy=float(self.pca_energy), k_red=self.pca_k_red
+                    )
+
+                    save_pca_basis(
+                        pca_path,
+                        mean, V, sigma, explained,
+                        signature=sig,
+                        meta={"signature": sig,
+                            "train_M": int(self.pca_train_M),
+                            "energy": float(self.pca_energy),
+                            "k_red": int(V.shape[1])},
+                    )
+
+                # stash for Aeropt export
+                self.pca_cache_path = pca_path
+
+        self.control_ready.emit()
         
     @pyqtSlot()
     def plot_control_displacements(self):
@@ -1098,9 +1408,7 @@ class MeshViewer(QWidget):
                 self.log(f"[ERROR] Failed to submit mesh batch: {e}")
             return
 
-        # ---- Local mode fallback (leave your old local morph workflow here) ----
         self.log("[MORPH] Local mode: running local morph workflow (not HPC orchestrator).")
-        # (keep whatever you want for local)
 
 
     def _on_morph_finished(self, result):
@@ -1259,3 +1567,57 @@ class SurfaceEditDialog(QDialog):
                 actor.GetProperty().SetEdgeVisibility(False)
             parent.plotter.reset_camera()
             parent.plotter.render()
+            
+            
+            
+class ControlNodeSelectionDialog(QDialog):
+    """
+    Lets the user choose either:
+      - Auto: pick N control nodes automatically
+      - Manual: pick N control nodes by clicking points on the T patch
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Control Node Selection")
+        self.resize(420, 180)
+
+        layout = QVBoxLayout(self)
+
+        self.mode_auto = QCheckBox("Auto-select control nodes (random)")
+        self.mode_manual = QCheckBox("Manually select control nodes (click points on T patch)")
+        self.mode_auto.setChecked(True)
+        self.mode_manual.setChecked(False)
+
+        # make them mutually exclusive
+        self.mode_auto.stateChanged.connect(lambda s: self._sync("auto"))
+        self.mode_manual.stateChanged.connect(lambda s: self._sync("manual"))
+
+        layout.addWidget(self.mode_auto)
+        layout.addWidget(self.mode_manual)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Number of control nodes (N):"))
+        self.n_spin = QSpinBox()
+        self.n_spin.setRange(1, 5000)
+        self.n_spin.setValue(6)
+        row.addWidget(self.n_spin)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _sync(self, which):
+        if which == "auto" and self.mode_auto.isChecked():
+            self.mode_manual.setChecked(False)
+        if which == "manual" and self.mode_manual.isChecked():
+            self.mode_auto.setChecked(False)
+        # ensure at least one is checked
+        if not self.mode_auto.isChecked() and not self.mode_manual.isChecked():
+            self.mode_auto.setChecked(True)
+
+    def get_choice(self):
+        mode = "manual" if self.mode_manual.isChecked() else "auto"
+        return mode, int(self.n_spin.value())

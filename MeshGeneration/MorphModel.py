@@ -180,42 +180,48 @@ class MorphModel(MorphModelBase):
         anchor_points=None,
         tol=1e-9,
         # ---- control influence radius (PASS 1) ----
-        min_R_frac=0.2,
+        min_R_frac=0.1,
         fallback_R_frac=0.85,
         R_scale=2.75,
 
         # ---- legacy taper (DISABLE for new method) ----
-        anchor_taper=False,
-        dc_ramp_frac=0.08,
+        anchor_taper=False,       # default OFF
+        dc_ramp_frac=0.2,
 
         # ---- control mapping ----
         snap_tol_frac=1e-10,
 
+        # ---- Adaptive seam safeguard (optional; preserves variance) ----
+        seam_adapt=True,
+        seam_k=10,
+        seam_band_frac=0.06,
+        seam_tau0=3.0,
+        seam_tau1=8.0,
+        seam_kmax=3.0,
+
         # ---- NEW: boundary correction (PASS 2) ----
         boundary_recover=True,
-        corr_R_frac=0.03,          # smaller radius than pass-1 (fraction of patch length)
-        corr_R_scale=1.0,          # additional scaling
-        corr_lambda=1e-8,          # regularization for correction solve
-        corr_band_frac=0.06,       # correction decays to ~0 after this band thickness
-        max_corr_sources=1200,     # thin boundary sources if too many (keeps solve tractable)
-        corr_chunk=5000,           # chunk size for evaluating correction field
+        corr_R_frac=0.03,
+        corr_R_scale=1.0,
+        corr_lambda=1e-6,         # bump default; 1e-8 is often too small for stability
+        corr_band_frac=0.06,      # only used for weighting (application band), not constraints
+        max_corr_sources=1200,
+        corr_chunk=5000,
         seed=0,
     ):
         """
         Two-pass morph:
 
         PASS 1:
-        U1(x) = sum_i phi(||x-ci||/Ri) * disp_i        (your current behaviour)
+            U1(x) = sum_i phi(||x-ci||/Ri) * disp_i
 
-        PASS 2 (boundary correction):
-        Solve weights W on boundary samples S such that:
-            sum_j phi(||S_k - S_j||/Rc) * W_j = -U1(S_k)
-        Then:
-            Uc(x) = sum_j phi(||x - S_j||/Rc) * W_j
-        Apply locally near boundary using distance-band weight w(d):
-            U(x) = U1(x) + w(d(x)) * Uc(x)
+        PASS 2 (seam correction):
+            Constrain ONLY seam points (anchors mapped onto TU mesh):
+                K(S,S) W = -U1(S)
+            Apply correction locally with a distance-to-seam weight w(d):
+                U(x) = U1(x) + w(d(x)) * Uc(x)
 
-        This avoids the ridge created by multiplying U1 by a decay ramp near anchors.
+        Key: Do NOT include the whole seam band as hard constraints (causes ringing/blotches).
         """
         import numpy as np
 
@@ -242,17 +248,23 @@ class MorphModel(MorphModelBase):
         L = float(np.linalg.norm(maxs - mins))
         L = max(L, 1e-12)
 
-        # snap controls to actual mesh vertices
-        try:
-            from scipy.spatial import cKDTree
-            treeT = cKDTree(T)
-            dmin, idx0 = treeT.query(ctrl, k=1)
-            dmin = np.asarray(dmin, float)
-            idx0 = np.asarray(idx0, int)
-        except Exception:
-            idx0 = np.array([int(np.argmin(np.linalg.norm(T - p[None, :], axis=1))) for p in ctrl], dtype=int)
-            dmin = np.array([float(np.linalg.norm(T[idx0[i]] - ctrl[i])) for i in range(len(idx0))], dtype=float)
+        # --- helpers ---
+        def nearest_dist(points, query_points):
+            """Return (dists, idx) from each query point to nearest point in points."""
+            try:
+                from scipy.spatial import cKDTree
+                tree = cKDTree(points)
+                d, idx = tree.query(query_points, k=1)
+                return np.asarray(d, float), np.asarray(idx, int)
+            except Exception:
+                diff = query_points[:, None, :] - points[None, :, :]
+                d2 = np.sum(diff * diff, axis=2)
+                idx = np.argmin(d2, axis=1).astype(int)
+                d = np.sqrt(d2[np.arange(d2.shape[0]), idx])
+                return d.astype(float), idx
 
+        # snap controls to actual mesh vertices
+        dmin, idx0 = nearest_dist(T, ctrl)
         snap_tol = max(float(snap_tol_frac) * L, 1e-12)
         ctrl_snap = np.array(ctrl, copy=True)
         need_snap = dmin > snap_tol
@@ -261,7 +273,7 @@ class MorphModel(MorphModelBase):
 
         n_ctrl = int(ctrl_snap.shape[0])
 
-        # Wendland C4 kernel (compact support, C4 smooth)
+        # Wendland C4 kernel
         def phi(s):
             s = np.asarray(s, dtype=float)
             out = np.zeros_like(s)
@@ -270,19 +282,14 @@ class MorphModel(MorphModelBase):
             out[m] = (1.0 - sm) ** 6 * (35.0 * sm**2 + 18.0 * sm + 3.0)
             return out
 
-        # PASS 1: compute U1 from control nodes
+        # ---------- PASS 1 ----------
+        A = None
         if anchor_points is not None and len(anchor_points) > 0:
             A = np.asarray(anchor_points, dtype=float)
             if A.ndim == 1:
                 A = A.reshape(1, -1)
-            try:
-                from scipy.spatial import cKDTree
-                treeA = cKDTree(A)
-                Ri, _ = treeA.query(ctrl_snap, k=1)
-                Ri = np.asarray(Ri, float)
-            except Exception:
-                Ri = np.array([np.min(np.linalg.norm(A - p[None, :], axis=1)) for p in ctrl_snap], dtype=float)
 
+            Ri, _ = nearest_dist(A, ctrl_snap)
             R_min = max(float(min_R_frac) * L, 1e-9)
             Ri = np.maximum(Ri, R_min) * float(R_scale)
         else:
@@ -295,111 +302,106 @@ class MorphModel(MorphModelBase):
             wi = phi(r / Ri[i])
             U1 += wi[:, None] * disp[i][None, :]
 
-        # Legacy anchor taper multiply (leave available but default OFF)
-        if anchor_taper and anchor_points is not None and len(anchor_points) > 0:
-            A = np.asarray(anchor_points, dtype=float)
-            if A.ndim == 1:
-                A = A.reshape(1, -1)
-            try:
-                from scipy.spatial import cKDTree
-                treeA = cKDTree(A)
-                db, _ = treeA.query(T, k=1)
-                db = np.asarray(db, float)
-            except Exception:
-                db = np.min(np.linalg.norm(T[:, None, :] - A[None, :, :], axis=2), axis=1)
+        # Precompute distance-to-anchor for metric if anchors exist
+        db = None
+        if A is not None:
+            db, _ = nearest_dist(A, T)
 
+        # ---------- Adaptive seam safeguard (adjust PASS-2 params only) ----------
+        corr_R_frac_eff = float(corr_R_frac)
+        corr_band_frac_eff = float(corr_band_frac)
+        corr_R_scale_eff = float(corr_R_scale)
+
+        if seam_adapt and boundary_recover and (A is not None) and (db is not None):
+            band = db < max(float(seam_band_frac) * L, 1e-12)
+            if np.count_nonzero(band) > max(50, int(seam_k) + 2):
+                ridge_ratio = 0.0
+                try:
+                    from scipy.spatial import cKDTree
+                    treeT_all = cKDTree(T)
+                    dnn, inn = treeT_all.query(T[band], k=int(seam_k) + 1)
+                    dnn = np.asarray(dnn, float)[:, 1:]
+                    inn = np.asarray(inn, int)[:, 1:]
+                    U_band = U1[band]
+                    eps = 1e-12
+                    dU = np.linalg.norm(U_band[:, None, :] - U1[inn], axis=2)
+                    g_local = np.max(dU / (dnn + eps), axis=1)
+                    g = float(np.percentile(g_local, 95.0))
+                    Umag = np.linalg.norm(U1, axis=1)
+                    u_ref = float(np.percentile(Umag, 95.0))
+                    g_ref = (u_ref / L) + 1e-12
+                    ridge_ratio = g / g_ref
+                except Exception:
+                    ridge_ratio = 0.0
+
+                if ridge_ratio > float(seam_tau0):
+                    s = (ridge_ratio - float(seam_tau0)) / (float(seam_tau1) - float(seam_tau0) + 1e-12)
+                    s = float(np.clip(s, 0.0, 1.0))
+                    mult = 1.0 + s * (float(seam_kmax) - 1.0)
+                    corr_band_frac_eff = float(corr_band_frac) * mult
+                    corr_R_frac_eff = float(corr_R_frac) * (1.0 + 0.35 * (mult - 1.0))
+                    corr_R_scale_eff = float(corr_R_scale)
+
+        # ---------- Legacy anchor taper (ONLY if PASS-2 disabled) ----------
+        if anchor_taper and (not boundary_recover) and (A is not None) and (db is not None):
             ramp = max(float(dc_ramp_frac) * L, 1e-12)
             t = np.clip(db / ramp, 0.0, 1.0)
-            wA = t**3 * (t * (t * 6.0 - 15.0) + 10.0)  # smootherstep
+            wA = t**3 * (t * (t * 6.0 - 15.0) + 10.0)
             wA[db <= tol] = 0.0
             U1 *= wA[:, None]
 
-        # PASS 2: boundary correction (recommended ON)
-        if boundary_recover and anchor_points is not None and len(anchor_points) > 0:
-            A = np.asarray(anchor_points, dtype=float)
-            if A.ndim == 1:
-                A = A.reshape(1, -1)
-
-            # map anchors to indices in T
-            try:
-                from scipy.spatial import cKDTree
-                treeT = cKDTree(T)
-                dB, idxB = treeT.query(A, k=1)
-                dB = np.asarray(dB, float)
-                idxB = np.asarray(idxB, int)
-            except Exception:
-                idxB = np.array([int(np.argmin(np.linalg.norm(T - p[None, :], axis=1))) for p in A], dtype=int)
-                dB = np.array([float(np.linalg.norm(T[idxB[i]] - A[i])) for i in range(len(idxB))], dtype=float)
-
-            # keep only anchors that truly lie on T (numerical safety)
+        # ---------- PASS 2: seam correction (seam-only constraints; band-only weighting) ----------
+        if boundary_recover and (A is not None):
+            # Map anchors to T indices (seam indices)
+            dB, idxB = nearest_dist(T, A)  # query=A onto points=T
             B_tol = max(1e-10 * L, 1e-12)
             keep = dB <= B_tol
-            idxB = idxB[keep]
+            idxB = np.asarray(idxB[keep], int)
+
             if idxB.size > 0:
-                # unique boundary indices
                 idxB = np.unique(idxB)
 
-                S = T[idxB]                 # boundary source points
-                F = -U1[idxB]               # boundary targets (cancel U1 at boundary)
+                # Use ONLY seam indices as constraints
+                S = T[idxB]
+                F = -U1[idxB]
 
-                # thin sources if too many (keeps solve stable/fast)
-                if S.shape[0] > max_corr_sources:
+                # Thin if too many (works on seam only)
+                if S.shape[0] > int(max_corr_sources):
                     rng = np.random.default_rng(seed)
-                    # farthest-point sampling (simple)
                     Ns = S.shape[0]
-                    pick = [int(rng.integers(Ns))]
-                    d2 = np.full(Ns, np.inf)
-                    for _ in range(max_corr_sources - 1):
-                        last = pick[-1]
-                        dist2 = np.sum((S - S[last])**2, axis=1)
-                        d2 = np.minimum(d2, dist2)
-                        pick.append(int(np.argmax(d2)))
-                    pick = np.array(pick, dtype=int)
+                    pick = rng.choice(Ns, size=int(max_corr_sources), replace=False)
                     S = S[pick]
                     F = F[pick]
 
-                # correction radius and band
-                Rc = max(float(corr_R_frac) * L, 1e-9) * float(corr_R_scale)
-                Rband = max(float(corr_band_frac) * L, 1e-12)
+                Rc = max(float(corr_R_frac_eff) * L, 1e-9) * float(corr_R_scale_eff)
+                Rband = max(float(corr_band_frac_eff) * L, 1e-12)
 
-                # build (K + λI) and solve for weights W in R^3
-                # K_ij = phi(||Si - Sj|| / Rc)
+                # Build K and solve (regularised)
                 dSS = np.linalg.norm(S[:, None, :] - S[None, :, :], axis=2)
                 K = phi(dSS / Rc)
-                K.flat[:: K.shape[0] + 1] += float(corr_lambda)  # add λ on diagonal
+                K.flat[:: K.shape[0] + 1] += float(corr_lambda)
 
-                # solve for W: (M,M) x (M,3) = (M,3)
                 W = np.linalg.solve(K, F)
 
-                # distance-to-boundary for band weight
-                try:
-                    from scipy.spatial import cKDTree
-                    treeS = cKDTree(S)
-                    d_to_B, _ = treeS.query(T, k=1)
-                    d_to_B = np.asarray(d_to_B, float)
-                except Exception:
-                    d_to_B = np.min(np.linalg.norm(T[:, None, :] - S[None, :, :], axis=2), axis=1)
+                # Weighting band uses distance to seam (S)
+                d_to_seam, _ = nearest_dist(S, T)
+                t = np.clip(d_to_seam / Rband, 0.0, 1.0)
+                w = 1.0 - (t**3 * (t * (t * 6.0 - 15.0) + 10.0))
 
-                # band weight: 1 at boundary, 0 after Rband
-                t = np.clip(d_to_B / Rband, 0.0, 1.0)
-                w = 1.0 - (t**3 * (t * (t * 6.0 - 15.0) + 10.0))  # 1 - smootherstep
-
-                # evaluate correction field in chunks: Uc = K(T,S) @ W
+                # Evaluate correction field
                 Uc = np.zeros_like(U1)
-                for i0 in range(0, N, corr_chunk):
-                    i1 = min(N, i0 + corr_chunk)
+                for i0 in range(0, N, int(corr_chunk)):
+                    i1 = min(N, i0 + int(corr_chunk))
                     Tc = T[i0:i1]
                     dTS = np.linalg.norm(Tc[:, None, :] - S[None, :, :], axis=2)
                     Kts = phi(dTS / Rc)
                     Uc[i0:i1] = Kts @ W
 
-                # apply locally-weighted correction
                 U = U1 + (w[:, None] * Uc)
-
                 return (T + U).tolist()
 
-        # default: pass-1 only
         return (T + U1).tolist()
+
 
     def get_nodes(self, sections, surfaces, faces, nodes, ff):
         g_ids = []

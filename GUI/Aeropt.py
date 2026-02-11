@@ -77,6 +77,8 @@ class MainWindow(QMainWindow):
         self.optimisation_settings_saved = False
         self.control_node_source = "mesh"
         
+        self.use_pca_reduced = False
+        
         self.rbf_original = None
         self.rbf_current  = None
 
@@ -269,7 +271,7 @@ class MainWindow(QMainWindow):
         # Add main page layout to outer vertical layout
         outer_layout.addLayout(self.page_layout)
 
-        # 🔥 ADD the logger QTextEdit here
+        # ADD the logger QTextEdit here
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setStyleSheet("background-color: #f9f9f9; color: black;")
@@ -436,6 +438,56 @@ class MainWindow(QMainWindow):
 
                 self.remote_output_dir = base_hpc_dir
                 self.logger.log(f"[HPC] Created output directory and subfolders under: {self.remote_output_dir}")
+                
+                # create orig/ and move baseline inputs into it (best-effort) ---
+                try:
+                    import os
+
+                    base = getattr(self, "base_name", None) or self.get_project_basename()
+
+                    local_output_dir = self.output_dir  # your local output directory
+                    remote_orig_dir = f"{base_hpc_dir}/orig"
+
+                    # 1) Ensure remote orig directory exists
+                    mk_orig_cmd = f"mkdir -p \"{remote_orig_dir}\""
+                    self.ssh_client.exec_command(mk_orig_cmd)
+
+                    # 2) Files to upload
+                    file_list = [
+                        f"{base}.bac",
+                        f"{base}.bco",
+                        f"{base}.bpp",
+                        f"{base}.dat",
+                        f"{base}.fro",
+                        f"{base}.inp",
+                        "run.inp",
+                        "Mesh3D_v50.ctl",
+                        "Surf3D_v25.ctl",
+                        "rungen.inp",
+                    ]
+
+                    sftp = self.ssh_client.open_sftp()
+
+                    for fname in file_list:
+                        local_path = os.path.join(local_output_dir, fname)
+                        remote_path = f"{remote_orig_dir}/{fname}"
+
+                        if os.path.exists(local_path):
+                            try:
+                                sftp.put(local_path, remote_path)
+                                self.logger.log(f"[HPC] Uploaded: {fname}")
+                            except Exception as e:
+                                self.logger.log(f"[HPC][WARN] Failed upload {fname}: {e}")
+                        else:
+                            # Skip silently (or log lightly if you prefer)
+                            self.logger.log(f"[HPC] Skipped (not found locally): {fname}")
+
+                    sftp.close()
+
+                    self.logger.log(f"[HPC] Baseline files staged to: {remote_orig_dir}")
+
+                except Exception as e:
+                    self.logger.log(f"[HPC][ERROR] Failed to stage baseline files: {e}")
 
                 # Tell the viewer where remote outputs live
                 if hasattr(self, "mesh_viewer") and self.mesh_viewer:
@@ -535,7 +587,6 @@ class MainWindow(QMainWindow):
             # Create / refresh
             try:
                 self.pipeline = HPCPipelineManager(main_window=self, n=0)
-                # Best-effort: refresh context so base_name never falls back to 'model'
                 if hasattr(self.pipeline, "_refresh_context"):
                     self.pipeline._refresh_context()
             except Exception as e:
@@ -618,7 +669,17 @@ class MainWindow(QMainWindow):
             
         spacer = QSpacerItem(20, 40, QSizePolicy.Minimum, QSizePolicy.Expanding)
         self.button_layout.addItem(spacer)
-        
+
+        # ---- PCA reduced space toggle (optional) ----
+        try:
+            from PyQt5.QtWidgets import QCheckBox
+            self.use_pca_reduced_cb = QCheckBox("Use PCA reduced space")
+            self.use_pca_reduced_cb.setChecked(False)
+            self.use_pca_reduced_cb.toggled.connect(self._on_toggle_use_pca_reduced)
+            self.button_layout.addWidget(self.use_pca_reduced_cb)
+        except Exception:
+            self.use_pca_reduced_cb = None
+
         self.run_morph_btn = QPushButton("Run Morph")
         self.run_morph_btn.pressed.connect(self.run_morph)
         self.run_morph_btn.setEnabled(False)
@@ -633,6 +694,35 @@ class MainWindow(QMainWindow):
         self.run_opt_btn.pressed.connect(self.run_optimisation)
         self.run_opt_btn.setEnabled(False)
         self.button_layout.addWidget(self.run_opt_btn)
+
+
+    def _on_toggle_use_pca_reduced(self, checked: bool):
+        """
+        Global toggle in main UI. This should:
+        1) store the preference in MainWindow
+        2) propagate into MeshViewer so its CN panel defaults match
+        """
+        self.use_pca_reduced = bool(checked)
+
+        mv = getattr(self, "mesh_viewer", None)
+        if mv is None:
+            return
+
+        # If CN panel already created, sync its checkbox
+        cb = getattr(mv, "use_pca_cb", None)
+        if cb is not None:
+            try:
+                cb.blockSignals(True)
+                cb.setChecked(self.use_pca_reduced)
+            finally:
+                cb.blockSignals(False)
+
+        # Also store on MeshViewer so it persists even before the CN panel exists
+        mv.use_pca = self.use_pca_reduced
+
+        if hasattr(self, "logger") and self.logger:
+            self.logger.log(f"[PCA] Use PCA reduced space = {self.use_pca_reduced}")
+
 
     def run_morph(self):
         """
@@ -656,9 +746,6 @@ class MainWindow(QMainWindow):
         base = getattr(self, "base_name", None) or self.get_project_basename()
 
         # 1) Export & upload morph_basis.json
-        # NOTE: export_morph_basis_for_opt appends /morph/ internally (designed for the
-        # opt flow where remote_run=.../opt).  Pass the BASE output dir here so the
-        # file lands at .../morph/morph_basis.json — not .../morph/morph/morph_basis.json.
         remote_basis_path = self.export_morph_basis_for_opt(self.remote_output_dir)
         if not remote_basis_path:
             self.logger.log("[MORPH][WARN] Morph basis not available; displacements may be zero.")
@@ -763,7 +850,7 @@ class MainWindow(QMainWindow):
             self.logger.log("[SIM][ERROR] Still no conditions. Aborting.")
             return
 
-        # Launch on a worker thread as you already do
+        # Launch on a worker thread
         from PyQt5.QtCore import QThread
         from GUI.workers import SimulationWorker
 
@@ -804,7 +891,7 @@ class MainWindow(QMainWindow):
             return ""
     
 
-        # ---- 1) Build local JSON from mesh viewer state ----
+        # 1) Build local JSON from mesh viewer state
         basis_cfg = {
             "control_nodes": mv.control_nodes.tolist(),
             "control_normals": getattr(mv, "control_normals", None).tolist() if getattr(mv, "control_normals", None) is not None else None,
@@ -817,6 +904,12 @@ class MainWindow(QMainWindow):
             "coeff_frac": getattr(mv, "coeff_frac", 0.15),
             "seed": getattr(mv, "seed", 0),
             "normal_project": getattr(mv, "normal_project", True),
+            "use_pca": getattr(mv, "use_pca", False),
+            "pca_cache_path": getattr(mv, "pca_cache_path", None),
+            "pca_train_M": getattr(mv, "pca_train_M", None),
+            "pca_energy": getattr(mv, "pca_energy", None),
+            "pca_k_red": getattr(mv, "pca_k_red", None),
+            "pca_k_final": getattr(mv, "pca_k_final", None),
             "bump_enable": getattr(mv, "bump_enable", False),
             "bump_center": getattr(mv, "bump_center", None),
             "bump_radius": getattr(mv, "bump_radius", None),
@@ -839,39 +932,46 @@ class MainWindow(QMainWindow):
             self.logger.log("[OPT][ERROR] No SSH client for remote upload of morph basis.")
             return ""
 
-        remote_morph_dir = posixpath.join(remote_run, "morph")
+        remote_morph_dir  = posixpath.join(remote_run, "morph")
         remote_basis_path = posixpath.join(remote_morph_dir, "morph_basis.json")
 
-        try:
-            # Create morph dir and WAIT for completion (handles missing parent 'opt')
-            cmd = f"bash -lc 'mkdir -p \"{remote_morph_dir}\"'"
-            stdin, stdout, stderr = self.ssh_client.exec_command(cmd)
-            exit_code = stdout.channel.recv_exit_status()
-            err_text = stderr.read().decode().strip()
+        # mkdir morph dir first
+        cmd = f"bash -lc 'mkdir -p \"{remote_morph_dir}\"'"
+        stdin, stdout, stderr = self.ssh_client.exec_command(cmd)
+        exit_code = stdout.channel.recv_exit_status()
+        err_text = stderr.read().decode().strip()
+        if exit_code != 0 or err_text:
+            self.logger.log(f"[OPT][HPC][ERROR] Failed to create morph dir '{remote_morph_dir}'. exit={exit_code}, stderr={err_text}")
+            return ""
 
-            if exit_code != 0 or err_text:
-                self.logger.log(
-                    f"[OPT][HPC][ERROR] Failed to create morph dir '{remote_morph_dir}'. "
-                    f"exit={exit_code}, stderr={err_text}"
-                )
+        # --- if use_pca: upload PCA cache to remote_morph_dir and rewrite JSON path ---
+        if basis_cfg.get("use_pca", False):
+            local_pca = basis_cfg.get("pca_cache_path", None)
+            if (not local_pca) or (not os.path.exists(local_pca)):
+                self.logger.log(f"[OPT][ERROR] use_pca=True but local PCA cache not found: {local_pca}")
                 return ""
 
-            # Now upload the file
+            remote_pca_path = posixpath.join(remote_morph_dir, "pca_basis.npz")
             sftp = self.ssh_client.open_sftp()
             try:
-                self.logger.log(
-                    f"[OPT][HPC] Uploading morph basis '{local_basis}' → '{remote_basis_path}'"
-                )
-                sftp.put(local_basis, remote_basis_path)
+                self.logger.log(f"[OPT][HPC] Uploading PCA cache '{local_pca}' → '{remote_pca_path}'")
+                sftp.put(local_pca, remote_pca_path)
             finally:
                 sftp.close()
 
-            self.morph_basis_remote = remote_basis_path
-        except Exception as e:
-            self.logger.log(
-                f"[OPT][HPC][ERROR] Failed to upload morph basis to '{remote_basis_path}': {e}"
-            )
-            return ""
+            basis_cfg["pca_cache_path"] = remote_pca_path  # <-- CRITICAL for cluster
+
+            # rewrite local morph_basis.json with UPDATED pca_cache_path
+            with open(local_basis, "w", encoding="utf-8") as f:
+                json.dump(basis_cfg, f, indent=2)
+
+        # finally upload morph_basis.json
+        sftp = self.ssh_client.open_sftp()
+        try:
+            self.logger.log(f"[OPT][HPC] Uploading morph basis '{local_basis}' → '{remote_basis_path}'")
+            sftp.put(local_basis, remote_basis_path)
+        finally:
+            sftp.close()
 
         return remote_basis_path
 
@@ -1756,9 +1856,8 @@ class MainWindow(QMainWindow):
             print(f"[DEBUG] Error during MainWindow close: {e}")
         event.accept()
 
-# =========================
+
 # Objective Editor (GUI)
-# =========================
 class ParallelSimEditor(QDialog):
     """
     Lets user define:
@@ -1940,7 +2039,7 @@ class ObjectiveEditor(QDialog):
                 # skip malformed row
                 pass
 
-        # Constraints (simple parser)
+        # Constraints
         cons = []
         for line in self.constraints_edit.toPlainText().splitlines():
             ln = line.strip()

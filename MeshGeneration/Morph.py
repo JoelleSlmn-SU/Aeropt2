@@ -153,9 +153,7 @@ def MorphMesh(mesh_in: FroFile, base_name, morph_model, viewer, output_dir,
     logger.log(f"[CHECK] U surfaces: {morph_model.u_surfaces}")
     logger.log(f"[CHECK] count(T_gids)={len(t_gids)}, count(U_gids)={len(u_gids)}, count(C_gids)={len(c_gids)}")
 
-    # -------------------------
-    # STEP 2 - Deform D = T ∪ U
-    # -------------------------
+    # STEP 2 - Deform D = T & U
     logger.log("STEP 2 - Translating (D = T ∪ U)")
 
     # mappings and coords for T and U (needed later to split)
@@ -189,10 +187,8 @@ def MorphMesh(mesh_in: FroFile, base_name, morph_model, viewer, output_dir,
     d_verts_m = morph_model.transformT(
         d_verts,
         anchor_points=anchor_points,
-        # IMPORTANT: turn off the old multiply-by-decay behaviour
-        anchor_taper=False,
-        # Enable the new 2-pass boundary correction method
-        boundary_recover=True,
+        anchor_taper=False,        # <-- this restores variance
+        boundary_recover=True,     # <-- seam fixed via pass-2 correction
     )
 
     # split D back into T and U using the gid→local maps
@@ -218,17 +214,12 @@ def MorphMesh(mesh_in: FroFile, base_name, morph_model, viewer, output_dir,
                 dbg.nodes[gid] = u_verts_m[ul]
         viewer.debug_plot_requested.emit(dbg, "[STEP2] After Deforming D = T∪U")
 
-    # ---------------------------------------------
-    # STEP 3/4 are REMOVED in this single-region mode
-    # ---------------------------------------------
-    # We still define bt so recover_boundaries_array() doesn't crash if enabled.
-    # In this mode C is intended to stay fixed, so bt = 0 translations.
+    
     b_c = morph_model.GetIndepBoundaries(mesh_in)  # {boundary_id: [gids]}
     bt = {k: np.array([0.0, 0.0, 0.0]) for k in b_c.keys()}
 
-    # -------------------------
+    
     # STEP 5 - Update mesh nodes
-    # -------------------------
     logger.log("STEP 5 - Update the vertice positions in the mesh")
 
     # Vectorised T update

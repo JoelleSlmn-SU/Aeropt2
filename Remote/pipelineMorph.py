@@ -24,9 +24,6 @@ def _log(msg, log_path=None):
             pass
 
 
-# ----------------------------
-# (A) Orchestrator mode
-# ----------------------------
 def orchestrate_run(run_dir: str):
     run_dir = os.path.abspath(run_dir)
     settings_path = os.path.join(run_dir, "morph_settings.json")

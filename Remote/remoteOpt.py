@@ -1,22 +1,20 @@
 # remoteOpt.py - FIXED FOR CLUSTER EXECUTION
-# ----------------------------------------------------------------------
 # This script runs ON THE CLUSTER (not your local machine)
 # It uses ClusterPipelineManager instead of HPCPipelineManager
-# ----------------------------------------------------------------------
 
 import os, json, time, sys, re, subprocess
 import numpy as np
 
 # Add project paths
 script_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(script_dir)  # Assuming remoteOpt.py is in Scripts/
+project_root = os.path.dirname(script_dir)  
 
 for subdir in ["", "Optimisation", "FileRW", "Remote", "MeshGeneration"]:
     path = os.path.join(project_root, subdir) if subdir else project_root
     if path not in sys.path:
         sys.path.insert(0, path)
 
-# Import cluster-side pipeline (NO SSH)
+
 from pipeline_cluster import ClusterPipelineManager
 
 
@@ -45,6 +43,52 @@ def _metrics_path(remote_root, n, gen, cond_index: int, base_name):
         f"{n}",
         f"{base_name}_{n}.rsd",
     )
+    
+def _build_objective_callable(objective_dict: dict):
+    """
+    Returns (obj_func, pretty_expr)
+      - obj_func(metrics: dict) -> float
+      - pretty_expr: str
+    metrics dict contains at least: {"CL":..., "CD":..., "CM":...}
+    """
+
+    obj_type = (objective_dict.get("objective_type", "") or "").strip()
+    expr_raw = (objective_dict.get("expression", "") or "").strip()
+
+
+    if obj_type.lower() == "drag" or expr_raw.lower() == "drag":
+        expr = "CD"
+    elif obj_type.lower() == "lift" or expr_raw.lower() == "lift":
+        expr = "-CL"
+    elif obj_type.lower() in ("lift-to-drag", "lift to drag") or expr_raw.lower() in ("lift-to-drag", "lift to drag"):
+        expr = "-(CL/CD)"
+    else:
+        # Custom expression (as typed by user)
+        expr = expr_raw if expr_raw else "CD"
+
+    # Restricted eval environment
+    allowed_funcs = {
+        "abs": abs,
+        "min": min,
+        "max": max,
+    }
+    safe_globals = {"__builtins__": {}}
+    safe_globals.update(allowed_funcs)
+
+    def obj_func(m: dict) -> float:
+        local_vars = {
+            "CL": float(m.get("CL", 0.0)),
+            "CD": float(m.get("CD", 1e9)),
+            "CM": float(m.get("CM", 0.0)),
+        }
+        try:
+            return float(eval(expr, safe_globals, local_vars))
+        except Exception:
+            # hard penalty if expression fails (division by 0, typo, etc.)
+            return 1e9
+
+    return obj_func, expr
+
 
 class ClusterTestManager:
     """
@@ -85,7 +129,7 @@ class ClusterTestManager:
             **self.executables,
         }
 
-        # IMPORTANT: gen must be the BO generation number
+        # gen must be the BO generation number
         pipe = ClusterPipelineManager(config, gen=int(gen_num), n=int(n_index))
 
         try:
@@ -128,7 +172,6 @@ class ClusterTestManager:
         num_conds = len(conds)
 
         def _sol_dir(n_index: int, nc: int) -> str:
-            # matches pipeline_cluster.py: solutions/n_{gen}/cond_{nc}/{n_index}/
             return os.path.join(
                 self.remote_root,
                 "solutions",
@@ -141,7 +184,6 @@ class ClusterTestManager:
             return os.path.join(_sol_dir(n_index, nc), "SOLVER_DONE")
 
         def _rsd_path(n_index: int, nc: int) -> str:
-            # your solver writes BASE.rsd where BASE = f"{base_name}_{n_index}"
             return os.path.join(_sol_dir(n_index, nc), f"{self.base_name}_{n_index}.rsd")
 
         # Build list of required DONE markers
@@ -265,6 +307,10 @@ def main():
     conds = objective.get("conditions", [])
     weights = [c.get("Weight", 1.0) for c in conds]
     
+    # Build objective function from GUI config (Drag/Lift/Lift-to-Drag/Custom)
+    obj_func, obj_expr = _build_objective_callable(objective)
+    _log(f"[REMOTE-OPT] Objective expression (minimised): {obj_expr}", log_path)    
+    
     _log(f"[REMOTE-OPT] Conditions: {conds}", log_path)
     _log(f"[REMOTE-OPT] Weights: {weights}", log_path)
     
@@ -310,15 +356,16 @@ def main():
     def eval_func(X_list, gen_num):
         _log(f"[REMOTE-OPT] Evaluating generation {gen_num}", log_path)
         per_design = tm.evaluate_generation(X_list, gen_num, conds)
-        
-        # Reduce per-condition metrics to scalar objective
+
+        # Reduce per-condition metrics -> scalar objective via expression
         Y = []
-        for metrics in per_design:
+        for metrics_per_cond in per_design:
             y = 0.0
-            for w, m in zip(weights, metrics):
-                y += float(w) * float(m.get("CD", 1e9))
-            Y.append(y)
-        
+            for cond, m in zip(conds, metrics_per_cond):
+                w = float(cond.get("Weight", 1.0))
+                y += w * obj_func(m)
+            Y.append(float(y))
+
         _log(f"[REMOTE-OPT] Generation {gen_num} objectives: {Y}", log_path)
         return np.array(Y, dtype=float)
     

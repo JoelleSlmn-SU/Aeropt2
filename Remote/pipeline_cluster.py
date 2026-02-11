@@ -60,7 +60,7 @@ class ClusterPipelineManager:
         self.surface_mesher = config_dict.get("surface_mesher", "/home/s.o.hassan/XieZ/work/Meshers/surface/src/a.Surf3D")
         self.volume_mesher = config_dict.get("volume_mesher", "/home/s.o.hassan/XieZ/work/Meshers/volume/src/a.Mesh3D")
         self.prepro_exe = config_dict.get("prepro_exe", "/home/s.o.hassan/bin/Gen3d_jj")
-        self.solver_exe = config_dict.get("solver_exe", "/home/s.o.hassan/bin/UnsMgnsg3d") # TODO: CHANGE TO BENS SOLVER OR USE MAKEPLOT AND SPLITPLOT FROM OUBAY
+        self.solver_exe = config_dict.get("solver_exe", "/home/s.engevabj/codes/FLITE_uns/UnsMgnsg3d") # TODO: CHANGE TO BENS SOLVER OR USE MAKEPLOT AND SPLITPLOT FROM OUBAY
         self.combine_exe = config_dict.get("combine_exe", "/home/s.engevabj/codes/utilities/makeplot2")
         self.ensight_exe = config_dict.get("ensight_exe", "/home/s.engevabj/codes/utilities/engen_tet")
         self.splitplot_exe = config_dict.get("splitplot_exe", "/home/s.engevabj/codes/utilities/splitplot2")
@@ -95,7 +95,6 @@ class ClusterPipelineManager:
         with open(self.log_file, "a") as f:
             f.write(f"{datetime.now().isoformat()} - {msg}\n")
             
-        # -------------------- STATE (resume / status) --------------------
     def _state_path(self) -> str:
         st_dir = os.path.join(self.remote_output, "logs", "state", f"n_{self.gen}")
         os.makedirs(st_dir, exist_ok=True)
@@ -328,9 +327,7 @@ class ClusterPipelineManager:
             else:
                 shutil.copy2(vtm_path, target)
 
-        # ------------------------------------------------------
         # 3) Apply morph basis: surfaces, control nodes, d_ctrl
-        # ------------------------------------------------------
         t_surfaces = []
         u_surfaces = []
         c_surfaces = []
@@ -352,6 +349,9 @@ class ClusterPipelineManager:
                     t_surfaces = list(map(int, basis.get("TSurfaces", [])))
                     u_surfaces = list(map(int, basis.get("USurfaces", [])))
                     c_surfaces = list(map(int, basis.get("CSurfaces", [])))
+                    
+                    use_pca = bool(basis.get("use_pca", False))
+                    pca_cache_path = basis.get("pca_cache_path", None)
 
                     # normals at control nodes
                     cn_normals = basis.get("control_normals", None)
@@ -360,31 +360,49 @@ class ClusterPipelineManager:
                     cn_normals = np.asarray(cn_normals, float).reshape((-1, 3))
 
                     # design coeffs (from BO)
-                    coeffs = np.asarray(self.modal_coeffs, dtype=float)
-                    k_modes = int(basis.get("k_modes", max(1, coeffs.size)))
-                    if coeffs.ndim > 1:
-                        coeffs = coeffs.reshape(-1)
-                    if coeffs.size < k_modes:
-                        coeffs = np.pad(coeffs, (0, k_modes - coeffs.size))
-                    elif coeffs.size > k_modes:
-                        coeffs = coeffs[:k_modes]
-                        
+                    coeffs = np.asarray(self.modal_coeffs, dtype=float).reshape(-1)
+
+                    use_pca = bool(basis.get("use_pca", False))
+                    pca_cache_path = basis.get("pca_cache_path", None)
+
                     self._log(
-                        f"[PIPELINE] gen={self.gen} n={self.n} "
-                        f"modal_coeffs={self.modal_coeffs} (used coeffs={coeffs.tolist()})"
+                        f"[PIPELINE] gen={self.gen} n={self.n} use_pca={use_pca} coeffs_len={int(coeffs.size)}"
                     )
 
-                    d_ctrl = getDisplacements(
-                        self.remote_output,
-                        seed=int(basis.get("seed", 0)),
-                        control_nodes=cn,
-                        normals=cn_normals,
-                        coeffs=coeffs,
-                        k_modes=k_modes,
-                        normal_project=bool(basis.get("normal_project", True)),
-                        t_patch_scale=basis.get("t_patch_scale", None),
-                        amp_alpha=float(basis.get("amp_alpha", 0.02)),  # 2% default
-                    )
+                    if use_pca:
+                        if not pca_cache_path:
+                            raise RuntimeError("use_pca=True but no pca_cache_path provided in morph_basis.json")
+
+                        d_ctrl = getDisplacements(
+                            self.remote_output,
+                            control_nodes=cn,
+                            normals=cn_normals,
+                            use_pca=True,
+                            pca_cache_path=pca_cache_path,
+                            pca_coeffs=coeffs,
+                            normal_project=bool(basis.get("normal_project", True)),
+                            t_patch_scale=basis.get("t_patch_scale", None),
+                            amp_alpha=float(basis.get("amp_alpha", 0.002)),
+                        )
+                    else:
+                        k_modes = int(basis.get("k_modes", max(1, coeffs.size)))
+                        if coeffs.size < k_modes:
+                            coeffs = np.pad(coeffs, (0, k_modes - coeffs.size))
+                        elif coeffs.size > k_modes:
+                            coeffs = coeffs[:k_modes]
+
+                        d_ctrl = getDisplacements(
+                            self.remote_output,
+                            seed=int(basis.get("seed", 0)),
+                            control_nodes=cn,
+                            normals=cn_normals,
+                            coeffs=coeffs,
+                            k_modes=k_modes,
+                            normal_project=bool(basis.get("normal_project", True)),
+                            t_patch_scale=basis.get("t_patch_scale", None),
+                            amp_alpha=float(basis.get("amp_alpha", 0.002)),
+                        )
+
                     d_ctrl = np.asarray(d_ctrl, dtype=float)
                 else:
                     self._log("[PIPELINE] morph_basis_json has no control_nodes; leaving morph zero.")
@@ -394,9 +412,7 @@ class ClusterPipelineManager:
                 self._log(f"[PIPELINE][ERROR] Failed morph basis '{basis_path}': {e}\n{tb}")
                 raise 
 
-        # ------------------------------------------------------
         # 4) Write final morph config
-        # ------------------------------------------------------
         self._log(
             f"[PIPELINE] Wrote morph_config_n_{self.n}.json with "
             f"{len(control_nodes)} CNs, "
@@ -509,7 +525,7 @@ class ClusterPipelineManager:
             self._save_state(stage="volume_done", volume_output=plt_path)
             return None
 
-        # ---- Run volume mesher (allow non-zero exit but keep outputs) ----
+        # Run volume mesher (allow non-zero exit but keep outputs)
         bf.lines.append("")
         bf.lines.append("# ---- RUN VOLUME MESHER ----")
         bf.lines.append("set +e")  # do not abort batchfile if Mesh3D returns non-zero after writing outputs
@@ -518,7 +534,7 @@ class ClusterPipelineManager:
         bf.lines.append("set -e")
         bf.lines.append("echo \"[VOL] Mesh3D return code: ${MESH_RC}\"")
 
-        # ---- UNIT CONVERSION (mm -> m or whatever your converter does) ----
+        # UNIT CONVERSION (mm -> m or whatever your converter does) 
         if (self.units or "").lower() == "mm":
             self._log("[PIPELINE] CAD units = mm → adding PLT conversion to volume batchfile")
 
@@ -538,10 +554,6 @@ class ClusterPipelineManager:
             bf.lines.append("fi")
 
         # Decide final exit code behavior:
-        # - If you want the pipeline to treat this as SUCCESS when PLT exists & converted, force exit 0.
-        # - If you want SLURM dependency afterok to fail when Mesh3D rc!=0, exit with MESH_RC.
-        #
-        # Recommendation for optimisation stability: exit 0 if PLT exists (so downstream can run).
         bf.lines.append("")
         bf.lines.append("# ---- FINALIZE ----")
         bf.lines.append(f"if [ -f \"{base}.plt\" ]; then")
@@ -582,12 +594,6 @@ class ClusterPipelineManager:
             self.job_ids["prepro"] = None
             self._save_state(stage="prepro_done", prepro_dir=pre_dir)
             return None
-        
-        # Copy necessary files
-        '''for fname in [f"{self.base_name}_{self.n}.bco", "rungen.inp"]:
-            src = os.path.join(self.input_dir, fname)
-            if os.path.exists(src):
-                shutil.copy2(src, pre_dir)'''
         
         # Create batch file
         batch_name = f"pre_n{self.gen}_{self.n}"
@@ -841,7 +847,6 @@ class ClusterPipelineManager:
         # Run solver
         bf.lines.append(f"mpirun {self.solver_exe} < {self.base_name}_{self.n}.inp &> solver_output")
         bf.lines.append("touch SOLVER_DONE")
-        #bf.lines.append("kill $PR_PID 2>/dev/null || true")
         bf.lines.append("wait $PR_PID 2>/dev/null || true")
 
         bf.lines.append(f"{self.combine_exe} <<INPUT1")

@@ -337,6 +337,110 @@ def animate_split_screen_fro_surface(
     pl.close()
     return out_path
 
+import os
+
+def _ensure_ext(path: str, ext: str) -> str:
+    """Return path with the given extension (ext includes dot)."""
+    root, _ = os.path.splitext(path)
+    return root + ext
+
+def _save_both(callable_anim, out_path: str, save_mp4=True, save_gif=True, **kwargs):
+    """
+    Generic helper: calls an existing animator twice (mp4 + gif),
+    reusing the same kwargs so the animations match.
+    """
+    outputs = {}
+
+    if save_mp4:
+        mp4_path = out_path if out_path.lower().endswith(".mp4") else _ensure_ext(out_path, ".mp4")
+        try:
+            outputs["mp4"] = callable_anim(out_path=mp4_path, **kwargs)
+            print(f"[ANIM] Saved MP4: {mp4_path}")
+        except Exception as e:
+            # MP4 requires ffmpeg (PyVista open_movie). If missing, GIF can still succeed.
+            print(f"[ANIM][WARN] MP4 failed ({e}). GIF may still succeed.")
+
+    if save_gif:
+        gif_path = out_path if out_path.lower().endswith(".gif") else _ensure_ext(out_path, ".gif")
+        try:
+            outputs["gif"] = callable_anim(out_path=gif_path, **kwargs)
+            print(f"[ANIM] Saved GIF: {gif_path}")
+        except Exception as e:
+            print(f"[ANIM][ERROR] GIF failed ({e}).")
+
+    return outputs
+
+
+def animate_vtk_morph_both(
+    mesh0_path, mesh1_path, out_path="morph",
+    n_frames=60, fps=30, show_edges=False, opacity=1.0,
+    save_mp4=True, save_gif=True,
+):
+    return _save_both(
+        callable_anim=lambda out_path, **kw: animate_vtk_morph(
+            mesh0_path, mesh1_path, out_path=out_path, **kw
+        ),
+        out_path=out_path,
+        save_mp4=save_mp4,
+        save_gif=save_gif,
+        n_frames=n_frames,
+        fps=fps,
+        show_edges=show_edges,
+        opacity=opacity,
+    )
+
+
+def animate_fro_morph_surface_both(
+    fro0_path, fro1_path, surface_id,
+    out_path="morph",
+    n_frames=80, fps=25,
+    base_opacity=0.12,
+    morph_opacity=1.0,
+    show_edges=True,
+    deform_scale=2.0,
+    color_by_displacement=True,
+    save_mp4=True, save_gif=True,
+):
+    return _save_both(
+        callable_anim=lambda out_path, **kw: animate_fro_morph_surface(
+            fro0_path, fro1_path, surface_id, out_path=out_path, **kw
+        ),
+        out_path=out_path,
+        save_mp4=save_mp4,
+        save_gif=save_gif,
+        n_frames=n_frames,
+        fps=fps,
+        base_opacity=base_opacity,
+        morph_opacity=morph_opacity,
+        show_edges=show_edges,
+        deform_scale=deform_scale,
+        color_by_displacement=color_by_displacement,
+    )
+
+
+def animate_split_screen_fro_surface_both(
+    fro0_path, fro1_path, surface_id,
+    out_path="split_morph",
+    n_frames=80, fps=25,
+    deform_scale=10.0,
+    base_surface_opacity=0.15,
+    show_edges=False,
+    save_mp4=True, save_gif=True,
+):
+    return _save_both(
+        callable_anim=lambda out_path, **kw: animate_split_screen_fro_surface(
+            fro0_path, fro1_path, surface_id, out_path=out_path, **kw
+        ),
+        out_path=out_path,
+        save_mp4=save_mp4,
+        save_gif=save_gif,
+        n_frames=n_frames,
+        fps=fps,
+        deform_scale=deform_scale,
+        base_surface_opacity=base_surface_opacity,
+        show_edges=show_edges,
+    )
+
 
 # ----------------------------------------------------------------------
 # Option A: ParaView interactive export (time series)
@@ -501,23 +605,45 @@ def interactive_fro_morph_surface(
 
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
-    # Mesh paths
-    orig_fro = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Morph 29.01\surfaces\n_0\corner.fro"
-    morp_fro = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Morph 29.01\surfaces\n_0\corner_5.fro"
-    cfg_json = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Morph 29.01\surfaces\n_0\morph_config_n_1.json"
-
-    # 1) MP4 animations
-    surfaces = get_surfaces_from_morph_config(cfg_json, mode="TU")
-    out_1 = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Morph 29.01\surfaces\n_0\n0_5_corner_morph_TU.mp4"
-    out_2 = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Morph 29.01\surfaces\n_0\n0_5_corner_morph_split_TU.mp4"
+    from pathlib import Path
     
-    #animate_fro_morph_surface(orig_fro, morp_fro, surface_id=surfaces, out_path=out_1, n_frames=90, deform_scale=1.0)
-    #animate_split_screen_fro_surface(orig_fro, morp_fro, surface_id=surfaces, out_path=out_2, n_frames=90, fps=25, deform_scale=1.0)
+    folder = [
+        "CB Morph 12CN"
+    ]
 
-    # 2) Interactive mesh
-    surfaces = get_surfaces_from_morph_config(cfg_json, mode="TU")
-    export = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Morph 29.01\surfaces\n_1"
+    #x_case = 7
+    gen = 0
     
-    interactive_fro_morph_surface(orig_fro, morp_fro, surface_id=surfaces, deform_scale=1.0)
-    #export_morph_series_multiblock(orig_fro, morp_fro, surface_ids=surfaces, out_dir=export, base_name="corner_morph", n_frames=90, deform_scale=1.0)
+    for x_case in range(1,11):
+        base = Path(r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples")
+        case_root = base / folder[0]
+
+        orig_fro = str(case_root / "surfaces" / f"PCA" / f"corner.fro")
+        morp_fro = str(case_root / "surfaces" / f"PCA" / f"corner_{str(x_case)}.fro")
+        cfg_json = str(case_root / "surfaces" / f"PCA" / f"morph_config_n_1.json")
+
+        # 1) MP4 animations
+        surfaces = get_surfaces_from_morph_config(cfg_json, mode="TU")
+        out_1 = str(case_root / "surfaces" / f"PCA" / f"n0_{str(x_case)}_corner_morph_TU")
+        out_2 = str(case_root / "surfaces" / f"PCA" / f"n0_{str(x_case)}_corner_morph_split_TU")
+        
+        animate_fro_morph_surface_both(
+            orig_fro, morp_fro, surface_id=surfaces,
+            out_path=out_1,
+            n_frames=90, fps=25, deform_scale=1.0,
+            save_mp4=False, save_gif=True,
+        )
+
+        animate_split_screen_fro_surface_both(
+            orig_fro, morp_fro, surface_id=surfaces,
+            out_path=out_2,
+            n_frames=90, fps=25, deform_scale=1.0,
+            save_mp4=False, save_gif=True,
+        )
+
+        # 2) Interactive mesh
+        export = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Morph\surfaces\n_0"
+        
+        #interactive_fro_morph_surface(orig_fro, morp_fro, surface_id=surfaces, deform_scale=1.0)
+        #export_morph_series_multiblock(orig_fro, morp_fro, surface_ids=surfaces, out_dir=export, base_name="corner_morph", n_frames=90, deform_scale=1.0)
     pass

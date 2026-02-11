@@ -1,0 +1,59 @@
+#Unchecking_Curve_IDs
+ 
+#Unchecking_Surf_IDs
+ 50 98
+#Highorder_Surf_IDs
+
+#Generating_Surf_IDs
+
+#Unchecking_Curve_Names
+
+#Unchecking_Surf_Names
+
+#Generating_Surf_Names
+
+#Layer_Heights
+ 30
+0.01
+0.013
+0.0169
+0.02197
+0.028561
+0.0371293
+0.04826809
+0.062748517
+0.081573072
+0.106044994
+0.137858492
+0.179216039
+0.232980851
+0.302875107
+0.393737639
+0.51185893
+0.665416609
+0.865041592
+1.12455407
+1.46192029
+1.900496377
+2.470645291
+3.211838878
+4.175390541
+5.428007704
+7.056410015
+9.173333019
+11.92533293
+15.5029328
+20.15381264
+#SuperPatch_Groups
+ 0
+#SuperCurve_RidgeAngle
+ 0
+#Symmetry_Surf_IDs
+ 50 111
+#farfield_Surf_IDs
+ 98
+#Symmetry_Surf_Names
+
+#farfield_Surf_Names
+
+#end
