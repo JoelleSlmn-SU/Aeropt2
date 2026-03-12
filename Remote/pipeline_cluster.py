@@ -5,10 +5,33 @@
 # - Mirrors HPCPipelineManager API but uses subprocess.run() instead of SSH
 # ----------------------------------------------------------------------
 
-import os, posixpath, shutil, re, textwrap, subprocess, json
+import sys, os, posixpath, shutil, re, textwrap, subprocess, json
 from datetime import datetime
 
 import numpy as np
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
+project_root = script_dir
+while True:
+    # We want the directory that *contains* FileRW
+    if os.path.isdir(os.path.join(project_root, "FileRW")):
+        break
+    parent = os.path.dirname(project_root)
+    if parent == project_root:
+        # Reached filesystem root; give up
+        break
+    project_root = parent
+
+# Put the project root on sys.path if we found FileRW
+if os.path.isdir(os.path.join(project_root, "FileRW")):
+    sys.path.insert(0, project_root)
+    sys.path.insert(0, os.path.join(project_root, "ConvertFileType"))
+    sys.path.insert(0, os.path.join(project_root, "MeshGeneration"))
+else:
+    # Fallback: at least add script_dir so relative imports still have a chance
+    sys.path.insert(0, script_dir)
+
 from MeshGeneration.controlNodeDisp import estimate_normals, getDisplacements
 
 class Batchfile:
@@ -79,10 +102,8 @@ class ClusterPipelineManager:
         self.units = config_dict.get("cad_units", "mm")
         
         self.job_ids = {}
-        if config_dict.get("parallel_domains") == 1:
-            self.sol_parallel_domains = 160
-        else:
-            self.sol_parallel_domains = config_dict.get("parallel_domains", 160)
+        pp = int(config_dict.get("parallel_processes", 160))
+        self.sol_parallel_domains = max(1, pp)
         
         # Setup logging
         log_dir = os.path.join(self.remote_output, "logs")
@@ -341,6 +362,7 @@ class ClusterPipelineManager:
                     basis = json.load(bf)
 
                 cn = np.asarray(basis["control_nodes"], float)
+                cn_normals = np.asarray(basis["control_normals"], float)
                 t_surfaces = basis["TSurfaces"]
                 if cn.size > 0:
                     cn = cn.reshape((-1, 3))
@@ -350,28 +372,92 @@ class ClusterPipelineManager:
                     u_surfaces = list(map(int, basis.get("USurfaces", [])))
                     c_surfaces = list(map(int, basis.get("CSurfaces", [])))
                     
-                    use_pca = bool(basis.get("use_pca", False))
-                    pca_cache_path = basis.get("pca_cache_path", None)
+                                        # -----------------------------
+                    # top-level parameterisation info
+                    # -----------------------------
+                    parameterisation_method = str(
+                        basis.get("parameterisation_method", "modal")
+                    ).strip().lower()
 
-                    # normals at control nodes
-                    cn_normals = basis.get("control_normals", None)
-                    if cn_normals is None:
-                        cn_normals = estimate_normals(cn, knn=12)  # fallback for old jsons
-                    cn_normals = np.asarray(cn_normals, float).reshape((-1, 3))
-
-                    # design coeffs (from BO)
-                    coeffs = np.asarray(self.modal_coeffs, dtype=float).reshape(-1)
+                    direct_subtype = basis.get("direct_parameterisation_subtype", None)
 
                     use_pca = bool(basis.get("use_pca", False))
                     pca_cache_path = basis.get("pca_cache_path", None)
+
+                    normal_project = bool(basis.get("normal_project", True))
+                    vector_mode = str(basis.get("vector_mode", "local_frame"))
+                    frame_knn = basis.get("frame_knn", 12)
+
+                    global_modes = bool(basis.get("global_modes", False))
+                    global_mode_config = basis.get("global_mode_config", [])
+                    basis_axes = basis.get("basis_axes", None)
+
+                    use_local_modes = bool(basis.get("use_local_modes", True))
+                    global_only = bool(basis.get("global_only", False))
+                    if global_only:
+                        use_local_modes = False
+
+                    k = int(basis.get("k_modes", 5))
+                    # design coeffs (from BO / optimiser)
+                    coeffs = np.asarray(
+                        [] if self.modal_coeffs is None else self.modal_coeffs,
+                        dtype=float
+                    ).reshape(-1)
 
                     self._log(
-                        f"[PIPELINE] gen={self.gen} n={self.n} use_pca={use_pca} coeffs_len={int(coeffs.size)}"
+                        f"[PIPELINE] gen={self.gen} n={self.n} "
+                        f"param={parameterisation_method} "
+                        f"use_pca={use_pca} coeffs_len={int(coeffs.size)}"
                     )
 
-                    if use_pca:
+                    # -------------------------------------------------
+                    # DIRECT PARAMETERISATION
+                    # -------------------------------------------------
+                    if parameterisation_method == "direct":
+                        subtype = str(direct_subtype or "").strip().lower()
+
+                        if subtype == "xyz":
+                            expected_len = 3 * len(cn)
+                        elif subtype == "normal":
+                            expected_len = len(cn)
+                        else:
+                            raise RuntimeError(
+                                f"Unknown direct_parameterisation_subtype: {direct_subtype}"
+                            )
+
+                        if coeffs.size < expected_len:
+                            coeffs = np.pad(coeffs, (0, expected_len - coeffs.size))
+                        elif coeffs.size > expected_len:
+                            coeffs = coeffs[:expected_len]
+
+                        d_ctrl = getDisplacements(
+                            self.remote_output,
+                            control_nodes=cn,
+                            normals=cn_normals,
+                            coeffs=coeffs,
+                            t_patch_scale=basis.get("t_patch_scale", None),
+                            amp_alpha=float(basis.get("amp_alpha", 0.005)),
+                            parameterisation_method="direct",
+                            direct_parameterisation_subtype=subtype,
+                        )
+
+                    # -------------------------------------------------
+                    # PCA-REDUCED MODAL PARAMETERISATION
+                    # -------------------------------------------------
+                    elif use_pca:
                         if not pca_cache_path:
-                            raise RuntimeError("use_pca=True but no pca_cache_path provided in morph_basis.json")
+                            raise RuntimeError(
+                                "use_pca=True but no pca_cache_path provided in morph_basis.json"
+                            )
+
+                        # try to size from morph_basis first, otherwise pass through
+                        pca_k_final = basis.get("pca_k_final", None)
+                        if pca_k_final is not None:
+                            pca_k_final = int(pca_k_final)
+                            if coeffs.size < pca_k_final:
+                                coeffs = np.pad(coeffs, (0, pca_k_final - coeffs.size))
+                            elif coeffs.size > pca_k_final:
+                                coeffs = coeffs[:pca_k_final]
 
                         d_ctrl = getDisplacements(
                             self.remote_output,
@@ -380,16 +466,53 @@ class ClusterPipelineManager:
                             use_pca=True,
                             pca_cache_path=pca_cache_path,
                             pca_coeffs=coeffs,
-                            normal_project=bool(basis.get("normal_project", True)),
+                            normal_project=normal_project,
                             t_patch_scale=basis.get("t_patch_scale", None),
-                            amp_alpha=float(basis.get("amp_alpha", 0.002)),
+                            amp_alpha=float(basis.get("amp_alpha", 0.005)),
+                            vector_mode=vector_mode,
+                            frame_knn=frame_knn,
+                            global_modes=global_modes,
+                            global_mode_config=global_mode_config,
+                            basis_axes=basis_axes,
+                            use_local_modes=use_local_modes,
+                            global_only=global_only,
                         )
+
+                    # -------------------------------------------------
+                    # STANDARD MODAL PARAMETERISATION
+                    # -------------------------------------------------
                     else:
-                        k_modes = int(basis.get("k_modes", max(1, coeffs.size)))
-                        if coeffs.size < k_modes:
-                            coeffs = np.pad(coeffs, (0, k_modes - coeffs.size))
-                        elif coeffs.size > k_modes:
-                            coeffs = coeffs[:k_modes]
+                        n_global = (
+                            len(global_mode_config)
+                            if global_modes and global_mode_config
+                            else (8 if global_modes else 0)
+                        )
+
+                        if use_local_modes:
+                            if normal_project:
+                                valid_local = (k,)
+                                default_local = k
+                            else:
+                                if vector_mode == "xyz":
+                                    valid_local = (3 * k,)
+                                    default_local = 3 * k
+                                else:
+                                    valid_local = (k, 2 * k, 3 * k)
+                                    default_local = 3 * k
+                        else:
+                            valid_local = (0,)
+                            default_local = 0
+
+                        valid_full = tuple(n_global + v for v in valid_local)
+                        if coeffs.size in valid_local or coeffs.size in valid_full:
+                            expected_len = int(coeffs.size)
+                        else:
+                            expected_len = n_global + default_local
+
+                        if coeffs.size < expected_len:
+                            coeffs = np.pad(coeffs, (0, expected_len - coeffs.size))
+                        elif coeffs.size > expected_len:
+                            coeffs = coeffs[:expected_len]
 
                         d_ctrl = getDisplacements(
                             self.remote_output,
@@ -397,10 +520,18 @@ class ClusterPipelineManager:
                             control_nodes=cn,
                             normals=cn_normals,
                             coeffs=coeffs,
-                            k_modes=k_modes,
-                            normal_project=bool(basis.get("normal_project", True)),
+                            k_modes=k,
+                            normal_project=normal_project,
                             t_patch_scale=basis.get("t_patch_scale", None),
-                            amp_alpha=float(basis.get("amp_alpha", 0.002)),
+                            amp_alpha=float(basis.get("amp_alpha", 0.005)),
+                            vector_mode=vector_mode,
+                            frame_knn=frame_knn,
+                            global_modes=global_modes,
+                            global_mode_config=global_mode_config,
+                            basis_axes=basis_axes,
+                            parameterisation_method="modal",
+                            use_local_modes=use_local_modes,
+                            global_only=global_only,
                         )
 
                     d_ctrl = np.asarray(d_ctrl, dtype=float)
@@ -598,7 +729,7 @@ class ClusterPipelineManager:
         # Create batch file
         batch_name = f"pre_n{self.gen}_{self.n}"
         bf = Batchfile(batch_name)
-        bf.sbatch_params["ntasks"] = str(self.sol_parallel_domains) if self.sol_parallel_domains != 1 else 80
+        bf.sbatch_params["ntasks"] = 1
         bf.sbatch_params["mem"] = "0"
         bf.sbatch_params["time"] = "06:00:00"
         bf.sbatch_params.pop("nodes", None)

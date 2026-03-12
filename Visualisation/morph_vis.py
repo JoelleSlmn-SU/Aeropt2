@@ -8,7 +8,7 @@ def load_morph_case(json_path):
     with open(json_path, "r") as f:
         data = json.load(f)
 
-    out_dir = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\Corner Bump Surface Coarse Optimisation"
+    out_dir = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\viz"
     n = 0
 
     # Path to the morphed T-surface (adjust name as needed)
@@ -101,7 +101,7 @@ def visualise_morph(
     targets = control_nodes + disp_scaled
 
     # Lift CNs a tiny bit off the surface to reduce z-fighting
-    lift = 1e-4 * L
+    lift = 1e-2 * L
     cnP = control_nodes.copy()
     tgtP = targets.copy()
     cnP[:, 2] += lift
@@ -114,19 +114,26 @@ def visualise_morph(
     # T-surface (background)
     plotter.add_mesh(
         mesh,
-        color=(0.85, 0.85, 0.9),
-        opacity=0.8,
-        show_edges=True,
+        color="#3246a8",
+        opacity=0.7,
         label="T surface",
+    )
+    plotter.add_mesh(
+        mesh,
+        style="wireframe",
+        color="#3246a8",
+        opacity=0.3,
     )
 
     # --- Glyphs for CNs (black & red spheres, like mesh_gui) ---
-    r = 0.012 * lmin
+    r1 = 0.012 * lmin
+    r2 = 0.005 * lmin
 
-    sph = pv.Sphere(radius=r)
+    sph = pv.Sphere(radius=r1)
+    sph2 = pv.Sphere(radius=r2)
 
-    cn_poly = pv.PolyData(cnP[0])
-    tgt_poly = pv.PolyData(tgtP[0])
+    cn_poly = pv.PolyData(cnP)
+    tgt_poly = pv.PolyData(tgtP)
 
     cn_glyphs = cn_poly.glyph(geom=sph, scale=False)
     tgt_glyphs = tgt_poly.glyph(geom=sph, scale=False)
@@ -152,7 +159,7 @@ def visualise_morph(
     # Attach displacement magnitude as a cell scalar, so we can show a color bar
     segs.cell_data["disp_mag"] = mags  # one value per segment
 
-    act_segs = plotter.add_mesh(
+    '''act_segs = plotter.add_mesh(
         segs,
         scalars="disp_mag",
         cmap="viridis",
@@ -165,7 +172,7 @@ def visualise_morph(
             fmt="%.2e",
         ),
         label="Displacement vectors",
-    )
+    )'''
 
     # Axes & legend & info text
     plotter.add_axes()
@@ -182,6 +189,11 @@ def visualise_morph(
         (5561.85, 966.818, 1248.69),     # focus point
         (0.537, -0.733, 0.417),     # view-up vector
     ]
+    plotter.camera_position = [
+        (1283.1, 8264.98, 18682.9),
+        (5785.03,  1245.4, 1273.31),
+        (0.3489, -0.834, 0.4266),
+    ]
     plotter.camera.zoom(7)
 
     if screenshot_path:
@@ -193,8 +205,8 @@ def visualise_morph(
 
 # ----------------- Example driver for many morphs ----------------- #
 if __name__ == "__main__":
-    out_path = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\Corner Bump Surface\surfaces\n_0"
-    for i in range(5):
+    out_path = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\viz\surfaces\n_0"
+    for i in range(0,5):
         fpath = f"morph_config_n_{i+1}.json"
         json_path = os.path.join(out_path, fpath)
 
@@ -210,9 +222,9 @@ if __name__ == "__main__":
 
         visualise_morph(
             mesh_path,
-            cn[0],
-            disp[0],
-            scale=1.0,                 # can increase to exaggerate arrow visibility
+            cn,
+            disp,
+            scale=20.0,                 # can increase to exaggerate arrow visibility
             screenshot_path=screenshot,
             window_size=(1600, 1200),
         )

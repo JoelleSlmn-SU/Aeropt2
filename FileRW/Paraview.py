@@ -11,19 +11,15 @@ from vtk.util import numpy_support as ns
 
 # ---------- CONFIG ----------
 folder = [
-    "CB Opt 18.12",
-    "CB Opt 21.12",
-    "CB Opt 07.01",
-    "CB Opt 09.01",
     "CB Orig"
 ]
 
 x_case = 1
 gen = 0
 base = Path(r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples")
-case_root = base / folder[3]
+case_root = base / folder[0]
 
-CASE_FILE = str(case_root / "postprocessed" / f"n_{gen}" / str(x_case) / f"ENSIGHTcorner_{str(x_case)}.case")
+CASE_FILE = str(case_root / "postprocessed" / f"n_{gen}" / str(x_case) / f"ENSIGHTcorner.case")
 OUT_DIR   = str(case_root / "postprocessed" / f"n_{gen}" / str(x_case) / f"x_sweep_out")
 os.makedirs(OUT_DIR, exist_ok=True)
 

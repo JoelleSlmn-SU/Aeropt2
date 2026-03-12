@@ -27,6 +27,10 @@ Aeropt2 assumes familiarity with:
 
 ## SET UP - LOCAL
 
+% Need to upload fro surface mesh file to input directory
+
+0) Install Python v.3.10 >
+
 1) Clone Aeropt2
  - Open a terminal
  - cd <where you keep projects>

@@ -4,7 +4,8 @@ import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 from scipy.spatial import cKDTree
-
+import json
+from scipy.sparse.csgraph import connected_components
 
 def laplacian_smooth(points, disp, iters=2, knn=6):
     points = np.asarray(points, float)
@@ -24,6 +25,95 @@ def laplacian_smooth(points, disp, iters=2, knn=6):
         nbrs = idx[:, 1:] if idx.ndim == 2 else idx[1:]
         disp = np.array([disp[row].mean(axis=0) for row in nbrs])
     return disp
+
+def _mutual_knn_weighted_graph(points: np.ndarray, knn: int, sigma: float | None = None):
+    """
+    Build a symmetric mutual-kNN graph with Gaussian weights.
+
+    Keeps edge (i,j) only if:
+      j in kNN(i) AND i in kNN(j)
+
+    Returns:
+      W (csr_matrix): symmetric adjacency (zero diagonal)
+      sigma (float): Gaussian length scale used
+      knn_used (int): actual knn used (clamped)
+    """
+    from sklearn.neighbors import NearestNeighbors
+
+    X = np.asarray(points, float)
+    n = X.shape[0]
+    if n < 2:
+        raise ValueError("Need at least 2 points to build a graph.")
+
+    knn_used = int(min(max(1, knn), n - 1))
+    n_neighbors = knn_used + 1  # include self
+
+    nbrs = NearestNeighbors(n_neighbors=n_neighbors).fit(X)
+    dists, idx = nbrs.kneighbors(X, return_distance=True)  # shapes (n, k+1)
+
+    # Estimate sigma from mean 1st neighbor distance (excluding self)
+    if sigma is None:
+        nn1 = dists[:, 1] if dists.shape[1] > 1 else np.ones(n)
+        sigma = float(np.mean(nn1))
+        sigma = max(sigma, 1e-12)
+
+    # membership sets for mutual check (exclude self at col 0)
+    neigh_sets = [set(row[1:].tolist()) for row in idx]
+
+    rows, cols, data = [], [], []
+    for i in range(n):
+        for pos in range(1, idx.shape[1]):
+            j = int(idx[i, pos])
+            if j == i:
+                continue
+            # mutual condition
+            if i not in neigh_sets[j]:
+                continue
+
+            dist = float(dists[i, pos])
+            w = float(np.exp(-(dist * dist) / (2.0 * sigma * sigma)))
+
+            rows.append(i); cols.append(j); data.append(w)
+            rows.append(j); cols.append(i); data.append(w)
+
+    W = sp.csr_matrix((data, (rows, cols)), shape=(n, n))
+    W.setdiag(0.0)
+    W.eliminate_zeros()
+    return W, sigma, knn_used
+
+def _save_graph_debug(debug_dir: str, prefix: str, points: np.ndarray, W: sp.spmatrix,
+                     sigma: float, knn: int, mutual: bool):
+    os.makedirs(debug_dir, exist_ok=True)
+
+    # Save sparse adjacency
+    npz_path = os.path.join(debug_dir, f"{prefix}.npz")
+    sp.save_npz(npz_path, W.tocsr())
+
+    # Summaries for quick inspection
+    deg = np.asarray(W.sum(axis=1)).reshape(-1).tolist()
+    n_comp, labels = connected_components(W, directed=False, return_labels=True)
+
+    # Save json (edge list + metadata)
+    Wcoo = W.tocoo()
+    edges = list(zip(Wcoo.row.tolist(), Wcoo.col.tolist(), Wcoo.data.tolist()))
+
+    js = {
+        "n_points": int(points.shape[0]),
+        "knn": int(knn),
+        "sigma": float(sigma),
+        "mutual": bool(mutual),
+        "n_components": int(n_comp),
+        "component_labels": labels.tolist(),
+        "degree": deg,
+        "num_edges_directed": int(len(edges)),
+        "points": np.asarray(points, float).tolist(),
+        "edges": edges,  # (i, j, w) list
+    }
+    json_path = os.path.join(debug_dir, f"{prefix}.json")
+    with open(json_path, "w") as f:
+        json.dump(js, f, indent=2)
+
+    print(f"[DEBUG] Saved connectivity graph to:\n  {npz_path}\n  {json_path}")
 
 def _knn_graph(X, k=6):
     # k-NN graph (undirected, unweighted)
@@ -46,107 +136,136 @@ def _knn_graph(X, k=6):
     W.eliminate_zeros()
     return W
 
-def build_laplacian_basis(control_nodes, k_modes=10, knn=6):
+def build_laplacian_basis(
+    control_nodes,
+    k_modes: int = 10,
+    knn: int = 6,
+    use_mutual_knn: bool = True,
+    ensure_connected: bool = True,
+    max_knn: int | None = None,
+    debug: bool = True,
+    debug_dir: str | None = None,
+    debug_prefix: str = "connectivity_mutual_knn",
+):
     """
-    Debug version with extensive validation
+    Build Laplacian eigenmodes from a (mutual) kNN graph.
+
+    Key changes vs your current version:
+    - Optionally uses MUTUAL kNN to stabilise connectivity.
+    - Optionally increases knn until the graph becomes connected.
+    - Optional debug dump of W (sparse) + JSON metadata.
+
+    Returns:
+      evals (k_modes,) , evecs (N, k_modes)  (skipping constant mode)
     """
     import numpy as np
     import scipy.sparse.linalg as spla
-    
-    # Convert to numpy array
-    points = np.asarray(control_nodes)
-    
-    # Validate input
-    if len(points) == 0:
-        raise ValueError("No control nodes provided")
-    
-    if len(points) < k_modes + 2:
-        k_modes = max(1, len(points) - 2)
-    
-    if len(points) <= knn:
-        knn = max(1, len(points) - 1)
-    
-    # Check for duplicate points
-    unique_points = np.unique(points, axis=0)
-    if len(unique_points) < len(points):
-        points = unique_points
-    
-    # Check point distribution
-    if len(points) > 1:
-        distances = np.linalg.norm(points[1:] - points[0], axis=1)
-        min_dist = np.min(distances)
-        max_dist = np.max(distances)
-        
-        if min_dist < 1e-10:
-            print("[ERROR] Points are too close together (numerical precision issues)")
-    
-    # Build the graph Laplacian (this is the missing implementation)
-    from sklearn.neighbors import NearestNeighbors
-    
-    # Find k-nearest neighbors
-    N = len(points)
-    n_neighbors = min(knn + 1, max(2, N - 1))  # must be < N
-    nbrs = NearestNeighbors(n_neighbors=n_neighbors).fit(points)
-    distances, indices = nbrs.kneighbors(points)
-    
-    # Build adjacency matrix
-    n = len(points)
-    from scipy.sparse import csr_matrix
-    
-    # Create adjacency matrix with Gaussian weights
-    row_indices = []
-    col_indices = []
-    data = []
-    
-    sigma = np.mean(distances[:, 1])  # Use mean nearest neighbor distance as sigma
-    print(f"[DEBUG] Using sigma = {sigma:.6f} for Gaussian weights")
-    
-    for i in range(n):
-        for j in range(1, len(indices[i])):  # Skip self (index 0)
-            neighbor = indices[i][j]
-            dist = distances[i][j]
-            weight = np.exp(-dist**2 / (2 * sigma**2))
-            
-            row_indices.extend([i, neighbor])
-            col_indices.extend([neighbor, i])
-            data.extend([weight, weight])
-    
-    # Create sparse adjacency matrix
-    W = csr_matrix((data, (row_indices, col_indices)), shape=(n, n))
-    
-    # Compute degree matrix
-    degrees = np.array(W.sum(axis=1)).flatten()
-    D = csr_matrix((degrees, (range(n), range(n))), shape=(n, n))
-    
-    # Compute Laplacian: L = D - W
-    L = D - W
-    
-    # Check if matrix is singular
-    try:
-        # Try a small shift to avoid singularity
-        L_shifted = L + 1e-8 * csr_matrix(np.eye(n))
-        
-        # Compute eigenvalues
-        evals, evecs = spla.eigsh(L_shifted, k=k_modes+1, sigma=0.0, which='LM')
-        
-        
-        return evals[1:], evecs[:, 1:]  # Skip the first (constant) mode
-        
-    except RuntimeError as e:
-        print(f"[ERROR] Eigenvalue computation failed: {e}")
-        
-        # Fallback: use PCA instead
-        print("[FALLBACK] Using PCA instead of Laplacian eigenmodes")
-        from sklearn.decomposition import PCA
-        
-        pca = PCA(n_components=min(k_modes, points.shape[1], len(points)-1))
-        components = pca.fit_transform(points - np.mean(points, axis=0))
-        
-        # Create fake eigenvalues
-        explained_var = pca.explained_variance_
-        fake_evals = np.arange(1, len(explained_var) + 1)
-        
-        return fake_evals, components
+
+    points = np.asarray(control_nodes, float)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"control_nodes must be (N,3). Got {points.shape}")
+
+    n = points.shape[0]
+    if n < 3:
+        raise ValueError("Need at least 3 points to build a Laplacian basis.")
+
+    # Clamp k_modes and knn
+    k_modes = int(min(max(1, k_modes), n - 2))
+    knn = int(min(max(1, knn), n - 1))
+    if max_knn is None:
+        max_knn = min(n - 1, max(knn, 12))
+
+    # Remove exact duplicates (can break neighbour logic / sigma)
+    uniq = np.unique(points, axis=0)
+    if uniq.shape[0] != points.shape[0]:
+        print(f"[WARN] Found duplicates: {points.shape[0] - uniq.shape[0]} removed.")
+        points = uniq
+        n = points.shape[0]
+        k_modes = int(min(max(1, k_modes), n - 2))
+        knn = int(min(max(1, knn), n - 1))
+        max_knn = min(max_knn, n - 1)
+
+    # --- build adjacency ---
+    sigma = None
+    W = None
+    knn_used = knn
+
+    if use_mutual_knn:
+        # try increasing knn until connected (optional)
+        for k_try in range(knn, max_knn + 1):
+            W_try, sigma_try, k_used = _mutual_knn_weighted_graph(points, k_try, sigma=None)
+            n_comp = connected_components(W_try, directed=False, return_labels=False)
+            if (not ensure_connected) or (n_comp == 1):
+                W, sigma, knn_used = W_try, sigma_try, k_used
+                if n_comp != 1:
+                    print(f"[WARN] mutual-kNN graph not connected (components={n_comp}), proceeding anyway.")
+                break
+
+        if W is None:
+            # fallback to union kNN (symmetric) if mutual cannot connect
+            print("[WARN] Could not form connected mutual-kNN graph within max_knn. Falling back to symmetric union-kNN.")
+            W, sigma, knn_used = _mutual_knn_weighted_graph(points, max_knn, sigma=None)  # still mutual, but max
+    else:
+        # keep your old behaviour: symmetric union of kNN edges with Gaussian weights
+        from sklearn.neighbors import NearestNeighbors
+        nn = NearestNeighbors(n_neighbors=min(knn + 1, n)).fit(points)
+        dists, idx = nn.kneighbors(points, return_distance=True)
+        nn1 = dists[:, 1] if dists.shape[1] > 1 else np.ones(n)
+        sigma = float(np.mean(nn1))
+        sigma = max(sigma, 1e-12)
+
+        rows, cols, data = [], [], []
+        for i in range(n):
+            for pos in range(1, idx.shape[1]):
+                j = int(idx[i, pos])
+                if j == i:
+                    continue
+                dist = float(dists[i, pos])
+                w = float(np.exp(-(dist * dist) / (2.0 * sigma * sigma)))
+                rows += [i, j]
+                cols += [j, i]
+                data += [w, w]
+        W = sp.csr_matrix((data, (rows, cols)), shape=(n, n))
+        W.setdiag(0.0)
+        W.eliminate_zeros()
+        knn_used = knn
+
+    print(f"[DEBUG] kNN={knn_used} mutual={use_mutual_knn} sigma={sigma:.6e}")
+
+    if debug:
+        if debug_dir is None:
+            debug_dir = os.getcwd()
+        _save_graph_debug(
+            debug_dir=debug_dir,
+            prefix=debug_prefix,
+            points=points,
+            W=W,
+            sigma=sigma,
+            knn=knn_used,
+            mutual=use_mutual_knn
+        )
+
+    # Laplacian
+    degrees = np.asarray(W.sum(axis=1)).reshape(-1)
+    D = sp.diags(degrees, offsets=0, shape=(n, n), format="csr")
+    L = (D - W).tocsr()
+
+    # small diagonal shift for numerical stability
+    Ls = L + 1e-10 * sp.identity(n, format="csr")
+
+    # eigen solve: compute k_modes+1 and drop the constant mode
+    # use "SM" (smallest magnitude) since L is PSD; shift already avoids exact singularity
+    evals, evecs = spla.eigsh(Ls, k=min(k_modes + 1, n - 1), which="SM")
+    # sort ascending
+    order = np.argsort(evals)
+    evals = evals[order]
+    evecs = evecs[:, order]
+
+    # drop first mode (≈ constant)
+    evals = evals[1:k_modes + 1]
+    evecs = evecs[:, 1:k_modes + 1]
+
+    return evals, evecs
 
 def expand_modal_coeffs(phi: np.ndarray,
                         coeffs: np.ndarray,

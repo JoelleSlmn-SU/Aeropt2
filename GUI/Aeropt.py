@@ -71,6 +71,7 @@ class MainWindow(QMainWindow):
         self.create_display_section()
         
         self.control_nodes_saved = False
+        self.input_directory_set = False
         self.output_directory_set = False
         self.prepro_settings_saved = False
         self.solver_settings_saved = False
@@ -105,6 +106,13 @@ class MainWindow(QMainWindow):
             if not ok:
                 QMessageBox.warning(self, "Connection Failed", "Falling back to local execution.")
                 self.run_mode = "Local"
+
+    
+    def get_project_basename(self):
+        """Return self.base name of loaded geometry/mesh file without extension."""
+        if hasattr(self, "input_filename") and self.input_filename:
+            return os.path.splitext(self.input_filename)[0]
+        return "project"
 
     def ask_run_location(self):
         reply = QMessageBox.question(
@@ -283,6 +291,98 @@ class MainWindow(QMainWindow):
         container.setLayout(outer_layout)
         self.setCentralWidget(container)
 
+    def _stage(self):
+        import posixpath
+        # --- Stage baseline inputs into orig/ (best-effort) ---
+        base = getattr(self, "base", None) or self.get_project_basename()
+        self.logger.log(f"[HPC] Staging baseline inputs using base='{base}'")
+
+        remote_orig_dir = f"{self.base_hpc_dir}/orig"
+
+        # Where to look for the files locally
+        search_dirs = []
+        candidates = [
+            getattr(self, "input_directory", None),
+            getattr(self, "output_directory", None),
+            os.path.join(getattr(self, "output_directory", ""), "surfaces", "n_0"),
+            os.path.dirname(getattr(self, "input_file_path", "") or ""),
+        ]
+        for d in candidates:
+            if d and os.path.isdir(d) and d not in search_dirs:
+                search_dirs.append(d)
+
+        def find_local(fname: str):
+            for d in search_dirs:
+                p = os.path.join(d, fname)
+                if os.path.exists(p):
+                    return p
+            return None
+
+        file_list = [
+            f"{base}.bac",
+            f"{base}.bco",
+            f"{base}.bpp",
+            f"{base}.dat",
+            f"{base}.fro",
+            f"{base}.inp",
+            "run.inp",
+            "Mesh3D_v50.ctl",
+            "Surf3D_v25.ctl",
+            "rungen.inp",
+        ]
+
+        sftp = self.ssh_client.open_sftp()
+        try:
+            for fname in file_list:
+                src = find_local(fname)
+                remote_path = posixpath.join(remote_orig_dir, fname)
+                if src:
+                    try:
+                        sftp.put(src, remote_path)
+                        self.logger.log(f"[HPC] Uploaded: {fname}  (from {src})")
+                    except Exception as e:
+                        self.logger.log(f"[HPC][WARN] Failed upload {fname}: {e}")
+                else:
+                    self.logger.log(f"[HPC][WARN] Missing locally (searched {search_dirs}): {fname}")
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+
+    def _stage_before_hpc_run(self, action_name="run") -> bool:
+        """
+        Refresh remote orig/ from the latest local files immediately before
+        submitting an HPC action.
+        """
+        if getattr(self, "run_mode", "") != "HPC":
+            return True
+
+        if not getattr(self, "ssh_client", None):
+            self.logger.log(f"[{action_name}][HPC][ERROR] Not connected to HPC.")
+            return False
+
+        if not getattr(self, "remote_output_dir", None):
+            self.logger.log(f"[{action_name}][HPC][ERROR] No remote output directory set.")
+            return False
+
+        try:
+            self.logger.log(f"[{action_name}][HPC] Refreshing staged files in remote orig/ ...")
+
+            # Stage the standard file set used by your pipeline
+            self._stage()
+
+            # Also do the more targeted orig refresh helper, since it searches
+            # input/output dirs robustly for core FLITE inputs
+            remote_orig = self._stage_orig_inputs_to_remote()
+            if not remote_orig:
+                self.logger.log(f"[{action_name}][HPC][WARN] orig/ refresh returned empty path.")
+
+            return True
+        except Exception as e:
+            self.logger.log(f"[{action_name}][HPC][ERROR] Failed to refresh staged files: {e}")
+            return False
+
     def new_file(self):
         """Start a fresh project: clear viewers, state, docks, logs."""
         # close any sub-dialogs
@@ -328,6 +428,7 @@ class MainWindow(QMainWindow):
 
         self.logger.log("[INFO] New project started. State reset.")
 
+
     def open_file(self):
         filename, _ = QFileDialog.getOpenFileName(
             self,
@@ -361,8 +462,8 @@ class MainWindow(QMainWindow):
             self.logger.log("[INFO] Mesh loaded into Mesh viewer.")
         else:
             self.logger.log(f"[WARN] Unsupported file type: {ext}.")
-
-        # If user already chose output dir (local or remote), this will create the right pipeline
+        
+        self.input_directory_set = True
         self.create_pipeline()
         
     def _ensure_output_home(self):
@@ -392,6 +493,10 @@ class MainWindow(QMainWindow):
             os.makedirs(self.rbf_original, exist_ok=True)
                 
     def save_file(self):
+        import os
+        import posixpath
+        from PyQt5.QtWidgets import QFileDialog
+
         # 1) Pick output dir (local)
         output_dir = QFileDialog.getExistingDirectory(self, "Select Output Directory")
         if not output_dir:
@@ -414,80 +519,29 @@ class MainWindow(QMainWindow):
 
         self.logger.log(f"[Local] Created output directory and subfolders under: {self.output_directory}")
 
-        # 2) If HPC mode, mirror folders remotely (with absolute $HOME)
+        # 2) If HPC mode, mirror folders remotely (and stage baseline inputs to orig/)
         if getattr(self, "run_mode", "") == "HPC":
             try:
-                # Resolve $HOME to an absolute path for SFTP compatibility
-                _in, _out, _err = self.ssh_client.exec_command("bash -lc 'printf %s \"$HOME\"'")
-                home = _out.read().decode().strip() or "~"
+                # Name remote run folder after local output folder (sanitised)
                 temp = os.path.basename(self.output_directory.rstrip('/\\')).replace(' ', '_')
-                base_hpc_dir = f"/scratch/{self.ssh_creds['username']}/aeropt/aeropt_out/{temp}" # TODO: FIX - CHANGE TO SCRATCH
+                base_hpc_dir = f"/scratch/{self.ssh_creds['username']}/aeropt/aeropt_out/{temp}"
+                self.base_hpc_dir = base_hpc_dir
 
                 # Create remote dirs with bash (handles parents)
                 subfolders = ["preprocessed", "solutions", "surfaces", "volumes", "postprocessed"]
-                mkdir_cmd = "bash -lc " + "'" + " && ".join(
-                    [f"mkdir -p {base_hpc_dir}"] +
-                    [f"mkdir -p {base_hpc_dir}/{sub}" for sub in subfolders] +
-                    [f"mkdir -p {base_hpc_dir}/surfaces/n_0"]
-                ) + "'"
+                mkdir_parts = [f"mkdir -p '{base_hpc_dir}'"]
+                mkdir_parts += [f"mkdir -p '{base_hpc_dir}/{sub}'" for sub in subfolders]
+                mkdir_parts += [f"mkdir -p '{base_hpc_dir}/surfaces/n_0'"]
+                mkdir_parts += [f"mkdir -p '{base_hpc_dir}/orig'"]
 
+                mkdir_cmd = "bash -lc \"" + " && ".join(mkdir_parts) + "\""
                 _in, _out, _err = self.ssh_client.exec_command(mkdir_cmd)
-                err = _err.read().decode().strip()
+                err = _err.read().decode(errors="ignore").strip()
                 if err:
                     self.logger.log(f"[HPC] mkdir stderr: {err}")
 
                 self.remote_output_dir = base_hpc_dir
                 self.logger.log(f"[HPC] Created output directory and subfolders under: {self.remote_output_dir}")
-                
-                # create orig/ and move baseline inputs into it (best-effort) ---
-                try:
-                    import os
-
-                    base = getattr(self, "base_name", None) or self.get_project_basename()
-
-                    local_output_dir = self.output_dir  # your local output directory
-                    remote_orig_dir = f"{base_hpc_dir}/orig"
-
-                    # 1) Ensure remote orig directory exists
-                    mk_orig_cmd = f"mkdir -p \"{remote_orig_dir}\""
-                    self.ssh_client.exec_command(mk_orig_cmd)
-
-                    # 2) Files to upload
-                    file_list = [
-                        f"{base}.bac",
-                        f"{base}.bco",
-                        f"{base}.bpp",
-                        f"{base}.dat",
-                        f"{base}.fro",
-                        f"{base}.inp",
-                        "run.inp",
-                        "Mesh3D_v50.ctl",
-                        "Surf3D_v25.ctl",
-                        "rungen.inp",
-                    ]
-
-                    sftp = self.ssh_client.open_sftp()
-
-                    for fname in file_list:
-                        local_path = os.path.join(local_output_dir, fname)
-                        remote_path = f"{remote_orig_dir}/{fname}"
-
-                        if os.path.exists(local_path):
-                            try:
-                                sftp.put(local_path, remote_path)
-                                self.logger.log(f"[HPC] Uploaded: {fname}")
-                            except Exception as e:
-                                self.logger.log(f"[HPC][WARN] Failed upload {fname}: {e}")
-                        else:
-                            # Skip silently (or log lightly if you prefer)
-                            self.logger.log(f"[HPC] Skipped (not found locally): {fname}")
-
-                    sftp.close()
-
-                    self.logger.log(f"[HPC] Baseline files staged to: {remote_orig_dir}")
-
-                except Exception as e:
-                    self.logger.log(f"[HPC][ERROR] Failed to stage baseline files: {e}")
 
                 # Tell the viewer where remote outputs live
                 if hasattr(self, "mesh_viewer") and self.mesh_viewer:
@@ -495,7 +549,7 @@ class MainWindow(QMainWindow):
 
             except Exception as e:
                 self.logger.log(f"[HPC] Remote setup failed: {e}")
-
+            
         # 3) Mark as ready and (re)create the pipeline now that BOTH input & output are known
         self.output_directory_set = True
         self.check_run_morph_button_state()
@@ -503,6 +557,10 @@ class MainWindow(QMainWindow):
         # Centralized creation; will no-op if prerequisites are missing
         if hasattr(self, "create_pipeline"):
             self.create_pipeline()
+
+        # If you’re using the new train-classifier gating, refresh it here too
+        if hasattr(self, "_update_train_classifier_button_state"):
+            self._update_train_classifier_button_state()
 
     def list_jobs_me(self) -> str:
         """
@@ -540,6 +598,10 @@ class MainWindow(QMainWindow):
             self.logger.log("[HPC][cancel stderr] {err}")
             return False
         return True
+
+    def _mesh_is_loaded(self) -> bool:
+        mv = getattr(self, "mesh_viewer", None)
+        return bool(mv is not None and getattr(mv, "mesh_obj", None) is not None)
 
     def on_hpc_status_clicked(self):
         try:
@@ -623,13 +685,17 @@ class MainWindow(QMainWindow):
                 self.logger.log(f"[HPC] Geometry upload failed: {e}")
 
         self.logger.log("[PIPE] Pipeline initialised and linked.")
-
     
-    def get_project_basename(self):
-        """Return self.base name of loaded geometry/mesh file without extension."""
-        if hasattr(self, "input_filename") and self.input_filename:
-            return os.path.splitext(self.input_filename)[0]
-        return "project"
+    def _update_train_classifier_button_state(self):
+        ok = (
+            getattr(self, "run_mode", "") == "HPC"
+            and bool(getattr(self, "remote_output_dir", None))
+            and bool(getattr(self, "ssh_client", None))
+            and bool(getattr(self, "control_nodes_saved", False))
+            and bool(getattr(self, "output_directory_set", False))
+        )
+        if hasattr(self, "train_mesh_classifier_btn"):
+            self.train_mesh_classifier_btn.setEnabled(ok)
     
     def check_run_morph_button_state(self):
         if self.control_nodes_saved and self.output_directory_set:
@@ -658,6 +724,7 @@ class MainWindow(QMainWindow):
             ("Geometry Definition", self.open_geometry_window),
             ("Solver Settings", self.activate_tab_3),
             ("Optimisation Settings", self.activate_tab_2),
+            ("Train Mesh Classifier", self.on_train_mesh_classifier_clicked),
         ]
         
         self.button_layout.setAlignment(Qt.AlignTop)
@@ -666,6 +733,11 @@ class MainWindow(QMainWindow):
             btn.pressed.connect(handler)
             self.button_layout.addWidget(btn)
             self.button_layout.addSpacing(12)
+            
+            if text == "Train Mesh Classifier":
+                self.train_mesh_classifier_btn = btn
+                
+        self.train_mesh_classifier_btn.setEnabled(False)
             
         spacer = QSpacerItem(20, 40, QSizePolicy.Minimum, QSizePolicy.Expanding)
         self.button_layout.addItem(spacer)
@@ -733,6 +805,9 @@ class MainWindow(QMainWindow):
             self.logger.log("[MORPH][ERROR] Not connected to HPC.")
             return
 
+        if not self._stage_before_hpc_run("MORPH"):
+            return
+
         # --- ask how many morphs ---
         from PyQt5.QtWidgets import QInputDialog
         n_cases, ok = QInputDialog.getInt(self, "Morph", "How many morphed meshes would you like?", 5, 1, 1000, 1)
@@ -772,6 +847,9 @@ class MainWindow(QMainWindow):
             # optional knobs (remoteMorph will default if missing)
             "coeff_sigma": 0.5,   # random coeff distribution
             "seed": None,         # or an int for repeatability
+            "n_cases": n_cases,   # or however many
+            "batch_size": 10,     # how many to run at once
+            "poll_s": 200         # how long to wait to check if batch has been run
         }
 
         with open(morph_json, "w", encoding="utf-8") as f:
@@ -849,6 +927,10 @@ class MainWindow(QMainWindow):
         if not conds:
             self.logger.log("[SIM][ERROR] Still no conditions. Aborting.")
             return
+        
+        if getattr(self, "run_mode", "") == "HPC":
+            if not self._stage_before_hpc_run("SIM"):
+                return
 
         # Launch on a worker thread
         from PyQt5.QtCore import QThread
@@ -894,27 +976,51 @@ class MainWindow(QMainWindow):
         # 1) Build local JSON from mesh viewer state
         basis_cfg = {
             "control_nodes": mv.control_nodes.tolist(),
-            "control_normals": getattr(mv, "control_normals", None).tolist() if getattr(mv, "control_normals", None) is not None else None,
+            "control_normals": getattr(mv, "control_normals", None).tolist()
+                if getattr(mv, "control_normals", None) is not None else None,
+
+            "parameterisation_method": getattr(mv, "parameterisation_method", "modal"),
+            "direct_parameterisation_subtype": getattr(mv, "direct_parameterisation_subtype", None),
+
+            "selection_mode": getattr(mv, "control_node_selection_mode", None),
+            "loaded_control_nodes_path": getattr(mv, "loaded_control_nodes_path", None),
+            "loaded_control_normals_path": getattr(mv, "loaded_control_normals_path", None),
+
             "t_patch_scale": getattr(mv, "t_patch_scale", None),
+            "amp_alpha": getattr(mv, "amp_alpha", 0.001),
+
             "TSurfaces": getattr(mv, "TSurfaces", []),
             "USurfaces": getattr(mv, "USurfaces", []),
             "CSurfaces": getattr(mv, "CSurfaces", []),
-            "k_modes": getattr(mv, "k_modes", 6),
-            "spectral_p": getattr(mv, "spectral_p", 2.0),
-            "coeff_frac": getattr(mv, "coeff_frac", 0.15),
+
+            "k_modes": getattr(mv, "k_modes", 0),
+            "spectral_p": getattr(mv, "spectral_p", None),
+            "coeff_frac": getattr(mv, "coeff_frac", None),
             "seed": getattr(mv, "seed", 0),
-            "normal_project": getattr(mv, "normal_project", True),
+
+            "normal_project": getattr(mv, "normal_project", None),
+            "vector_mode": getattr(mv, "vector_mode", None),
+            "frame_knn": getattr(mv, "frame_knn", None),
+
+            "use_local_modes": getattr(mv, "use_local_modes", False),
+            "global_modes": getattr(mv, "global_modes_selected", False),
+            "global_only": getattr(mv, "global_only", False),
+            "global_mode_config": getattr(mv, "global_mode_config", []),
+            "basis_axes": getattr(mv, "basis_axes", None),
+
             "use_pca": getattr(mv, "use_pca", False),
             "pca_cache_path": getattr(mv, "pca_cache_path", None),
             "pca_train_M": getattr(mv, "pca_train_M", None),
             "pca_energy": getattr(mv, "pca_energy", None),
             "pca_k_red": getattr(mv, "pca_k_red", None),
             "pca_k_final": getattr(mv, "pca_k_final", None),
+
             "bump_enable": getattr(mv, "bump_enable", False),
             "bump_center": getattr(mv, "bump_center", None),
             "bump_radius": getattr(mv, "bump_radius", None),
             "bump_one_sided": getattr(mv, "bump_one_sided", False),
-            "rigid_translation": getattr(mv, "rigid_boundary_translation", True)
+
+            "rigid_translation": getattr(mv, "rigid_boundary_translation", True),
         }
 
         local_tmp = tempfile.mkdtemp()
@@ -1215,6 +1321,9 @@ class MainWindow(QMainWindow):
         #                    "remoteOpt will rely on existing files on the cluster.")    
 
         # 1a) Export & upload morph_basis.json for this run
+        if not self._stage_before_hpc_run("OPT"):
+            return
+        
         remote_basis_path = self.export_morph_basis_for_opt(remote_run)
         if not remote_basis_path:
             self.logger.log("[OPT][WARN] Morph basis not available; optimisation may run with zero morphing.")
@@ -1236,6 +1345,7 @@ class MainWindow(QMainWindow):
         s["acquisition_function"] = self.bo_acq_combo.currentText()
         s["sim_dir"] = remote_run + "/"
         s["units"] = self.cad_units
+        s["parallel"] = self.parallel
         # NEW: include path to morph_basis.json on the cluster
         s["morph_basis_json"] = remote_basis_path
         
@@ -1293,6 +1403,114 @@ class MainWindow(QMainWindow):
             self.geom_window.show()
         else:
             QMessageBox.warning(self, "Error", "Load a mesh first.")
+            
+    def on_train_mesh_classifier_clicked(self):
+        """UI entry-point: stage baseline to orig/, export morph basis, and submit a classifier training sweep on HPC."""
+        if getattr(self, "run_mode", "") != "HPC":
+            QMessageBox.warning(self, "HPC only", "Mesh-classifier training is currently configured for HPC mode.")
+            return
+        if not bool(getattr(self, "control_nodes_saved", False)):
+            QMessageBox.warning(self, "Missing control nodes", "Save control nodes first (define CNs + bounds) before training.")
+            return
+        if not bool(getattr(self, "output_directory_set", False)) or not getattr(self, "remote_output_dir", None):
+            QMessageBox.warning(self, "Missing output directory", "Set an output directory first.")
+            return
+        if not getattr(self, "ssh_client", None):
+            QMessageBox.warning(self, "Not connected", "Connect to the HPC first.")
+            return
+
+        if not self._stage_before_hpc_run("TRAIN"):
+            return
+
+        dlg = TrainMeshClassifierDialog(self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        n_cases, batch_size, poll_s = dlg.values()
+
+        import os, json, posixpath, tempfile
+        from datetime import datetime
+
+        # Ensure baseline is staged into remote_output_dir/orig (includes baseline .fro)
+        '''remote_orig_dir = self._pick_surface_mesh_for_opt()
+        if not remote_orig_dir:
+            self.logger.log("[TRAIN][ERROR] Failed to stage baseline surface mesh into remote orig/.")
+            return'''
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        remote_run = posixpath.join(self.remote_output_dir, "train_mesh_classifier", stamp)
+        self.ssh_client.exec_command(f"bash -lc 'mkdir -p \"{remote_run}\"'")
+
+        # Export morph basis into remote_run/morph/morph_basis.json (and upload PCA cache if enabled)
+        remote_basis_path = self.export_morph_basis_for_opt(remote_run)
+        if not remote_basis_path:
+            self.logger.log("[TRAIN][ERROR] Failed to export morph basis; cannot start training sweep.")
+            return
+
+        # Minimal sweep settings (keep morph basis logic inside export_morph_basis_for_opt)
+        sweep_settings = {
+            "remote_output": self.remote_output_dir,
+            "run_dir": remote_run,
+            "input_dir": posixpath.join(self.remote_output_dir, "orig"),
+            "morph_basis_json": remote_basis_path,
+            "cad_units": getattr(self, "cad_units", "mm"),
+            "parallel_domains": int(getattr(self, "parallel_domains", 80)),
+            "n_cases": int(n_cases),
+            "batch_size": int(batch_size),
+            "poll_s": int(poll_s),
+            "dataset_path": posixpath.join(remote_run, "dataset.jsonl"),
+        }
+
+        local_tmp = tempfile.mkdtemp()
+        local_settings = os.path.join(local_tmp, "sweep_settings.json")
+        with open(local_settings, "w", encoding="utf-8") as f:
+            json.dump(sweep_settings, f, indent=2)
+
+        sftp = self.ssh_client.open_sftp()
+        try:
+            sftp.put(local_settings, posixpath.join(remote_run, "sweep_settings.json"))
+        finally:
+            try: sftp.close()
+            except Exception: pass
+
+        # Submit the sweep driver (submit_sweep.py) which will call run_case.py (which calls the pipeline)
+        user = self.ssh_creds["username"]
+        py = f"/home/{user}/.conda/envs/aeropt-hpc/bin/python"
+        # NOTE: these scripts will live alongside other remote scripts (we'll create them next)
+        submit_sweep = f"/home/{user}/aeropt/Scripts/MeshFailureClassifier/sweep/submit_sweep.py"
+
+        batch_lines = [
+            "#!/bin/bash -l",
+            "#SBATCH --job-name=train_meshclf",
+            "#SBATCH --output=train_meshclf.%J.out",
+            "#SBATCH --error=train_meshclf.%J.err",
+            "#SBATCH --time=3-00:00",
+            "#SBATCH --nodes=1",
+            "#SBATCH --ntasks=1",
+            "set -euo pipefail",
+            "source ~/.bashrc",
+            f'cd "{remote_run}"',
+            f'{py} "{submit_sweep}" "{remote_run}"',
+        ]
+        
+        local_batch = os.path.join(local_tmp, "batchfile_train_meshclf")
+        with open(local_batch, "w", newline="\n") as f:
+            f.write("\n".join(batch_lines) + "\n")
+
+        sftp = self.ssh_client.open_sftp()
+        try:
+            sftp.put(local_batch, posixpath.join(remote_run, "batchfile_train_meshclf"))
+        finally:
+            try: sftp.close()
+            except Exception: pass
+
+        _in, _out, _err = self.ssh_client.exec_command(f"bash -lc 'cd \"{remote_run}\"; sbatch batchfile_train_meshclf'")
+        out = _out.read().decode().strip()
+        err = _err.read().decode().strip()
+        if err:
+            self.logger.log(f"[TRAIN][HPC][WARN] sbatch stderr: {err}")
+        self.logger.log(f"[TRAIN][HPC] Submitted: {out}")
+        self.logger.log(f"[TRAIN][HPC] Run dir: {remote_run}")
+
 
     def create_stack_pages(self):
         """Create pages for the stacked layout."""
@@ -1360,11 +1578,18 @@ class MainWindow(QMainWindow):
         self.bo_obj_spin.setValue(1)
         self.bo_form.addRow("Number of objectives:", self.bo_obj_spin)
 
-        # Placeholder for bounds (real fields created later)
-        self.bounds_container = QWidget()
-        self.bounds_layout = QFormLayout(self.bounds_container)
-        self.bounds_layout.addRow(QLabel("Bounds will be generated once control nodes are saved."))
-        self.bo_form.addRow(self.bounds_container)
+        # Bounds summary + editor button (dialog-based)
+        self.bound_fields = []
+        self.bound_meta = []
+        self.current_bounds = {"lb": [], "ub": []}
+
+        self.bounds_summary_label = QLabel("Bounds not generated yet. Save control nodes first.")
+        self.bo_form.addRow("Bounds:", self.bounds_summary_label)
+
+        self.edit_bounds_btn = QPushButton("Edit Bounds")
+        self.edit_bounds_btn.setEnabled(False)
+        self.edit_bounds_btn.clicked.connect(self.open_bounds_dialog)
+        self.bo_form.addRow("", self.edit_bounds_btn)
 
         # Count limit
         self.bo_count_spin = QSpinBox()
@@ -1407,36 +1632,202 @@ class MainWindow(QMainWindow):
         
         self.objective_config = {
             "objective_type": "Drag",
-            "expression": "Drag",
-            "conditions": [{"AoA": 3.5, "Mach": 1.2, "Re": 1e6, "TurbModel": 2, "EngineFlow": 1, "MassFlow": 1.0, "Weight": 1.0}],
+            "expression": "min(CD)",
+            "conditions": [{
+                "Altitude": 36000.0,
+                "AoA": 3.5,
+                "Mach": 1.2,
+                "Re": 1e6,
+                "TurbModel": 2,
+                "EngineFlow": 1,
+                "MassFlow": 1.0,
+                "Weight": 1.0
+            }],
             "constraints": []
-        }        
+        }     
         return widget
     
     def open_objective_editor(self):
-        dlg = ObjectiveEditor(self)
+        dlg = ObjectiveEditor(self, config=getattr(self, "objective_config", None))
         if dlg.exec_() == QDialog.Accepted:
             self.objective_config = dlg.get_config()
-            self.logger.log(f"[OPT] Objective config saved with {len(self.objective_config.get('conditions', []))} condition(s).")
+            self.logger.log(
+                f"[OPT] Objective config saved: "
+                f"{self.objective_config.get('expression', '')} "
+                f"with {len(self.objective_config.get('conditions', []))} condition(s)."
+            )
+
+    def _get_bo_dimension_info(self):
+        """
+        Returns a list of bound descriptors in optimisation-vector order.
+        Each item is a dict: {"name": ..., "lb": ..., "ub": ...}
+        """
+        mv = getattr(self, "mesh_viewer", None)
+        if mv is None:
+            return []
+
+        info = []
+
+        parameterisation_method = str(
+            getattr(mv, "parameterisation_method", "modal")
+        ).strip().lower()
+
+        # --------------------------------------------------
+        # DIRECT CONTROL-NODE PARAMETERISATION
+        # --------------------------------------------------
+        if parameterisation_method == "direct":
+            subtype = str(
+                getattr(mv, "direct_parameterisation_subtype", "xyz") or "xyz"
+            ).strip().lower()
+
+            cn = getattr(mv, "control_nodes", None)
+            n_cn = 0 if cn is None else len(cn)
+
+            if subtype == "xyz":
+                for i in range(n_cn):
+                    for comp in ["x", "y", "z"]:
+                        info.append({
+                            "name": f"CN {i+1} {comp}",
+                            "lb": -1.0,
+                            "ub":  1.0
+                        })
+            elif subtype == "normal":
+                for i in range(n_cn):
+                    info.append({
+                        "name": f"CN {i+1} normal",
+                        "lb": -1.0,
+                        "ub":  1.0
+                    })
+            else:
+                self.logger.log(f"[Bayes][WARN] Unknown direct subtype '{subtype}'.")
+                return []
+
+            return info
+
+        # --------------------------------------------------
+        # PCA-REDUCED MODAL PARAMETERISATION
+        # --------------------------------------------------
+        use_pca = bool(getattr(mv, "use_pca", False))
+        if use_pca:
+            k_red = getattr(mv, "pca_k_red", None)
+            k_final = getattr(mv, "pca_k_final", None)
+
+            n_dim = k_final or k_red or getattr(mv, "k_modes", 0)
+            for i in range(int(n_dim)):
+                info.append({
+                    "name": f"PCA Mode {i+1}",
+                    "lb": -2.0,
+                    "ub":  2.0
+                })
+            return info
+
+        # --------------------------------------------------
+        # STANDARD MODAL PARAMETERISATION
+        # --------------------------------------------------
+        k = int(getattr(mv, "k_modes", 0))
+        normal_project = bool(getattr(mv, "normal_project", True))
+        vector_mode = str(getattr(mv, "vector_mode", "local_frame") or "local_frame")
+        global_modes = bool(getattr(mv, "global_modes_selected", False))
+        global_cfg = getattr(mv, "global_mode_config", []) or []
+        use_local_modes = bool(getattr(mv, "use_local_modes", True))
+        global_only = bool(getattr(mv, "global_only", False))
+
+        if global_only:
+            use_local_modes = False
+
+        # globals first, matching backend ordering
+        if global_modes:
+            if global_cfg:
+                for i, g in enumerate(global_cfg, start=1):
+                    gtype = g.get("type", "global")
+                    gdir = g.get("direction", "")
+                    label = f"Global {i}: {gtype}_{gdir}".rstrip("_")
+                    info.append({
+                        "name": label,
+                        "lb": -0.5,
+                        "ub":  0.5
+                    })
+            else:
+                # fallback if config missing but global_modes is on
+                for i in range(8):
+                    info.append({
+                        "name": f"Global {i+1}",
+                        "lb": -0.5,
+                        "ub":  0.5
+                    })
+
+        # locals only if enabled
+        if use_local_modes:
+            if normal_project:
+                for i in range(k):
+                    info.append({
+                        "name": f"Local Mode {i+1}",
+                        "lb": -1.0,
+                        "ub":  1.0
+                    })
+            else:
+                if vector_mode == "xyz":
+                    for comp in ["x", "y", "z"]:
+                        for i in range(k):
+                            info.append({
+                                "name": f"{comp} Mode {i+1}",
+                                "lb": -1.0,
+                                "ub":  1.0
+                            })
+                else:
+                    # local_frame mode
+                    for comp in ["t1", "t2", "n"]:
+                        for i in range(k):
+                            info.append({
+                                "name": f"{comp} Mode {i+1}",
+                                "lb": -1.0,
+                                "ub":  1.0
+                            })
+
+        return info
 
     def populate_bayes_bounds(self):
-        """Generate lower/upper bound fields once k_modes is known."""
-        # Clear old layout
-        for i in reversed(range(self.bounds_layout.count())):
-            item = self.bounds_layout.itemAt(i)
-            if item.widget():
-                item.widget().deleteLater()
+        """
+        Generate internal bounds storage once control nodes / basis are saved.
+        This no longer clutters the main layout.
+        """
+        meta = self._get_bo_dimension_info()
+        self.bound_meta = meta
 
-        self.bound_fields = []
-        k_modes = getattr(self.mesh_viewer, "k_modes", 6)
-        for i in range(1, k_modes + 1):
-            lb_edit = QLineEdit(); lb_edit.setPlaceholderText("-0.1")
-            ub_edit = QLineEdit(); ub_edit.setPlaceholderText("0.1")
-            self.bounds_layout.addRow(f"Lower bound (Mode {i}):", lb_edit)
-            self.bounds_layout.addRow(f"Upper bound (Mode {i}):", ub_edit)
-            self.bound_fields.append((lb_edit, ub_edit))
+        if not meta:
+            self.current_bounds = {"lb": [], "ub": []}
+            self.bounds_summary_label.setText("Bounds not generated yet. Save control nodes first.")
+            self.edit_bounds_btn.setEnabled(False)
+            self.logger.log("[Bayes][WARN] No optimisation dimensions found for current parameterisation.")
+            return
 
-        self.logger.log(f"[Bayes] Bounds fields regenerated for {k_modes} modes.")
+        lb = [item["lb"] for item in meta]
+        ub = [item["ub"] for item in meta]
+        self.current_bounds = {"lb": lb, "ub": ub}
+
+        self.bounds_summary_label.setText(
+            f"{len(meta)} optimisation variables configured."
+        )
+        self.edit_bounds_btn.setEnabled(True)
+
+        self.logger.log(f"[Bayes] Bounds regenerated for {len(meta)} optimisation variables.")
+
+    def open_bounds_dialog(self):
+        if not getattr(self, "bound_meta", None):
+            QMessageBox.warning(self, "Bounds", "No bounds available yet. Save control nodes first.")
+            return
+
+        dlg = BoundsDialog(
+            meta=self.bound_meta,
+            lb=list(self.current_bounds["lb"]),
+            ub=list(self.current_bounds["ub"]),
+            parent=self
+        )
+        if dlg.exec_() == QDialog.Accepted:
+            lb, ub = dlg.get_bounds()
+            self.current_bounds = {"lb": lb, "ub": ub}
+            self.bounds_summary_label.setText(f"{len(lb)} bounds configured.")
+            self.logger.log(f"[Bayes] Updated bounds for {len(lb)} dimensions.")
 
     def save_bayesian_settings(self):
         """Collect Bayesian Optimisation settings and save to optimiser + JSON."""
@@ -1465,16 +1856,23 @@ class MainWindow(QMainWindow):
         }
 
         # Parse bounds
-        lb, ub = [], []
-        for i, (lb_edit, ub_edit) in enumerate(self.bound_fields, start=1):
+        lb = list(getattr(self, "current_bounds", {}).get("lb", []))
+        ub = list(getattr(self, "current_bounds", {}).get("ub", []))
+
+        if not lb or not ub or len(lb) != len(ub):
+            QMessageBox.warning(self, "Error", "Bounds are not defined. Please open 'Edit Bounds' first.")
+            return
+
+        for i, (lbi, ubi) in enumerate(zip(lb, ub), start=1):
             try:
-                lb_val = float(lb_edit.text()) if lb_edit.text() else float(lb_edit.placeholderText())
-                ub_val = float(ub_edit.text()) if ub_edit.text() else float(ub_edit.placeholderText())
+                lbi = float(lbi)
+                ubi = float(ubi)
             except Exception:
-                QMessageBox.warning(self, "Error", f"Invalid bound for Mode {i}.")
+                QMessageBox.warning(self, "Error", f"Invalid bound for variable {i}.")
                 return
-            lb.append(lb_val)
-            ub.append(ub_val)
+            if lbi >= ubi:
+                QMessageBox.warning(self, "Error", f"Lower bound must be smaller than upper bound for variable {i}.")
+                return
 
         n_dim = len(lb)
         
@@ -1652,7 +2050,7 @@ class MainWindow(QMainWindow):
         invvis = 1 if self.rg_invvis.currentIndex() == 0 else 2
         num_grids = int(self.rg_num_grids.value())
         hybrid = bool(self.rg_hybrid.isChecked())
-        parallel = int(self.rg_parallel.value())
+        self.parallel = int(self.rg_parallel.value())
         roll = bool(self.rg_roll.isChecked())
         ground_angle = int(self.rg_ground_angle.value())
         start_step = int(self.rg_start_step.value())
@@ -1664,7 +2062,7 @@ class MainWindow(QMainWindow):
             invvis=invvis,
             number_of_grids=num_grids,
             hybrid=hybrid,
-            parallel_domains=parallel,
+            parallel_domains=self.parallel,
             roll_ground=roll,
             ground_angle=ground_angle,
             starting_step_in_cycle=start_step,
@@ -1801,6 +2199,8 @@ class MainWindow(QMainWindow):
         self.control_nodes_saved = True
         self.logger.log("[INFO] Control nodes and bounds defined.")
         self.check_run_morph_button_state()
+    
+        self._update_train_classifier_button_state()
 
         # Regenerate optimisation bounds once control nodes are saved
         if hasattr(self, "populate_bayes_bounds"):
@@ -1940,38 +2340,47 @@ class ObjectiveEditor(QDialog):
     """
     Lets user define:
       - Objective type (Drag, Lift, Lift-to-Drag, or Custom expression)
-      - Flow-condition rows with: AoA, Mach, Re, TurbModel(1|2|3), EngineFlow(1|2), MassFlow, Weight
+      - Flow-condition rows with: Altitude, AoA, Mach, Re, TurbModel(1|2|3), EngineFlow(1|2), MassFlow, Weight
       - Optional constraints (each line: e.g., 'CL >= 0.3' or 'CD <= 0.02')
     """
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, config=None):
         super().__init__(parent)
         self.setWindowTitle("Define Objective & Flow Conditions")
-        self.resize(900, 520)
+        self.resize(950, 560)
+
+        self.config = config or {}
 
         layout = QVBoxLayout(self)
 
         # --- Objective type row ---
         obj_row = QHBoxLayout()
         obj_row.addWidget(QLabel("Objective:"))
+
         self.obj_type = QComboBox()
         self.obj_type.addItems(["Drag", "Lift", "Lift-to-Drag", "Custom Expression"])
+
         self.custom_expr = QLineEdit()
-        self.custom_expr.setPlaceholderText("e.g. CD/CL + 0.1*abs(CM)")
-        self.custom_expr.setEnabled(False)
-        self.obj_type.currentTextChanged.connect(
-            lambda t: self.custom_expr.setEnabled(t == "Custom Expression")
-        )
+        self.custom_expr.setPlaceholderText("e.g. max(CL), max(CL/CD), min(CD + 0.1*abs(CM))")
+
+        self.expr_preview = QLabel("")
+        self.expr_preview.setStyleSheet("color: #888; font-style: italic;")
+
+        self.obj_type.currentTextChanged.connect(self._on_objective_changed)
+        self.custom_expr.textChanged.connect(self._update_preview)
+
         obj_row.addWidget(self.obj_type)
-        obj_row.addWidget(QLabel("Custom:"))
+        obj_row.addWidget(QLabel("Expression:"))
         obj_row.addWidget(self.custom_expr, 1)
         layout.addLayout(obj_row)
+        layout.addWidget(self.expr_preview)
 
         # --- Table of flow conditions ---
         self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels([
-            "Altitude (ft)", "AoA", "Mach", "Reynolds", "Turb Model (1|2|3)",
-            "Engine Flow (1|2)", "Mass Flow", "Weight"
+            "Altitude (ft)", "AoA", "Mach", "Reynolds",
+            "Turb Model (1|2|3)", "Engine Flow (1|2)", "Mass Flow", "Weight"
         ])
+        self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table)
 
         # Add/remove condition buttons
@@ -1985,68 +2394,215 @@ class ObjectiveEditor(QDialog):
         row_btns.addStretch(1)
         layout.addLayout(row_btns)
 
-        # Pre-fill one sensible default row
-        self._add_row(defaults=["36000", "3", "1.3", "1e6", "1", "2", "1.0", "1.0"])
-
-        # Constraints block (optional)
+        # Constraints block
         layout.addWidget(QLabel("Constraints (optional, one per line; e.g. 'CL >= 0.3', 'CD <= 0.02')"))
         self.constraints_edit = QTextEdit()
         self.constraints_edit.setPlaceholderText("CL >= 0.3\nCD <= 0.02")
         self.constraints_edit.setFixedHeight(90)
         layout.addWidget(self.constraints_edit)
 
-        # OK/Cancel
+        # Buttons
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.accepted.connect(self.accept)
+        btns.accepted.connect(self._validate_and_accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
+
+        self._load_from_config()
+
+    def _preset_expression(self, obj_type: str) -> str:
+        mapping = {
+            "Drag": "min(CD)",
+            "Lift": "max(CL)",
+            "Lift-to-Drag": "max(CL/CD)",
+        }
+        return mapping.get(obj_type, "")
+
+    def _on_objective_changed(self, text):
+        is_custom = (text == "Custom Expression")
+        self.custom_expr.setEnabled(is_custom)
+
+        if not is_custom:
+            self.custom_expr.setText(self._preset_expression(text))
+            self.custom_expr.setReadOnly(True)
+        else:
+            self.custom_expr.setReadOnly(False)
+            if self.custom_expr.text().strip() in {
+                "min(CD)", "max(CL)", "max(CL/CD)", "Drag", "Lift", "Lift-to-Drag"
+            }:
+                self.custom_expr.clear()
+
+        self._update_preview()
+
+    def _update_preview(self):
+        expr = self.custom_expr.text().strip()
+        if not expr:
+            self.expr_preview.setText("Parsed expression: —")
+            return
+        self.expr_preview.setText(f"Parsed expression: {expr}")
+
+    def _load_from_config(self):
+        cfg = self.config or {}
+        obj_type = (cfg.get("objective_type") or "Drag").strip()
+        expr = (cfg.get("expression") or "").strip()
+
+        valid_types = ["Drag", "Lift", "Lift-to-Drag", "Custom Expression"]
+        if obj_type not in valid_types:
+            obj_type = "Custom Expression"
+
+        idx = self.obj_type.findText(obj_type)
+        if idx >= 0:
+            self.obj_type.setCurrentIndex(idx)
+
+        if obj_type == "Custom Expression":
+            self.custom_expr.setReadOnly(False)
+            self.custom_expr.setEnabled(True)
+            self.custom_expr.setText(expr)
+        else:
+            self.custom_expr.setText(self._preset_expression(obj_type))
+            self.custom_expr.setReadOnly(True)
+            self.custom_expr.setEnabled(False)
+
+        conds = cfg.get("conditions", [])
+        if conds:
+            for c in conds:
+                self._add_row(defaults=[
+                    str(c.get("Altitude", 36000)),
+                    str(c.get("AoA", 3)),
+                    str(c.get("Mach", 1.3)),
+                    str(c.get("Re", 1e6)),
+                    str(c.get("TurbModel", 1)),
+                    str(c.get("EngineFlow", 2)),
+                    str(c.get("MassFlow", 1.0)),
+                    str(c.get("Weight", 1.0)),
+                ])
+        else:
+            self._add_row(defaults=["36000", "3", "1.3", "1e6", "1", "2", "1.0", "1.0"])
+
+        cons = cfg.get("constraints", [])
+        if cons:
+            self.constraints_edit.setPlainText("\n".join(cons))
+
+        self._update_preview()
 
     def _add_row(self, defaults=None):
         row = self.table.rowCount()
         self.table.insertRow(row)
         defaults = defaults or ["36000", "3", "1.3", "1e6", "1", "2", "1.0", "1.0"]
         for c, val in enumerate(defaults):
-            self.table.setItem(row, c, QTableWidgetItem(val))
+            self.table.setItem(row, c, QTableWidgetItem(str(val)))
 
     def _remove_rows(self):
         rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
         for r in rows:
             self.table.removeRow(r)
 
-    def get_config(self):
-        # Collect objective
-        obj_type = self.obj_type.currentText()
-        expr = self.custom_expr.text().strip() if obj_type == "Custom Expression" else obj_type
+    def _validate_expression(self, expr: str):
+        import re
 
-        # Conditions → list of dicts
+        expr = (expr or "").strip()
+        if not expr:
+            return False, "Objective expression cannot be empty."
+
+        allowed_pattern = r'^[A-Za-z0-9_+\-*/().<>=! \t]+$'
+        if not re.match(allowed_pattern, expr):
+            return False, "Expression contains unsupported characters."
+
+        # Accept either wrapped objective or plain expression
+        m = re.match(r'^\s*(min|max)\s*\(\s*(.+)\s*\)\s*$', expr, flags=re.IGNORECASE)
+        inner = expr
+        if m:
+            inner = m.group(2).strip()
+
+        # only allow recognised variables/functions/tokens
+        tokens = set(re.findall(r'[A-Za-z_]+', inner))
+        allowed_tokens = {"CL", "CD", "CM", "abs", "min", "max"}
+        bad = sorted(tok for tok in tokens if tok not in allowed_tokens)
+        if bad:
+            return False, f"Unsupported symbol(s) in expression: {', '.join(bad)}"
+
+        return True, ""
+
+    def _validate_and_accept(self):
+        obj_type = self.obj_type.currentText()
+
+        if obj_type == "Custom Expression":
+            expr = self.custom_expr.text().strip()
+            ok, msg = self._validate_expression(expr)
+            if not ok:
+                QMessageBox.warning(self, "Invalid objective expression", msg)
+                return
+        else:
+            # enforce preset expression
+            self.custom_expr.setText(self._preset_expression(obj_type))
+
+        if self.table.rowCount() == 0:
+            QMessageBox.warning(self, "Missing conditions", "Please add at least one flow condition.")
+            return
+
+        conds_ok = False
+        for r in range(self.table.rowCount()):
+            try:
+                alt = float(self.table.item(r, 0).text().strip())
+                aoa = float(self.table.item(r, 1).text().strip())
+                mach = float(self.table.item(r, 2).text().strip())
+                reyn = float(self.table.item(r, 3).text().strip())
+                turb = int(self.table.item(r, 4).text().strip())
+                engf = int(self.table.item(r, 5).text().strip())
+                mflow = float(self.table.item(r, 6).text().strip())
+                weight = float(self.table.item(r, 7).text().strip())
+
+                if turb not in (1, 2, 3):
+                    raise ValueError("Turb Model must be 1, 2, or 3.")
+                if engf not in (1, 2):
+                    raise ValueError("Engine Flow must be 1 or 2.")
+                if mach <= 0:
+                    raise ValueError("Mach must be > 0.")
+                if reyn <= 0:
+                    raise ValueError("Reynolds must be > 0.")
+                if weight <= 0:
+                    raise ValueError("Weight must be > 0.")
+
+                conds_ok = True
+            except Exception as e:
+                QMessageBox.warning(self, "Invalid condition row", f"Row {r+1}: {e}")
+                return
+
+        if not conds_ok:
+            QMessageBox.warning(self, "Missing conditions", "Please define at least one valid flow condition.")
+            return
+
+        self.accept()
+
+    def get_config(self):
+        obj_type = self.obj_type.currentText()
+
+        if obj_type == "Custom Expression":
+            expr = self.custom_expr.text().strip()
+        else:
+            expr = self._preset_expression(obj_type)
+
         conds = []
         for r in range(self.table.rowCount()):
             def _txt(c):
                 it = self.table.item(r, c)
                 return it.text().strip() if it else ""
-            try:
-                conds.append({
-                    "Altitude":   float(_txt(0)),
-                    "AoA":        float(_txt(1)),
-                    "Mach":       float(_txt(2))  if _txt(2)  else 1.2,
-                    "Re":         float(_txt(3))  if _txt(3)  else 1e6,
-                    "TurbModel":  int(_txt(4))    if _txt(4)  else 2,
-                    "EngineFlow": int(_txt(5))    if _txt(5)  else 1,
-                    "MassFlow":   float(_txt(6))  if _txt(6)  else 1.0,
-                    "Weight":     float(_txt(7))  if _txt(7)  else 1.0
-                })
-            except Exception:
-                # skip malformed row
-                pass
 
-        # Constraints
+            conds.append({
+                "Altitude":   float(_txt(0)) if _txt(0) else 36000.0,
+                "AoA":        float(_txt(1)) if _txt(1) else 3.0,
+                "Mach":       float(_txt(2)) if _txt(2) else 1.2,
+                "Re":         float(_txt(3)) if _txt(3) else 1e6,
+                "TurbModel":  int(_txt(4))   if _txt(4) else 2,
+                "EngineFlow": int(_txt(5))   if _txt(5) else 1,
+                "MassFlow":   float(_txt(6)) if _txt(6) else 1.0,
+                "Weight":     float(_txt(7)) if _txt(7) else 1.0
+            })
+
         cons = []
         for line in self.constraints_edit.toPlainText().splitlines():
             ln = line.strip()
-            if not ln:
-                continue
-            # expected: <lhs> <op> <rhs>, where lhs uses CL,CD,CM
-            cons.append(ln)
+            if ln:
+                cons.append(ln)
 
         return {
             "objective_type": obj_type,
@@ -2054,6 +2610,119 @@ class ObjectiveEditor(QDialog):
             "conditions": conds,
             "constraints": cons
         }
+
+class TrainMeshClassifierDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Train mesh classifier")
+        self.resize(420, 180)
+
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.n_cases = QSpinBox()
+        self.n_cases.setRange(1, 1000)
+        self.n_cases.setValue(200)
+
+        self.batch_size = QSpinBox()
+        self.batch_size.setRange(1, 200)
+        self.batch_size.setValue(10)
+
+        form.addRow("Number of training cases:", self.n_cases)
+        form.addRow("Batch size (concurrent morph/volume):", self.batch_size)
+        layout.addLayout(form)
+
+        self.poll_s = QSpinBox()
+        self.poll_s.setRange(10, 3600)
+        self.poll_s.setValue(200)
+        form.addRow("Poll interval (seconds):", self.poll_s)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def values(self):
+        return int(self.n_cases.value()), int(self.batch_size.value()), int(self.poll_s.value())
+
+
+class BoundsDialog(QDialog):
+    def __init__(self, meta, lb, ub, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Optimisation Bounds")
+        self.resize(760, 520)
+
+        self.meta = meta
+        self.lb_widgets = []
+        self.ub_widgets = []
+
+        layout = QVBoxLayout(self)
+
+        title = QLabel("Lower and upper bounds for optimisation variables")
+        title.setStyleSheet("font-weight: bold;")
+        layout.addWidget(title)
+
+        self.table = QTableWidget(len(meta), 3)
+        self.table.setHorizontalHeaderLabels(["Variable", "Lower Bound", "Upper Bound"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+
+        for i, item in enumerate(meta):
+            name_item = QTableWidgetItem(item["name"])
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(i, 0, name_item)
+
+            lb_edit = QLineEdit(str(lb[i]))
+            ub_edit = QLineEdit(str(ub[i]))
+            lb_edit.setAlignment(Qt.AlignRight)
+            ub_edit.setAlignment(Qt.AlignRight)
+
+            self.table.setCellWidget(i, 1, lb_edit)
+            self.table.setCellWidget(i, 2, ub_edit)
+
+            self.lb_widgets.append(lb_edit)
+            self.ub_widgets.append(ub_edit)
+
+        self.table.resizeColumnsToContents()
+        layout.addWidget(self.table)
+
+        btn_row = QHBoxLayout()
+
+        preset_btn = QPushButton("Reset to Presets")
+        preset_btn.clicked.connect(self.reset_to_presets)
+        btn_row.addWidget(preset_btn)
+
+        btn_row.addStretch()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        btn_row.addWidget(buttons)
+
+        layout.addLayout(btn_row)
+
+    def reset_to_presets(self):
+        for i, item in enumerate(self.meta):
+            self.lb_widgets[i].setText(str(item["lb"]))
+            self.ub_widgets[i].setText(str(item["ub"]))
+
+    def validate_and_accept(self):
+        try:
+            for i, item in enumerate(self.meta):
+                lb = float(self.lb_widgets[i].text())
+                ub = float(self.ub_widgets[i].text())
+                if lb >= ub:
+                    raise ValueError(f"{item['name']}: lower bound must be < upper bound")
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid bounds", str(e))
+            return
+        self.accept()
+
+    def get_bounds(self):
+        lb = [float(w.text()) for w in self.lb_widgets]
+        ub = [float(w.text()) for w in self.ub_widgets]
+        return lb, ub
 
 if __name__ == "__main__":
     import sys

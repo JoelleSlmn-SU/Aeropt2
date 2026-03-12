@@ -47,26 +47,39 @@ def _metrics_path(remote_root, n, gen, cond_index: int, base_name):
 def _build_objective_callable(objective_dict: dict):
     """
     Returns (obj_func, pretty_expr)
-      - obj_func(metrics: dict) -> float
-      - pretty_expr: str
-    metrics dict contains at least: {"CL":..., "CD":..., "CM":...}
+      - obj_func(metrics: dict) -> float   (ALWAYS "minimised" form)
+      - pretty_expr: str                  (what we're minimising)
+    Supports:
+      - objective_type: Drag | Lift | Lift-to-Drag | Custom Expression
+      - expression examples:
+          "max(CL)", "min(CD)", "max(CL/CD - 0.1*abs(CM))", "CD + abs(CM)"
     """
 
     obj_type = (objective_dict.get("objective_type", "") or "").strip()
     expr_raw = (objective_dict.get("expression", "") or "").strip()
 
-
+    # 1) Choose a default expression if user selected a preset
     if obj_type.lower() == "drag" or expr_raw.lower() == "drag":
-        expr = "CD"
+        expr_raw = "min(CD)"
     elif obj_type.lower() == "lift" or expr_raw.lower() == "lift":
-        expr = "-CL"
+        expr_raw = "max(CL)"
     elif obj_type.lower() in ("lift-to-drag", "lift to drag") or expr_raw.lower() in ("lift-to-drag", "lift to drag"):
-        expr = "-(CL/CD)"
+        expr_raw = "max(CL/CD)"
     else:
-        # Custom expression (as typed by user)
-        expr = expr_raw if expr_raw else "CD"
+        # custom: keep what they typed; if empty fall back to drag
+        expr_raw = expr_raw if expr_raw else "min(CD)"
 
-    # Restricted eval environment
+    # 2) Parse "min(...)" / "max(...)" wrapper (if present)
+    m = re.match(r"^\s*(min|max)\s*\(\s*(.*)\s*\)\s*$", expr_raw, flags=re.IGNORECASE)
+    if m:
+        sense = m.group(1).lower()      # "min" or "max"
+        inner = m.group(2).strip()      # expression inside
+    else:
+        # No wrapper given -> assume minimisation (consistent default)
+        sense = "min"
+        inner = expr_raw.strip()
+
+    # 3) Restricted eval environment
     allowed_funcs = {
         "abs": abs,
         "min": min,
@@ -75,27 +88,31 @@ def _build_objective_callable(objective_dict: dict):
     safe_globals = {"__builtins__": {}}
     safe_globals.update(allowed_funcs)
 
-    def obj_func(m: dict) -> float:
+    def _eval_inner(mdict: dict) -> float:
         local_vars = {
-            "CL": float(m.get("CL", 0.0)),
-            "CD": float(m.get("CD", 1e9)),
-            "CM": float(m.get("CM", 0.0)),
+            "CL": float(mdict.get("CL", 0.0)),
+            "CD": float(mdict.get("CD", 1e9)),
+            "CM": float(mdict.get("CM", 0.0)),
         }
+        return float(eval(inner, safe_globals, local_vars))
+
+    def obj_func(mdict: dict) -> float:
         try:
-            return float(eval(expr, safe_globals, local_vars))
+            val = _eval_inner(mdict)
+            # Convert "max(f)" -> minimise -f
+            return -val if sense == "max" else val
         except Exception:
-            # hard penalty if expression fails (division by 0, typo, etc.)
             return 1e9
 
-    return obj_func, expr
-
+    pretty = f"{'-(' + inner + ')' if sense=='max' else inner}"
+    return obj_func, pretty
 
 class ClusterTestManager:
     """
     Test manager that runs ON THE CLUSTER.
     Uses ClusterPipelineManager (no SSH/SFTP).
     """
-    def __init__(self, remote_root, base_name, input_dir, executables, poll_s=120, morph_basis_json="", units="mm"):
+    def __init__(self, remote_root, base_name, input_dir, executables, poll_s=120, morph_basis_json="", units="mm", parallel=80):
         self.remote_root = os.path.abspath(remote_root)
         self.base_name = base_name
         self.input_dir = input_dir
@@ -104,6 +121,7 @@ class ClusterTestManager:
         self.jobs = {}
         self.morph_basis_json = morph_basis_json or ""
         self.units = units
+        self.parallel = parallel
         
         # Create logs directory
         self.log_dir = os.path.join(self.remote_root, "logs")
@@ -126,6 +144,7 @@ class ClusterTestManager:
             "modal_coeffs": list(map(float, x)),
             "morph_basis_json": self.morph_basis_json,
             "cad_units": self.units,
+            "parallel_processes": self.parallel,
             **self.executables,
         }
 
@@ -319,6 +338,7 @@ def main():
     remote_root = settings_json.get("remote_root", os.path.dirname(run_dir))
     base_name = settings_json.get("base_name", "model")
     input_dir = settings_json.get("input_dir", os.path.join(remote_root, "orig"))
+    parallel = settings_json.get("parallel", 80)
     cad_units = settings_json.get("units", "mm")
     
     # Executable paths (customize for your cluster)
@@ -346,6 +366,7 @@ def main():
         poll_s=settings_json.get("poll_interval", 120),
         morph_basis_json=morph_basis_json,
         units = cad_units,
+        parallel = parallel
     )
     
     # Define init and eval functions for BO

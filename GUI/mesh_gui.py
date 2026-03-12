@@ -3,8 +3,8 @@ import numpy as np
 import matplotlib.cm as cm
 from PyQt5.QtCore import Qt, pyqtSignal, QThread, QTimer, pyqtSlot, QMetaObject, Q_ARG, QObject, QEvent
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QPushButton, QLabel, QSizePolicy, QDialog, QComboBox, QSpinBox,
-    QFileDialog, QLineEdit, QHBoxLayout, QInputDialog, QCheckBox, QListWidget, QDialogButtonBox
+    QWidget, QVBoxLayout, QPushButton, QLabel, QSizePolicy, QDialog, QComboBox, QSpinBox, QFormLayout,
+    QFileDialog, QLineEdit, QHBoxLayout, QInputDialog, QCheckBox, QListWidget, QDialogButtonBox, QTableWidget
 )
 import pyvista as pv
 import vtk
@@ -23,7 +23,7 @@ from ConvertFileType.convertToStep import *
 from GUI.workers import MorphWorker
 import pickle
 from MeshGeneration.pcaBasis import (
-    make_signature, load_pca_basis, save_pca_basis, build_pca_basis
+    build_pca_cache
 )
 
 def _dedup_preserve_order(seq):
@@ -84,6 +84,7 @@ class MeshViewer(QWidget):
         self.debug_plot_requested.connect(self._update_debug_plot_mpl)
         
         self.rigid_boundary_translation = False
+        self.global_modes_selected = False
 
         self.mesh_obj = None
         self.surface_actors = {}
@@ -204,7 +205,7 @@ class MeshViewer(QWidget):
         for name in [
             "reset_btn","cam_btn","hide_btn","tc_btn","export_btn",
             "T_btn","C_btn","U_btn","edit_btn","finish_btn",
-            "form_widget","cn_btn","back_btn","debug_checkbox","open_debug_btn"
+            "form_widget","back_btn","debug_checkbox","open_debug_btn"
         ]:
             w = getattr(self, name, None)
             if w is not None:
@@ -222,7 +223,6 @@ class MeshViewer(QWidget):
 
         # placeholder label
         if not hasattr(self, "placeholder") or self.placeholder is None:
-            from PyQt5.QtWidgets import QLabel
             self.placeholder = QLabel("No mesh loaded")
             self.placeholder.setAlignment(Qt.AlignCenter)
             self.main_layout.addWidget(self.placeholder)
@@ -246,7 +246,7 @@ class MeshViewer(QWidget):
         self.plot_ax = None
 
     def _show_surface_summary(self):
-        from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QDockWidget, QAbstractItemView
+        from PyQt5.QtWidgets import QTableWidgetItem, QDockWidget, QAbstractItemView
 
         table = QTableWidget()
         names = self.mesh_obj.get_surface_names()
@@ -358,17 +358,46 @@ class MeshViewer(QWidget):
         cmap = cm.get_cmap("tab20")
         self.colors = [tuple(cmap(i)[:3]) for i in range(len(surface_names))]
         sargs = dict(interactive=True)
-        
+
         for i, name in enumerate(surface_names):
             color = self.colors[i]
             try:
                 mesh = self.mesh_obj.get_surface_mesh(name)
-                actor = self.plotter.add_mesh(mesh, color=color, show_edges=True, pickable=True,
-                                            show_scalar_bar=True, scalar_bar_args=sargs)
+                actor = self.plotter.add_mesh(
+                    mesh,
+                    color=color,
+                    show_edges=True,
+                    pickable=True,
+                    show_scalar_bar=True,
+                    scalar_bar_args=sargs
+                )
                 self.surface_actors[name] = actor
             except Exception as e:
                 self.log(f"Failed to plot surface '{name}': {e}")
 
+        # ---- NEW: show axes + orientation marker ----
+        try:
+            self.plotter.add_axes(
+                line_width=2,
+                labels_off=False
+            )
+        except Exception as e:
+            self.log(f"[WARN] Failed to add axes: {e}")
+
+        # optional but very useful:
+        try:
+            self.plotter.show_bounds(
+                grid='back',
+                location='outer',
+                all_edges=True,
+                xtitle='X',
+                ytitle='Y',
+                ztitle='Z'
+            )
+        except Exception as e:
+            self.log(f"[WARN] Failed to show bounds: {e}")
+
+        self.plotter.set_visible(True) if hasattr(self.plotter, "set_visible") else None
         self.plotter.setVisible(True)
         self.plotter.render()
         self.plotter.enable_anti_aliasing()
@@ -468,6 +497,66 @@ class MeshViewer(QWidget):
         QTimer.singleShot(33, _do_draw)
         
         self.open_debug_btn.setVisible(True)
+        
+    def load_saved_control_nodes(self, control_nodes_path, control_normals_path=None):
+        if not control_nodes_path or not os.path.exists(control_nodes_path):
+            self.log(f"[ERROR] Control nodes file not found: {control_nodes_path}")
+            return
+
+        try:
+            self.control_nodes = np.asarray(np.load(control_nodes_path), float)
+        except Exception as e:
+            self.log(f"[ERROR] Failed to load control nodes from '{control_nodes_path}': {e}")
+            return
+
+        if self.control_nodes.ndim != 2 or self.control_nodes.shape[1] != 3:
+            self.log(f"[ERROR] Loaded control nodes must have shape (N, 3), got {self.control_nodes.shape}")
+            return
+
+        # Keep the T-surface points as the parent cloud for plotting / normal mapping
+        if not hasattr(self, "points") or self.points is None:
+            self.log("[ERROR] T-surface points are not available.")
+            return
+
+        try:
+            if control_normals_path and os.path.exists(control_normals_path):
+                self.control_normals = np.asarray(np.load(control_normals_path), float)
+                if self.control_normals.shape != self.control_nodes.shape:
+                    raise ValueError(
+                        f"control_normals shape {self.control_normals.shape} "
+                        f"does not match control_nodes shape {self.control_nodes.shape}"
+                    )
+                self.log(f"[INFO] Loaded control normals from: {control_normals_path}")
+            else:
+                surf_normals = _surface_normals(self.points, knn=16)
+                self.control_normals = _map_normals_to_control(
+                    self.control_nodes,
+                    self.points,
+                    surf_normals,
+                    k=12
+                )
+                self.log("[INFO] No control_normals.npy provided; normals mapped from T-surface points.")
+        except Exception as e:
+            self.log(f"[ERROR] Failed to create/load control normals: {e}")
+            return
+
+        try:
+            pts = np.asarray(self.points, float)
+            d = pts.max(axis=0) - pts.min(axis=0)
+            self.t_patch_scale = float(np.linalg.norm(d))
+            self.log(f"[INFO] T-patch scale (loaded CNs) = {self.t_patch_scale:.6g}")
+        except Exception as e:
+            self.t_patch_scale = None
+            self.log(f"[WARN] Failed to compute T-patch scale: {e}")
+
+        self.log(f"[INFO] Loaded {len(self.control_nodes)} control nodes from: {control_nodes_path}")
+
+        try:
+            self.plotter.close()
+        except Exception:
+            pass
+
+        self.plot_T_surfaces()
         
     def _open_last_debug_html(self):
         import webbrowser, glob
@@ -825,9 +914,56 @@ class MeshViewer(QWidget):
             self._manual_clear_btn.setParent(None)
         except Exception:
             pass
-
         
         self.plot_T_surfaces()
+        
+    def _on_global_modes_toggled(self, checked):
+        if checked:
+            existing = getattr(self, "global_mode_config", [])
+            dlg = GlobalModesDialog(existing=existing, parent=self)
+            if dlg.exec_() == QDialog.Accepted:
+                self.global_mode_config = dlg.get_selected_modes()
+                self.log(f"[INFO] Global modes selected: {self.global_mode_config}")
+            else:
+                # user cancelled -> undo checkbox
+                self.global_modes_cb.blockSignals(True)
+                self.global_modes_cb.setChecked(False)
+                self.global_modes_cb.blockSignals(False)
+                self.global_modes_selected = False
+                self.global_mode_config = []
+        else:
+            self.global_modes_selected = False
+            self.global_mode_config = []
+
+    def edit_global_modes(self):
+        existing = getattr(self, "global_mode_config", [])
+        dlg = GlobalModesDialog(existing=existing, parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            self.global_mode_config = dlg.get_selected_modes()
+            self.log(f"[INFO] Global modes updated: {self.global_mode_config}")
+            
+    def _clear_param_widgets(self):
+        for attr in [
+            "back_btn", "save_btn", "edit_global_modes_btn",
+            "global_modes_cb", "global_only_cb", "use_local_modes_cb",
+            "k_modes_spin", "decay_p_spin", "coeff_frac_spin", "seed_spin",
+            "normal_project_cb", "vector_mode_combo", "frame_knn_spin",
+            "rigid_translation_cb", "amp_alpha_spin",
+            "use_pca_cb", "pca_train_spin", "pca_energy_spin", "pca_k_red_spin",
+            "direct_mode_combo", "direct_amp_alpha_spin"
+        ]:
+            try:
+                w = getattr(self, attr, None)
+                if w is not None:
+                    w.setParent(None)
+            except Exception:
+                pass
+
+        try:
+            if hasattr(self, "form_container") and self.form_container is not None:
+                self.form_container.setParent(None)
+        except Exception:
+            pass
         
     def auto_select_control_nodes(self, output_path, num_input):
         self.points, self.control_nodes = selectControlNodes(output_path, self.output_dir, num_input)
@@ -919,34 +1055,51 @@ class MeshViewer(QWidget):
         dlg = ControlNodeSelectionDialog(self)
         if dlg.exec_() != QDialog.Accepted:
             return
-        mode, num_input = dlg.get_choice()
+
+        choice = dlg.get_choice()
+        mode = choice["selection_mode"]
+        num_input = choice["num_nodes"]
+
+        # store the selected parameterisation family for later UI branching
+        self.parameterisation_method = choice["parameterisation_method"]
+        self.control_node_selection_mode = mode
+        self.loaded_control_nodes_path = choice["control_nodes_path"]
+        self.loaded_control_normals_path = choice["control_normals_path"]
 
         # --- Build preview PolyData from T surface NAMES ---
         t_mesh = None
-        for nm in getattr(self, "T_names", []):   # IMPORTANT: use names, not IDs
+        for nm in getattr(self, "T_names", []):
             surf = self.mesh_obj.get_surface_mesh(nm)
             if surf is None or surf.n_cells == 0:
                 continue
             t_mesh = surf.copy() if t_mesh is None else t_mesh.merge(surf)
 
         if t_mesh is None or t_mesh.n_cells == 0:
-            self.log("[WARN] No T-surface cells available for manual selection.")
+            self.log("[WARN] No T-surface cells available for control-node selection.")
             return
 
-        # Make it “picker-friendly”
+        # picker-friendly mesh
         t_mesh = t_mesh.extract_surface().triangulate().clean()
 
-        # If you still want to save for downstream, save the real surface mesh
+        # save preview mesh for downstream / auto selection path
         output_path = os.path.join(self.output_dir, "surfaces", "output.vtk")
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         t_mesh.save(output_path)
-        
-        
+
+        # keep the point cloud available for all branches, including loaded CNs
+        self.points = np.asarray(t_mesh.points, float)
+
         if mode == "auto":
             self.auto_select_control_nodes(output_path, num_input)
-        else:
-            # manual selection from T mesh nodes
+        elif mode == "manual":
             self.manual_select_control_nodes(t_mesh, num_input)
+        elif mode == "load":
+            self.load_saved_control_nodes(
+                choice["control_nodes_path"],
+                choice["control_normals_path"]
+            )
+        else:
+            self.log(f"[ERROR] Unknown control-node selection mode: {mode}")
 
 
     def open_edit_dialog(self):
@@ -974,136 +1127,243 @@ class MeshViewer(QWidget):
             self.plotter.close()
         except Exception:
             pass
-        
+
+        self._clear_param_widgets()
+
         self.plotter = QtInteractor(self)
         self.main_layout.addWidget(self.plotter)
 
+        # ----------------------------
+        # base cloud / T patch preview
+        # ----------------------------
         polydata = pv.PolyData(self.points)
         self.plotter.add_mesh(polydata, color="#52b7ba", show_edges=True, opacity=0.3)
 
-        # Plot control nodes directly
+        # plot control nodes
         cn = pv.PolyData()
         cn.points = self.control_nodes
         verts = np.hstack([[1, i] for i in range(len(self.control_nodes))])
         cn.verts = verts
-        self.plotter.add_mesh(cn, color='black', point_size=12.0)
+        self.plotter.add_mesh(cn, color="black", point_size=12.0)
+
+        # axes
+        try:
+            self.plotter.add_axes(line_width=2, labels_off=False)
+        except Exception:
+            pass
+
+        try:
+            self.plotter.show_bounds(
+                grid="back",
+                location="outer",
+                all_edges=True,
+                xtitle="X",
+                ytitle="Y",
+                ztitle="Z",
+            )
+        except Exception:
+            pass
 
         self.plotter.reset_camera()
         self.plotter.render()
 
-        # ===== NEW: modal / spectral controls =====
-        from PyQt5.QtWidgets import QFormLayout, QSpinBox, QDoubleSpinBox, QCheckBox
+        # ----------------------------
+        # defaults
+        # ----------------------------
+        if not hasattr(self, "parameterisation_method"):
+            self.parameterisation_method = "modal"
+        
+        from PyQt5.QtWidgets import QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox
 
-        self.form = QFormLayout()
-
+        # shared buttons / form
         self.back_btn = QPushButton("Back")
         self.back_btn.clicked.connect(self.back_to_surface_selection)
         self.main_layout.addWidget(self.back_btn)
-        
-        # k_modes
-        n_cn = len(self.control_nodes)
-        self.k_modes_spin = QSpinBox()
-        if n_cn == 1:
-            self.k_modes_spin.setRange(1, n_cn)
-            self.k_modes_spin.setValue(min(getattr(self, "k_modes", 6), n_cn))
+
+        self.form = QFormLayout()
+        self.form_container = QWidget()
+        self.form_container.setLayout(self.form)
+
+        # show chosen family (read-only label)
+        method_label = QLabel(
+            "Direct Control Node Displacement"
+            if self.parameterisation_method == "direct"
+            else "Modal Parameterisation"
+        )
+        self.form.addRow("Parameterisation:", method_label)
+
+        # ============================
+        # DIRECT PARAMETERISATION UI
+        # ============================
+        if self.parameterisation_method == "direct":
+
+            # subtype
+            self.direct_mode_combo = QComboBox()
+            self.direct_mode_combo.addItems([
+                "Cartesian (x,y,z)",
+                "Normal displacement (d·n)",
+            ])
+            prev_direct_mode = getattr(self, "direct_parameterisation_subtype", "xyz")
+            self.direct_mode_combo.setCurrentIndex(0 if prev_direct_mode == "xyz" else 1)
+            self.form.addRow("Direct displacement type:", self.direct_mode_combo)
+
+            # amplitude scale
+            self.direct_amp_alpha_spin = QDoubleSpinBox()
+            self.direct_amp_alpha_spin.setRange(1e-6, 10.0)
+            self.direct_amp_alpha_spin.setDecimals(6)
+            self.direct_amp_alpha_spin.setSingleStep(0.001)
+            self.direct_amp_alpha_spin.setValue(float(getattr(self, "amp_alpha", 0.01)))
+            self.form.addRow("Amplitude scale:", self.direct_amp_alpha_spin)
+
+            # rigid translation
+            self.rigid_translation_cb = QCheckBox("Enable rigid boundary translation")
+            self.rigid_translation_cb.setChecked(getattr(self, "rigid_boundary_translation", False))
+            self.form.addRow(self.rigid_translation_cb)
+
+            # optional future extension note
+            direct_note = QLabel(
+                "Direct mode uses per-control-node displacement variables.\n"
+                "Modal/global/PCA settings are hidden for this parameterisation."
+            )
+            direct_note.setWordWrap(True)
+            self.form.addRow(direct_note)
+
+        # ============================
+        # MODAL PARAMETERISATION UI
+        # ============================
         else:
-            self.k_modes_spin.setRange(1, n_cn-1)
-            self.k_modes_spin.setValue(min(getattr(self, "k_modes", 6), n_cn-1))    
-        self.form.addRow("Number of modes (k):", self.k_modes_spin)
+            from PyQt5.QtWidgets import QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox
 
-        # spectral decay p
-        self.decay_p_spin = QDoubleSpinBox()
-        self.decay_p_spin.setRange(0.1, 6.0)
-        self.decay_p_spin.setDecimals(2)
-        self.decay_p_spin.setSingleStep(0.1)
-        self.decay_p_spin.setValue(getattr(self, "spectral_p", 2.0))
-        self.form.addRow("Spectral decay p:", self.decay_p_spin)
+            n_cn = len(self.control_nodes)
 
-        # coefficient amplitude fraction
-        self.coeff_frac_spin = QDoubleSpinBox()
-        self.coeff_frac_spin.setRange(0.01, 1.0)
-        self.coeff_frac_spin.setDecimals(3)
-        self.coeff_frac_spin.setSingleStep(0.01)
-        self.coeff_frac_spin.setValue(getattr(self, "coeff_frac", 0.15))
-        self.form.addRow("Coeff amplitude (frac):", self.coeff_frac_spin)
+            # number of modes
+            self.k_modes_spin = QSpinBox()
+            if n_cn == 1:
+                self.k_modes_spin.setRange(1, n_cn)
+                self.k_modes_spin.setValue(min(getattr(self, "k_modes", 6), n_cn))
+            else:
+                self.k_modes_spin.setRange(1, max(1, n_cn - 1))
+                self.k_modes_spin.setValue(min(getattr(self, "k_modes", 6), max(1, n_cn - 1)))
+            self.form.addRow("Number of modes (k):", self.k_modes_spin)
 
-        # random seed
-        self.seed_spin = QSpinBox()
-        self.seed_spin.setRange(-1_000_000, 1_000_000)
-        self.seed_spin.setValue(getattr(self, "seed", 0))  # 0 = deterministic default
-        self.form.addRow("Random seed (0=deterministic):", self.seed_spin)
+            # spectral decay
+            self.decay_p_spin = QDoubleSpinBox()
+            self.decay_p_spin.setRange(0.1, 6.0)
+            self.decay_p_spin.setDecimals(2)
+            self.decay_p_spin.setSingleStep(0.1)
+            self.decay_p_spin.setValue(getattr(self, "spectral_p", 2.0))
+            self.form.addRow("Spectral decay p:", self.decay_p_spin)
 
-        # normal projection
-        self.normal_proj_cb = QCheckBox("Project along surface normals")
-        self.normal_proj_cb.setChecked(getattr(self, "normal_project", True))
-        self.form.addRow(self.normal_proj_cb)
-        
-        self.rigid_c_cb = QCheckBox("Translate C surfaces rigidly with boundaries")
-        # Persist last choice if present
-        self.rigid_c_cb.setChecked(getattr(self, "rigid_boundary_translation", False))
-        self.form.addRow(self.rigid_c_cb)
-        
-        
-        from PyQt5.QtWidgets import QLineEdit, QLabel
-        # ---------- PCA reduced-space controls ----------
-        self.use_pca_cb = QCheckBox("Use PCA reduced space")
-        default_use_pca = bool(getattr(self.main_window, "use_pca_reduced", False))
-        self.use_pca_cb.setChecked(default_use_pca)
+            # coefficient amplitude fraction
+            self.coeff_frac_spin = QDoubleSpinBox()
+            self.coeff_frac_spin.setRange(0.01, 1.0)
+            self.coeff_frac_spin.setDecimals(3)
+            self.coeff_frac_spin.setSingleStep(0.01)
+            self.coeff_frac_spin.setValue(getattr(self, "coeff_frac", 0.15))
+            self.form.addRow("Coeff amplitude (frac):", self.coeff_frac_spin)
 
-        self.pca_M_spin = QSpinBox()
-        self.pca_M_spin.setRange(20, 5000)
-        self.pca_M_spin.setValue(300)
-        self.pca_M_spin.setSingleStep(50)
+            # seed
+            self.seed_spin = QSpinBox()
+            self.seed_spin.setRange(0, 10**9)
+            self.seed_spin.setValue(getattr(self, "seed", 0))
+            self.form.addRow("Random seed:", self.seed_spin)
 
-        self.pca_energy_spin = QDoubleSpinBox()
-        self.pca_energy_spin.setDecimals(3)
-        self.pca_energy_spin.setRange(0.50, 0.999)
-        self.pca_energy_spin.setValue(0.99)
-        self.pca_energy_spin.setSingleStep(0.01)
+            # amp alpha
+            self.amp_alpha_spin = QDoubleSpinBox()
+            self.amp_alpha_spin.setRange(1e-6, 10.0)
+            self.amp_alpha_spin.setDecimals(6)
+            self.amp_alpha_spin.setSingleStep(0.001)
+            self.amp_alpha_spin.setValue(float(getattr(self, "amp_alpha", 0.01)))
+            self.form.addRow("Amplitude scale:", self.amp_alpha_spin)
 
-        self.pca_k_spin = QSpinBox()
-        self.pca_k_spin.setRange(0, 5000)  # 0 => auto from energy
-        self.pca_k_spin.setValue(0)
+            # normal projection
+            self.normal_project_cb = QCheckBox("Project local modes along normals")
+            self.normal_project_cb.setChecked(getattr(self, "normal_project", True))
+            self.form.addRow(self.normal_project_cb)
 
-        pca_row = QHBoxLayout()
-        pca_row.addWidget(self.use_pca_cb)
-        pca_row.addWidget(QLabel("PCA M"))
-        pca_row.addWidget(self.pca_M_spin)
-        pca_row.addWidget(QLabel("Energy"))
-        pca_row.addWidget(self.pca_energy_spin)
-        pca_row.addWidget(QLabel("k (0=auto)"))
-        pca_row.addWidget(self.pca_k_spin)
+            # vector mode for non-normal case
+            self.vector_mode_combo = QComboBox()
+            self.vector_mode_combo.addItems([
+                "Local frame (t1,t2,n)",
+                "Cartesian (x,y,z)",
+            ])
+            prev_vm = getattr(self, "vector_mode", "local_frame")
+            self.vector_mode_combo.setCurrentIndex(0 if prev_vm == "local_frame" else 1)
+            self.form.addRow("Vector mode (if normals off):", self.vector_mode_combo)
 
-        self.form.addRow(pca_row)
+            # local frame knn
+            self.frame_knn_spin = QSpinBox()
+            self.frame_knn_spin.setRange(3, 200)
+            self.frame_knn_spin.setValue(int(getattr(self, "frame_knn", 16)))
+            self.form.addRow("Local-frame kNN:", self.frame_knn_spin)
 
-        # Optional bump window controls
-        self.bump_enable_cb = QCheckBox("Enable bump window")
-        self.bump_enable_cb.setChecked(getattr(self, "bump_enable", False))
-        self.form.addRow(self.bump_enable_cb)
+            # local/global toggles
+            self.use_local_modes_cb = QCheckBox("Use Laplacian local modes")
+            self.use_local_modes_cb.setChecked(getattr(self, "use_local_modes", True))
+            self.form.addRow(self.use_local_modes_cb)
 
-        bump_row = QHBoxLayout()
-        self.bump_cx = QLineEdit(); self.bump_cx.setPlaceholderText("cx")
-        self.bump_cy = QLineEdit(); self.bump_cy.setPlaceholderText("cy")
-        self.bump_cz = QLineEdit(); self.bump_cz.setPlaceholderText("cz")
-        self.bump_r  = QLineEdit(); self.bump_r.setPlaceholderText("radius")
-        bump_row.addWidget(QLabel("Center (x,y,z), Radius:"))
-        bump_row.addWidget(self.bump_cx); bump_row.addWidget(self.bump_cy); bump_row.addWidget(self.bump_cz); bump_row.addWidget(self.bump_r)
-        self.form.addRow(bump_row)
+            self.global_modes_cb = QCheckBox("Use global aerodynamic modes")
+            self.global_modes_cb.setChecked(getattr(self, "global_modes_selected", False))
+            self.global_modes_cb.toggled.connect(self._on_global_modes_toggled)
+            self.form.addRow(self.global_modes_cb)
 
-        self.bump_one_sided_cb = QCheckBox("One-sided (+normal only)")
-        self.bump_one_sided_cb.setChecked(getattr(self, "bump_one_sided", False))
-        self.form.addRow(self.bump_one_sided_cb)
+            self.global_only_cb = QCheckBox("Global modes only")
+            self.global_only_cb.setChecked(getattr(self, "global_only", False))
+            self.form.addRow(self.global_only_cb)
 
-        # mount the form
-        from PyQt5.QtWidgets import QWidget
-        self.form_widget = QWidget()
-        self.form_widget.setLayout(self.form)
-        self.main_layout.addWidget(self.form_widget)
+            self.edit_global_modes_btn = QPushButton("Edit global modes")
+            self.edit_global_modes_btn.clicked.connect(self.edit_global_modes)
+            self.form.addRow(self.edit_global_modes_btn)
 
-        # Save button
-        self.cn_btn = QPushButton("Save Selected Control Nodes")
-        self.cn_btn.clicked.connect(self.save_controlnodes)
-        self.main_layout.addWidget(self.cn_btn)
+            # PCA
+            self.use_pca_cb = QCheckBox("Use PCA-reduced basis")
+            self.use_pca_cb.setChecked(getattr(self, "use_pca", False))
+            self.form.addRow(self.use_pca_cb)
+
+            self.pca_train_spin = QSpinBox()
+            self.pca_train_spin.setRange(10, 100000)
+            self.pca_train_spin.setValue(int(getattr(self, "pca_train_M", 300)))
+            self.form.addRow("PCA training samples:", self.pca_train_spin)
+
+            self.pca_energy_spin = QDoubleSpinBox()
+            self.pca_energy_spin.setRange(0.5, 0.9999)
+            self.pca_energy_spin.setDecimals(4)
+            self.pca_energy_spin.setSingleStep(0.01)
+            self.pca_energy_spin.setValue(float(getattr(self, "pca_energy", 0.99)))
+            self.form.addRow("PCA energy target:", self.pca_energy_spin)
+
+            self.pca_k_red_spin = QSpinBox()
+            self.pca_k_red_spin.setRange(0, 100000)
+            self.pca_k_red_spin.setValue(int(getattr(self, "pca_k_red", 0) or 0))
+            self.form.addRow("PCA fixed reduced k (0=auto):", self.pca_k_red_spin)
+
+            # rigid translation
+            self.rigid_translation_cb = QCheckBox("Enable rigid boundary translation")
+            self.rigid_translation_cb.setChecked(getattr(self, "rigid_boundary_translation", False))
+            self.form.addRow(self.rigid_translation_cb)
+
+            # enable/disable vector widgets based on normal projection
+            def _sync_modal_widgets():
+                normals_on = self.normal_project_cb.isChecked()
+                self.vector_mode_combo.setEnabled(not normals_on)
+                self.frame_knn_spin.setEnabled(not normals_on)
+
+                global_only = self.global_only_cb.isChecked()
+                self.use_local_modes_cb.setEnabled(not global_only)
+                if global_only:
+                    self.use_local_modes_cb.setChecked(False)
+
+            self.normal_project_cb.toggled.connect(_sync_modal_widgets)
+            self.global_only_cb.toggled.connect(_sync_modal_widgets)
+            _sync_modal_widgets()
+
+        # ----------------------------
+        # save button
+        # ----------------------------
+        self.save_btn = QPushButton("Save Control Nodes / Basis")
+        self.save_btn.clicked.connect(self.save_controlnodes)
+        self.main_layout.addWidget(self.form_container)
+        self.main_layout.addWidget(self.save_btn)
         
     def back_to_surface_selection(self):
         """Return to T/U/C surface selection view."""
@@ -1112,8 +1372,6 @@ class MeshViewer(QWidget):
             self.plotter.close()
             if hasattr(self, "form_widget"):
                 self.form_widget.setParent(None)
-            if hasattr(self, "cn_btn"):
-                self.cn_btn.setParent(None)
             if hasattr(self, "back_btn"):
                 self.back_btn.setParent(None)
 
@@ -1124,143 +1382,180 @@ class MeshViewer(QWidget):
             self.log(f"[ERROR] Could not go back: {e}")
 
     def save_controlnodes(self):
-        self.cn_btn.setVisible(False)
 
-        self.k_modes = int(self.k_modes_spin.value())
-        self.spectral_p = float(self.decay_p_spin.value())
-        self.coeff_frac = float(self.coeff_frac_spin.value())
-        self.seed = int(self.seed_spin.value())
-        self.normal_project = bool(self.normal_proj_cb.isChecked())
-        self.rigid_boundary_translation = bool(self.rigid_c_cb.isChecked())
+        # --------------------------------------------------
+        # top-level parameterisation family
+        # --------------------------------------------------
+        self.save_btn.setVisible(False)
+        
+        self.parameterisation_method = getattr(self, "parameterisation_method", "modal")
 
-        # Bump (optional)
-        self.bump_enable = bool(self.bump_enable_cb.isChecked())
+        # defaults shared by both families
+        self.global_mode_config = getattr(self, "global_mode_config", [])
+        self.bump_enable = False
         self.bump_center = None
         self.bump_radius = None
-        self.bump_one_sided = bool(self.bump_one_sided_cb.isChecked())
+        self.bump_one_sided = None
 
-        if self.bump_enable:
-            try:
-                cx = float(self.bump_cx.text()); cy = float(self.bump_cy.text()); cz = float(self.bump_cz.text())
-                r  = float(self.bump_r.text())
-                self.bump_center = (cx, cy, cz)
-                self.bump_radius = r
-            except Exception:
-                self.bump_enable = False
-                self.bump_center = None
-                self.bump_radius = None
+        # optional body-frame mapping for globals
+        # for now default to world xyz unless you add a dedicated UI later
+        self.basis_axes = getattr(self, "basis_axes", [[1, 0, 0], [0, 1, 0], [0, 0, 1]])
 
-        # PCA settings
-        self.use_pca = bool(self.use_pca_cb.isChecked())
-        self.pca_train_M = int(self.pca_M_spin.value())
-        self.pca_energy = float(self.pca_energy_spin.value())
-        k_tmp = int(self.pca_k_spin.value())
-        self.pca_k_red = None if k_tmp <= 0 else k_tmp
+        # keep track of how CNs were obtained
+        self.control_node_selection_mode = getattr(self, "control_node_selection_mode", "auto")
+        self.loaded_control_nodes_path = getattr(self, "loaded_control_nodes_path", None)
+        self.loaded_control_normals_path = getattr(self, "loaded_control_normals_path", None)
 
-        # ---- Persist control nodes + normals to output directory ----
+        # --------------------------------------------------
+        # DIRECT CONTROL-NODE PARAMETERISATION
+        # --------------------------------------------------
+        if self.parameterisation_method == "direct":
+            self.direct_parameterisation_subtype = (
+                "xyz" if self.direct_mode_combo.currentIndex() == 0 else "normal"
+            )
+
+            self.amp_alpha = float(self.direct_amp_alpha_spin.value())
+            self.rigid_boundary_translation = bool(self.rigid_translation_cb.isChecked())
+
+            # disable modal-only settings
+            self.k_modes = 0
+            self.spectral_p = None
+            self.coeff_frac = None
+            self.seed = 0
+            self.normal_project = None
+            self.vector_mode = None
+            self.frame_knn = None
+
+            self.use_local_modes = False
+            self.global_modes_selected = False
+            self.global_only = False
+
+            self.use_pca = False
+            self.pca_train_M = None
+            self.pca_energy = None
+            self.pca_k_red = None
+            self.pca_k_final = None
+            self.pca_cache_path = None
+
+        # --------------------------------------------------
+        # MODAL PARAMETERISATION
+        # --------------------------------------------------
+        else:
+            self.direct_parameterisation_subtype = None
+
+            self.k_modes = int(self.k_modes_spin.value())
+            self.spectral_p = float(self.decay_p_spin.value())
+            self.coeff_frac = float(self.coeff_frac_spin.value())
+            self.seed = int(self.seed_spin.value())
+            self.amp_alpha = float(self.amp_alpha_spin.value())
+
+            self.normal_project = bool(self.normal_project_cb.isChecked())
+            self.vector_mode = "local_frame" if self.vector_mode_combo.currentIndex() == 0 else "xyz"
+            self.frame_knn = int(self.frame_knn_spin.value())
+
+            self.use_local_modes = bool(self.use_local_modes_cb.isChecked())
+            self.global_modes_selected = bool(self.global_modes_cb.isChecked())
+            self.global_only = bool(self.global_only_cb.isChecked())
+            self.rigid_boundary_translation = bool(self.rigid_translation_cb.isChecked())
+
+            # if global-only is checked, force local modes off
+            if self.global_only:
+                self.use_local_modes = False
+
+            self.use_pca = bool(self.use_pca_cb.isChecked())
+            self.pca_train_M = int(self.pca_train_spin.value())
+            self.pca_energy = float(self.pca_energy_spin.value())
+            k_tmp = int(self.pca_k_red_spin.value())
+            self.pca_k_red = None if k_tmp <= 0 else k_tmp
+            self.pca_k_final = getattr(self, "pca_k_final", None)
+            self.pca_cache_path = getattr(self, "pca_cache_path", None)
+
+        # --------------------------------------------------
+        # persist control nodes + normals to output directory
+        # --------------------------------------------------
         try:
             cn_dir = os.path.join(self.output_dir, "Control Nodes")
             os.makedirs(cn_dir, exist_ok=True)
 
-            cn = np.asarray(self.control_nodes, float).reshape((-1, 3))
-            nn = np.asarray(self.control_normals, float).reshape((-1, 3)) if getattr(self, "control_normals", None) is not None else None
+            cn_path = os.path.join(cn_dir, "control_nodes.npy")
+            np.save(cn_path, np.asarray(self.control_nodes, float))
+            self.log(f"[INFO] Saved control nodes -> {cn_path}")
 
-            np.save(os.path.join(cn_dir, "control_nodes.npy"), cn)
-            if nn is not None:
-                np.save(os.path.join(cn_dir, "control_normals.npy"), nn)
+            if getattr(self, "control_normals", None) is not None:
+                cn_normals_path = os.path.join(cn_dir, "control_normals.npy")
+                np.save(cn_normals_path, np.asarray(self.control_normals, float))
+                self.log(f"[INFO] Saved control normals -> {cn_normals_path}")
 
-            import json
-            cn_meta = {
-                "k_modes": int(self.k_modes),
-                "spectral_p": float(self.spectral_p),
-                "coeff_frac": float(self.coeff_frac),
-                "seed": int(self.seed),
-                "normal_project": bool(self.normal_project),
-                "rigid_boundary_translation": bool(self.rigid_boundary_translation),
+            meta = {
+                "parameterisation_method": self.parameterisation_method,
+                "direct_parameterisation_subtype": self.direct_parameterisation_subtype,
+                "selection_mode": self.control_node_selection_mode,
+                "loaded_control_nodes_path": self.loaded_control_nodes_path,
+                "loaded_control_normals_path": self.loaded_control_normals_path,
+                "k_modes": self.k_modes,
+                "spectral_p": self.spectral_p,
+                "coeff_frac": self.coeff_frac,
+                "seed": self.seed,
+                "normal_project": self.normal_project,
+                "vector_mode": self.vector_mode,
+                "frame_knn": self.frame_knn,
+                "use_local_modes": self.use_local_modes,
+                "global_modes": self.global_modes_selected,
+                "global_only": self.global_only,
+                "global_mode_config": self.global_mode_config,
+                "basis_axes": self.basis_axes,
                 "t_patch_scale": None if getattr(self, "t_patch_scale", None) is None else float(self.t_patch_scale),
-                "use_pca": bool(self.use_pca),
-                "pca_train_M": int(self.pca_train_M),
-                "pca_energy": float(self.pca_energy),
-                "pca_k_red": (None if self.pca_k_red is None else int(self.pca_k_red)),
+                "amp_alpha": float(self.amp_alpha),
+                "rigid_translation": bool(self.rigid_boundary_translation),
+                "use_pca": self.use_pca,
+                "pca_train_M": self.pca_train_M,
+                "pca_energy": self.pca_energy,
+                "pca_k_red": self.pca_k_red,
+                "pca_k_final": self.pca_k_final,
+                "pca_cache_path": self.pca_cache_path,
             }
-            with open(os.path.join(cn_dir, "control_nodes_meta.json"), "w", encoding="utf-8") as f:
-                json.dump(cn_meta, f, indent=2)
+
+            meta_path = os.path.join(cn_dir, "control_nodes_meta.json")
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+            self.log(f"[INFO] Saved control-node metadata -> {meta_path}")
 
         except Exception as e:
-            self.log(f"[WARN] Failed to save control node files: {e}")
-            # still emit ready so UI doesn't deadlock
-            self.control_ready.emit()
-            return
+            self.log(f"[WARN] Failed to save control nodes/metadata: {e}")
 
-        # ---- Build PCA cache if enabled ----
-        if self.use_pca:
-            if nn is None:
-                self.log("[WARN] PCA enabled but control_normals missing; disabling PCA.")
-                self.use_pca = False
-            else:
-                pca_dir = os.path.join(cn_dir, "pca")
-                os.makedirs(pca_dir, exist_ok=True)
-                pca_path = os.path.join(pca_dir, "pca_basis.npz")
+        # --------------------------------------------------
+        # PCA cache generation only for modal family
+        # --------------------------------------------------
+        if self.parameterisation_method == "modal" and self.use_pca:
+            try:
+                self.log("[PCA] Building PCA cache...")
 
-                sig = make_signature(
-                    control_nodes=cn,
-                    control_normals=nn,
-                    normal_project=bool(self.normal_project),
+                cache = build_pca_cache(
+                    output_dir=self.output_dir,
+                    control_nodes=np.asarray(self.control_nodes, float),
+                    normals=np.asarray(self.control_normals, float),
                     k_modes=int(self.k_modes),
-                    knn=12,
-                    spectral_p=float(self.spectral_p),
-                    coeff_frac=float(self.coeff_frac),
-                    amp_alpha=0.0005,
-                    t_patch_scale=getattr(self, "t_patch_scale", None),
-                    train_M=int(self.pca_train_M),
+                    M=int(self.pca_train_M),
                     energy=float(self.pca_energy),
                     k_red=self.pca_k_red,
+                    seed=int(self.seed),
+                    normal_project=bool(self.normal_project),
+                    t_patch_scale=self.t_patch_scale,
+                    amp_alpha=float(self.amp_alpha),
+                    vector_mode=self.vector_mode,
+                    frame_knn=int(self.frame_knn) if self.frame_knn is not None else 12,
+                    global_modes=bool(self.global_modes_selected),
+                    global_mode_config=self.global_mode_config,
+                    basis_axes=self.basis_axes,
                 )
-
-                need_build = True
-                if os.path.exists(pca_path):
-                    try:
-                        pca_existing = load_pca_basis(pca_path)  # PCABasis object
-                        if pca_existing.meta.get("signature") == sig:
-                            need_build = False
-                    except Exception:
-                        need_build = True
-
-                if need_build:
-                    from MeshGeneration.controlNodeDisp import getDisplacements
-
-                    X = []
-                    for i in range(int(self.pca_train_M)):
-                        d = getDisplacements(
-                            output_dir=self.output_dir,          # IMPORTANT (not cn_dir)
-                            seed=int(self.seed) + i,
-                            control_nodes=cn,
-                            normals=nn,
-                            coeffs=None,
-                            k_modes=int(self.k_modes),
-                            normal_project=bool(self.normal_project),
-                            t_patch_scale=getattr(self, "t_patch_scale", None),
-                            amp_alpha=0.02,
-                        )
-                        X.append(np.asarray(d, float).reshape(-1))
-                    X = np.vstack(X)
-
-                    mean, V, sigma, explained = build_pca_basis(
-                        X, energy=float(self.pca_energy), k_red=self.pca_k_red
-                    )
-
-                    save_pca_basis(
-                        pca_path,
-                        mean, V, sigma, explained,
-                        signature=sig,
-                        meta={"signature": sig,
-                            "train_M": int(self.pca_train_M),
-                            "energy": float(self.pca_energy),
-                            "k_red": int(V.shape[1])},
-                    )
-
-                # stash for Aeropt export
-                self.pca_cache_path = pca_path
+                self.pca_cache_path = cache["cache_path"]
+                self.pca_k_final = int(cache["k_red"])
+                self.log(f"[PCA] Cache built: {self.pca_cache_path} (k_red={self.pca_k_final})")
+            except Exception as e:
+                self.log(f"[ERROR] PCA cache build failed: {e}")
+                self.use_pca = False
+                self.pca_cache_path = None
+                self.pca_k_final = None
 
         self.control_ready.emit()
         
@@ -1569,55 +1864,249 @@ class SurfaceEditDialog(QDialog):
             parent.plotter.render()
             
             
-            
 class ControlNodeSelectionDialog(QDialog):
     """
-    Lets the user choose either:
-      - Auto: pick N control nodes automatically
-      - Manual: pick N control nodes by clicking points on the T patch
+    Lets the user choose:
+      - how to obtain control nodes:
+          * auto
+          * manual
+          * load saved .npy
+      - which parameterisation family to use:
+          * direct
+          * modal
     """
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Control Node Selection")
-        self.resize(420, 180)
+        self.resize(560, 280)
 
         layout = QVBoxLayout(self)
 
+        # ----------------------------
+        # selection mode
+        # ----------------------------
         self.mode_auto = QCheckBox("Auto-select control nodes (random)")
         self.mode_manual = QCheckBox("Manually select control nodes (click points on T patch)")
+        self.mode_load = QCheckBox("Load saved control nodes (.npy)")
         self.mode_auto.setChecked(True)
-        self.mode_manual.setChecked(False)
 
-        # make them mutually exclusive
         self.mode_auto.stateChanged.connect(lambda s: self._sync("auto"))
         self.mode_manual.stateChanged.connect(lambda s: self._sync("manual"))
+        self.mode_load.stateChanged.connect(lambda s: self._sync("load"))
 
         layout.addWidget(self.mode_auto)
         layout.addWidget(self.mode_manual)
+        layout.addWidget(self.mode_load)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Number of control nodes (N):"))
+        # ----------------------------
+        # node count
+        # ----------------------------
+        row_n = QHBoxLayout()
+        row_n.addWidget(QLabel("Number of control nodes (N):"))
         self.n_spin = QSpinBox()
         self.n_spin.setRange(1, 5000)
         self.n_spin.setValue(6)
-        row.addWidget(self.n_spin)
-        row.addStretch(1)
-        layout.addLayout(row)
+        row_n.addWidget(self.n_spin)
+        row_n.addStretch(1)
+        layout.addLayout(row_n)
+
+        # ----------------------------
+        # load saved files
+        # ----------------------------
+        row_cn = QHBoxLayout()
+        row_cn.addWidget(QLabel("Control nodes file:"))
+        self.cn_path_edit = QLineEdit()
+        self.cn_path_edit.setPlaceholderText("Path to control_nodes.npy")
+        self.cn_browse_btn = QPushButton("Browse...")
+        self.cn_browse_btn.clicked.connect(self._browse_cn_file)
+        row_cn.addWidget(self.cn_path_edit)
+        row_cn.addWidget(self.cn_browse_btn)
+        layout.addLayout(row_cn)
+
+        row_normals = QHBoxLayout()
+        row_normals.addWidget(QLabel("Control normals file (optional):"))
+        self.normals_path_edit = QLineEdit()
+        self.normals_path_edit.setPlaceholderText("Optional path to control_normals.npy")
+        self.normals_browse_btn = QPushButton("Browse...")
+        self.normals_browse_btn.clicked.connect(self._browse_normals_file)
+        row_normals.addWidget(self.normals_path_edit)
+        row_normals.addWidget(self.normals_browse_btn)
+        layout.addLayout(row_normals)
+
+        # ----------------------------
+        # parameterisation family
+        # ----------------------------
+        row_param = QHBoxLayout()
+        row_param.addWidget(QLabel("Parameterisation method:"))
+        self.param_combo = QComboBox()
+        self.param_combo.addItems([
+            "Direct Control Node Displacement",
+            "Modal Parameterisation",
+        ])
+        row_param.addWidget(self.param_combo)
+        row_param.addStretch(1)
+        layout.addLayout(row_param)
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
+        self._update_enabled_state()
+
     def _sync(self, which):
         if which == "auto" and self.mode_auto.isChecked():
             self.mode_manual.setChecked(False)
-        if which == "manual" and self.mode_manual.isChecked():
+            self.mode_load.setChecked(False)
+        elif which == "manual" and self.mode_manual.isChecked():
             self.mode_auto.setChecked(False)
-        # ensure at least one is checked
-        if not self.mode_auto.isChecked() and not self.mode_manual.isChecked():
+            self.mode_load.setChecked(False)
+        elif which == "load" and self.mode_load.isChecked():
+            self.mode_auto.setChecked(False)
+            self.mode_manual.setChecked(False)
+
+        if not self.mode_auto.isChecked() and not self.mode_manual.isChecked() and not self.mode_load.isChecked():
             self.mode_auto.setChecked(True)
 
+        self._update_enabled_state()
+
+    def _update_enabled_state(self):
+        load_mode = self.mode_load.isChecked()
+        self.n_spin.setEnabled(not load_mode)
+        self.cn_path_edit.setEnabled(load_mode)
+        self.cn_browse_btn.setEnabled(load_mode)
+        self.normals_path_edit.setEnabled(load_mode)
+        self.normals_browse_btn.setEnabled(load_mode)
+
+    def _browse_cn_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select control_nodes.npy",
+            "",
+            "NumPy files (*.npy)"
+        )
+        if path:
+            self.cn_path_edit.setText(path)
+
+    def _browse_normals_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select control_normals.npy",
+            "",
+            "NumPy files (*.npy)"
+        )
+        if path:
+            self.normals_path_edit.setText(path)
+
     def get_choice(self):
-        mode = "manual" if self.mode_manual.isChecked() else "auto"
-        return mode, int(self.n_spin.value())
+        if self.mode_load.isChecked():
+            selection_mode = "load"
+        elif self.mode_manual.isChecked():
+            selection_mode = "manual"
+        else:
+            selection_mode = "auto"
+
+        param_text = self.param_combo.currentText()
+        parameterisation_method = (
+            "direct"
+            if param_text == "Direct Control Node Displacement"
+            else "modal"
+        )
+
+        return {
+            "selection_mode": selection_mode,
+            "num_nodes": int(self.n_spin.value()),
+            "control_nodes_path": self.cn_path_edit.text().strip() or None,
+            "control_normals_path": self.normals_path_edit.text().strip() or None,
+            "parameterisation_method": parameterisation_method,
+        }
+
+
+class GlobalModesDialog(QDialog):
+    """
+    Lets the user build a list of global modes, each with:
+      - mode type
+      - direction
+    """
+    def __init__(self, existing=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Global Modes")
+        self.resize(520, 350)
+
+        self.mode_rows = []
+
+        layout = QVBoxLayout(self)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Enable", "Mode Type", "Direction"])
+        layout.addWidget(self.table)
+
+        row_btns = QHBoxLayout()
+        add_btn = QPushButton("+ Add Mode")
+        del_btn = QPushButton("– Remove Selected")
+        add_btn.clicked.connect(self.add_row)
+        del_btn.clicked.connect(self.remove_selected_rows)
+        row_btns.addWidget(add_btn)
+        row_btns.addWidget(del_btn)
+        row_btns.addStretch(1)
+        layout.addLayout(row_btns)
+
+        defaults = existing if existing else [
+            {"type": "stretch", "direction": "x"},
+            {"type": "flatten", "direction": "z"},
+        ]
+        for item in defaults:
+            self.add_row(item)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def add_row(self, data=None):
+        data = data or {"type": "stretch", "direction": "x"}
+
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+
+        enabled_cb = QCheckBox()
+        enabled_cb.setChecked(True)
+
+        mode_combo = QComboBox()
+        mode_combo.addItems([
+            "stretch",
+            "flatten",
+            "bulge",
+            "camber",
+            "twist",
+            "taper",
+            "bend"
+        ])
+        mode_combo.setCurrentText(data.get("type", "stretch"))
+
+        dir_combo = QComboBox()
+        dir_combo.addItems(["x", "y", "z"])
+        dir_combo.setCurrentText(data.get("direction", "x"))
+
+        self.table.setCellWidget(row, 0, enabled_cb)
+        self.table.setCellWidget(row, 1, mode_combo)
+        self.table.setCellWidget(row, 2, dir_combo)
+
+    def remove_selected_rows(self):
+        rows = sorted({idx.row() for idx in self.table.selectedIndexes()}, reverse=True)
+        for row in rows:
+            self.table.removeRow(row)
+
+    def get_selected_modes(self):
+        out = []
+        for row in range(self.table.rowCount()):
+            enabled_cb = self.table.cellWidget(row, 0)
+            mode_combo = self.table.cellWidget(row, 1)
+            dir_combo = self.table.cellWidget(row, 2)
+
+            if enabled_cb is not None and enabled_cb.isChecked():
+                out.append({
+                    "type": mode_combo.currentText(),
+                    "direction": dir_combo.currentText()
+                })
+        return out

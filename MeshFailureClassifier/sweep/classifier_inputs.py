@@ -127,10 +127,6 @@ def compute_mesh_fail_features(ff0, ff1, morph_model=None):
         flipped = np.sum(np.einsum("ij,ij->i", n0, n1) < 0.0)
 
         feats.update({
-            "area_ratio_min": float(np.min(ar)),
-            "area_ratio_p01": float(np.quantile(ar, 0.01)),
-            "area_ratio_p50": float(np.quantile(ar, 0.50)),
-            "area_ratio_p99": float(np.quantile(ar, 0.99)),
             "edge_ratio_min": float(np.min(er)),
             "edge_ratio_p01": float(np.quantile(er, 0.01)),
             "edge_ratio_p99": float(np.quantile(er, 0.99)),
@@ -138,7 +134,6 @@ def compute_mesh_fail_features(ff0, ff1, morph_model=None):
         })
     else:
         feats.update({
-            "area_ratio_min": 1.0, "area_ratio_p01": 1.0, "area_ratio_p50": 1.0, "area_ratio_p99": 1.0,
             "edge_ratio_min": 1.0, "edge_ratio_p01": 1.0, "edge_ratio_p99": 1.0,
             "tri_flipped_frac": 0.0,
         })
