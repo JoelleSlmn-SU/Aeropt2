@@ -112,7 +112,7 @@ class ClusterTestManager:
     Test manager that runs ON THE CLUSTER.
     Uses ClusterPipelineManager (no SSH/SFTP).
     """
-    def __init__(self, remote_root, base_name, input_dir, executables, poll_s=120, morph_basis_json="", units="mm", parallel=80):
+    def __init__(self, remote_root, base_name, input_dir, executables, poll_s=120, morph_basis_json="", units="mm", parallel=80, monitor_config_json=""):
         self.remote_root = os.path.abspath(remote_root)
         self.base_name = base_name
         self.input_dir = input_dir
@@ -122,6 +122,8 @@ class ClusterTestManager:
         self.morph_basis_json = morph_basis_json or ""
         self.units = units
         self.parallel = parallel
+        
+        self.monitor_config_json = monitor_config_json or ""
         
         # Create logs directory
         self.log_dir = os.path.join(self.remote_root, "logs")
@@ -288,6 +290,7 @@ def main():
         objective = json.load(f)
         
     morph_basis_json = settings_json.get("morph_basis_json", "")
+    monitor_config_json = settings_json.get("monitor_config_json", "")
     
     _log(f"[REMOTE-OPT] Loaded settings: {settings_json}", log_path)
     _log(f"[REMOTE-OPT] Loaded objective: {objective}", log_path)
@@ -366,7 +369,8 @@ def main():
         poll_s=settings_json.get("poll_interval", 120),
         morph_basis_json=morph_basis_json,
         units = cad_units,
-        parallel = parallel
+        parallel = parallel,
+        monitor_config_json=monitor_config_json
     )
     
     # Define init and eval functions for BO

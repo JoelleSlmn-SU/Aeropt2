@@ -69,6 +69,7 @@ def orchestrate_run(run_dir: str):
     sigma         = float(s.get("coeff_sigma", 0.5))
     seed          = s.get("seed", None)
     parallel      = int(s.get("parallel_domains", 80))
+    run_mode      = s.get("run_mode", "morph")
 
     # NEW:
     batch_size    = int(s.get("batch_size", 10))      # run 10 at a time
@@ -135,12 +136,12 @@ def orchestrate_run(run_dir: str):
 
     # Submit in WAVES of batch_size
     i = 1
-    vol = False
     while i <= n_cases:
         j_end = min(n_cases, i + batch_size - 1)
         _log(f"[MORPH-ORCH] Submitting batch: n={i}..{j_end}", log_path)
 
-        vol_jobs_this_batch = []
+        jobs_to_wait = []
+        wait_tag = None
 
         for n in range(i, j_end + 1):
             modal_coeffs = (rng.normal(0.0, sigma, size=coeff_len)).tolist()
@@ -158,17 +159,31 @@ def orchestrate_run(run_dir: str):
             pipe = ClusterPipelineManager(config_dict=config, gen=0, n=n)
 
             try:
-                morph_id = pipe.morph(n=n)                     # morph job
-                if vol == True:
-                    vol_id   = pipe.volume(runafter=morph_id)      # dependent volume job
-                    vol_jobs_this_batch.append(vol_id)
+                if run_mode == "disp":
+                    cfg_path = pipe._write_morph_config()
+                    _log(f"[MORPH-ORCH] n={n}: wrote displacement config {cfg_path}", log_path)
+
+                elif run_mode == "morph":
+                    morph_id = pipe.morph(n=n)
+                    jobs_to_wait.append(morph_id)
+                    wait_tag = "morph"
+                    _log(f"[MORPH-ORCH] n={n}: morph={morph_id}", log_path)
+
+                elif run_mode == "vol":
+                    morph_id = pipe.morph(n=n)
+                    vol_id = pipe.volume(runafter=morph_id)
+                    jobs_to_wait.append(vol_id)
+                    wait_tag = "volume"
                     _log(f"[MORPH-ORCH] n={n}: morph={morph_id}, volume={vol_id}", log_path)
-                else: _log(f"[MORPH-ORCH] n={n}: morph={morph_id}", log_path)
+
+                else:
+                    raise ValueError(f"Unknown run_mode: {run_mode}")
+
             except Exception as e:
                 _log(f"[MORPH-ORCH][ERROR] n={n} failed submit: {e}", log_path)
 
-        # Wait until this batch's VOLUME jobs finish, then proceed
-        _wait_for_jobs(vol_jobs_this_batch, poll_s=poll_s, log_path=log_path, tag="volume")
+        if jobs_to_wait:
+            _wait_for_jobs(jobs_to_wait, poll_s=poll_s, log_path=log_path, tag=wait_tag or "jobs")
 
         i = j_end + 1
 

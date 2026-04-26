@@ -130,47 +130,22 @@ def vtm_to_fro(vtm_path, outpath=None, write_file=True, tol=1e-6):
             surf_ids = np.full(n_cells, surface_id_counter, int)
             surface_id_counter += 1
 
-        # --- triangles ---
-        if 5 in cells_dict:
-            tris = cells_dict[5]
-            for i, tri in enumerate(tris):
-                gids = [get_gid(points[idx]) for idx in tri]
-                sid = int(surf_ids[i % len(surf_ids)])
-                all_tris.append([gids[0]+1, gids[1]+1, gids[2]+1, sid])  # 1-based indexing
+            # --- triangles (store 0-based internally) ---# --- triangles ---
+            if 5 in cells_dict:
+                tris = cells_dict[5]
+                for i, tri in enumerate(tris):
+                    gids = [get_gid(points[idx]) for idx in tri]
+                    sid = int(surf_ids[i % len(surf_ids)])
+                    all_tris.append([gids[0], gids[1], gids[2], sid])
 
-        # --- quads ---
-        if 9 in cells_dict:
-            quads = cells_dict[9]
-            for i, quad in enumerate(quads):
-                gids = [get_gid(points[idx]) for idx in quad]
-                sid = int(surf_ids[i % len(surf_ids)])
-                all_quads.append([gids[0]+1, gids[1]+1, gids[2]+1, gids[3]+1, sid])
-
-        max_index = 0
-        if all_tris:
-            max_index = max(max_index, np.max(np.array(all_tris)[:,:-1]))
-        if all_quads:
-            max_index = max(max_index, np.max(np.array(all_quads)[:,:-1]))
-        assert max_index < len(all_pts), (
-            f"[VTM→FRO] Out-of-bounds connectivity: max node index {max_index} >= {len(all_pts)} nodes"
-        )
+            # --- quads ---
+            if 9 in cells_dict:
+                quads = cells_dict[9]
+                for i, quad in enumerate(quads):
+                    gids = [get_gid(points[idx]) for idx in quad]
+                    sid = int(surf_ids[i % len(surf_ids)])
+                    all_quads.append([gids[0], gids[1], gids[2], gids[3], sid])
         
-        # --- poly fallback ---
-        # --- triangles (0-based internally) ---
-        if 5 in cells_dict:
-            tris = cells_dict[5]
-            for i, tri in enumerate(tris):
-                gids = [get_gid(points[idx]) for idx in tri]
-                sid = int(surf_ids[i % len(surf_ids)])
-                all_tris.append([gids[0], gids[1], gids[2], sid])
-
-        # --- quads (0-based internally) ---
-        if 9 in cells_dict:
-            quads = cells_dict[9]
-            for i, quad in enumerate(quads):
-                gids = [get_gid(points[idx]) for idx in quad]
-                sid = int(surf_ids[i % len(surf_ids)])
-                all_quads.append([gids[0], gids[1], gids[2], gids[3], sid])
                 
     max_index = 0
     if all_tris:
@@ -182,8 +157,17 @@ def vtm_to_fro(vtm_path, outpath=None, write_file=True, tol=1e-6):
         raise RuntimeError(
             f"[VTM→FRO] Connectivity out of range: max node index {max_index} for {len(all_pts)} nodes"
         )
+    max_index = 0
+    if all_tris:
+        max_index = max(max_index, np.max(np.array(all_tris)[:, :-1]))
+    if all_quads:
+        max_index = max(max_index, np.max(np.array(all_quads)[:, :-1]))
 
-    # --- build final Mesh / FroFile objects ---
+    if max_index >= len(all_pts):
+        raise RuntimeError(
+            f"[VTM→FRO] Connectivity out of range: max node index {max_index} for {len(all_pts)} nodes"
+        )
+
     m = Mesh()
     m.nodes = np.array(all_pts, dtype=float)
     m.node_count = len(all_pts)
@@ -193,11 +177,7 @@ def vtm_to_fro(vtm_path, outpath=None, write_file=True, tol=1e-6):
     m.boundary_quad_count = len(all_quads)
     m.surface_count = len(set([t[-1] for t in all_tris] + [q[-1] for q in all_quads]))
 
-    # shift to 1-based indexing only when writing
-    for arr in (m.boundary_triangles, m.boundary_quads):
-        if arr.size:
-            arr[:, :-1] += 1
-
+    # DO NOT shift to 1-based here
     fro_obj = FroFile.fromMesh(m)
 
     if write_file and outpath:
@@ -231,3 +211,4 @@ def check_fro_bounds(fro_path):
         print("❌ Out-of-bounds indices detected!")
     else:
         print("✅ All connectivity indices within range.")
+

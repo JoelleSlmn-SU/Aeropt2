@@ -3,8 +3,8 @@ import os
 import sys
 import numpy as np
 
-sys.path.append(os.path.dirname("MeshGeneration"))
-from MeshGeneration.modalBasis import (
+sys.path.append(os.path.dirname("ShapeParameterization"))
+from ShapeParameterization.modalBasis import (
     build_laplacian_basis,
     expand_modal_coeffs,
     save_basis,
@@ -435,6 +435,7 @@ def getDisplacements(
     directly to a flattened (N*3,) displacement vector, then reshaped to (N,3).
     """
     rng = np.random.default_rng(seed)
+    match_rms = True
 
     # ------------------------------------------------------------
     # load control nodes if needed
@@ -558,7 +559,6 @@ def getDisplacements(
             f"[DEBUG] Direct displacement norms: mean={d_norms.mean():.6f}, "
             f"max={d_norms.max():.6f}, std={d_norms.std():.6f}"
         )
-        return d_ctrl
 
     # ------------------------------------------------------------
     # PCA-reduced branch
@@ -569,7 +569,7 @@ def getDisplacements(
         if pca_coeffs is None:
             raise ValueError("use_pca=True but no pca_coeffs provided.")
 
-        from MeshGeneration.pcaBasis import load_pca_basis
+        from ShapeParameterization.pcaBasis import load_pca_basis
 
         p = load_pca_basis(pca_cache_path)
         z = np.asarray(pca_coeffs, float).reshape(-1)
@@ -597,7 +597,6 @@ def getDisplacements(
             f"[DEBUG] PCA displacement norms: mean={d_norms.mean():.6f}, "
             f"max={d_norms.max():.6f}, std={d_norms.std():.6f}"
         )
-        return d_ctrl
 
     # ------------------------------------------------------------
     # modal parameterisation
@@ -795,4 +794,20 @@ def getDisplacements(
         f"[DEBUG] Displacement norms: mean={d_norms.mean():.6f}, "
         f"max={d_norms.max():.6f}, std={d_norms.std():.6f}"
     )
+    
+    # ------------------------------------------------------------
+    # RMS normalisation (fair comparison across parameterisations)
+    # ------------------------------------------------------------
+    if match_rms:
+        target_rms = amp_alpha * len_scale   
+
+        rms = np.sqrt(np.mean(np.sum(d_ctrl**2, axis=1)))
+
+        if rms > 1e-12:
+            scale = target_rms / rms
+            d_ctrl *= scale
+            print(f"[DEBUG] RMS normalisation applied: target={target_rms:.6e}, old={rms:.6e}, scale={scale:.6f}")
+        else:
+            print("[WARN] RMS too small, skipping normalisation")
+        
     return d_ctrl

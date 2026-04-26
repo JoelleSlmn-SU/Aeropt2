@@ -33,7 +33,7 @@ if False:
         f.write(str(bco))
         
 if True:
-    df = DatFile(os.path.join(os.getcwd(), "examples/actualfinal", "CornerBump.dat"))
+    df = DatFile(os.path.join(os.getcwd(), "examples/lsr", "lsr.dat"))
     '''stats = df.clean(
         tol=1e-6,
         mode="euclid",
@@ -50,9 +50,9 @@ if True:
     print(stats)'''
     
     stats = df.clean_manual(
-        out_path=os.path.join(os.getcwd(), "examples/actualfinal", "CornerBumpFIXED.dat"),
+        out_path=os.path.join(os.getcwd(), "examples/2lsr", "lsr.dat"),
         remove_surfaces=[],
-        remove_curves=[246,316]
+        remove_curves=[]
     )
     print(stats)
     

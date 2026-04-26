@@ -180,9 +180,9 @@ class MorphModel(MorphModelBase):
         anchor_points=None,
         tol=1e-9,
         # ---- control influence radius (PASS 1) ----
-        min_R_frac=0.1,
-        fallback_R_frac=0.85,
-        R_scale=2.75,
+        min_R_frac=0.05,
+        fallback_R_frac=0.3,
+        R_scale=1.8,
 
         # ---- legacy taper (DISABLE for new method) ----
         anchor_taper=False,       # default OFF

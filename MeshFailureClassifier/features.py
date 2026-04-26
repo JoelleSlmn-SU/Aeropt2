@@ -23,7 +23,7 @@ FILERW_DIR = os.path.join(SCRIPTS_DIR, "FileRW")
 if FILERW_DIR not in sys.path:
     sys.path.insert(0, FILERW_DIR)
     
-from classifier_inputs import compute_mesh_fail_features
+from MeshFailureClassifier.classifier_inputs import compute_mesh_fail_features
 
 
 # ----------------------------
@@ -267,7 +267,7 @@ def compute_features(
     # Compose final record
     import datetime
     x = datetime.datetime.now()
-    case_id = x.strftime("%d%b%I") + case_id
+    #case_id = x.strftime("%d%b%I") + case_id
     
     rec: Dict[str, Any] = {
         "case_id": case_id or "",

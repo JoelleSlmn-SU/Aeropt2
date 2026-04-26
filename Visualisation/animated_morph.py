@@ -56,12 +56,12 @@ def add_slider_safe(plotter: pv.Plotter, **kwargs):
 
 def set_camera_from_paraview(pl: pv.Plotter):
     """Hard-coded camera copied from ParaView (edit as needed)."""
-    pos   = (-5350.33, 3446.88, 1886.9)
-    focal = (1984.2,  226.461, 123.97)
-    up    = (0.1916, -0.0981, 0.97655)
+    pos   = (7238.4, 2356.68, 4036.5)
+    focal = (6160.7,  964.62, 26.20)
+    up    = (-0.0645, -0.937, 0.343)
 
     pl.camera_position = (pos, focal, up)
-    pl.camera.zoom(8)
+    pl.camera.zoom(9)
     
     try:
         pl.camera.view_angle = 30
@@ -223,7 +223,7 @@ def animate_fro_morph_surface(
     base_opacity=0.12,
     morph_opacity=1.0,
     show_edges=True,
-    deform_scale=2.0,
+    deform_scale=1.0,
     color_by_displacement=True,
 ):
     f0 = FroFile.fromFile(fro0_path)
@@ -612,21 +612,22 @@ if __name__ == "__main__":
     from pathlib import Path
     
     folder = [
-        "sphere"
+        "param3"
     ]
 
     #x_case = 7
-    gen = 0
+    gen = "0"
+    filename = "corner"
     
-    for x_case in range(1,11):
+    for x_case in range(43,201):
         base = Path(r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples")
         case_root = base / folder[0]
 
-        orig_fro = str(case_root / "surfaces" / f"n_{gen}" / f"sphere.fro")
-        morp_fro = str(case_root / "surfaces" / f"n_{gen}" / f"sphere_{str(x_case)}.fro")
+        orig_fro = str(case_root / "surfaces" / f"n_{gen}" / f"{filename}.fro")
+        morp_fro = str(case_root / "surfaces" / f"n_{gen}" / f"{filename}_{str(x_case)}.fro")
         cfg_json = str(case_root / "surfaces" / f"n_{gen}" / f"morph_config_n_1.json")
 
-        # 1) MP4 animations
+        # 1) MP4 animations└
         surfaces = get_surfaces_from_morph_config(cfg_json, mode="T")
         out_1 = str(case_root / "surfaces" / f"n_{gen}" / f"n0_{str(x_case)}_morph_TU")
         out_2 = str(case_root / "surfaces" / f"n_{gen}" / f"n0_{str(x_case)}_morph_split_TU")
@@ -634,10 +635,10 @@ if __name__ == "__main__":
         animate_fro_morph_surface_both(
             orig_fro, morp_fro, surface_id=surfaces,
             out_path=out_1,
-            n_frames=90, fps=25, deform_scale=1.5,
+            n_frames=90, fps=25, deform_scale=1,
             save_mp4=False, save_gif=True,
         )
-
+        
         '''animate_split_screen_fro_surface_both(
             orig_fro, morp_fro, surface_id=surfaces,
             out_path=out_2,
@@ -647,7 +648,7 @@ if __name__ == "__main__":
 
         # 2) Interactive mesh
         export = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Morph\surfaces\n_0"
-        
-        interactive_fro_morph_surface(orig_fro, morp_fro, surface_id=surfaces, deform_scale=2.0, show_edges=False)
+        surfaces = get_surfaces_from_morph_config(cfg_json, mode="T")
+        #interactive_fro_morph_surface(orig_fro, morp_fro, surface_id=surfaces, deform_scale=2.0, show_edges=False)
         #export_morph_series_multiblock(orig_fro, morp_fro, surface_ids=surfaces, out_dir=export, base_name="corner_morph", n_frames=90, deform_scale=1.0)
     pass

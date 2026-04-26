@@ -694,6 +694,7 @@ class DatFile:
         ncur_new = len(keep_curves)
         nsurf_new = len(s1_blocks)
 
+        temp = 0
         # --- assemble new file ---
         out = []
         out.extend(self.lines[:hdr_line])
@@ -702,7 +703,7 @@ class DatFile:
         out.extend(new_curves_lines)
         out.extend(new_s1_lines)
         out.extend(self.lines[self.idx["MeshGen"] : self.idx["MeshGen"]+1])  # "Mesh Generation"
-        out.append(f"{ncur_new:8d}{nsurf_new:8d}\n")
+        out.append(f"{ncur_new:8d}{nsurf_new:8d}{temp:8d}{temp:8d}\n")
         out.extend(new_segments_lines)
         out.extend(self.lines[seg_end_idx : self.idx["Surfaces4"]])
         out.extend(new_s4_lines)

@@ -17,12 +17,12 @@ for dir in ["FileRW", "ShapeParameterization", "MeshGeneration", "ConvertFileTyp
     sys.path.append(os.path.dirname(dir))
 from ShapeParameterization.surfaceFitting import selectControlNodes
 from MeshGeneration.meshFile import load_mesh
-from MeshGeneration.controlNodeDisp import _surface_normals, _map_normals_to_control
+from ShapeParameterization.controlNodeDisp import _surface_normals, _map_normals_to_control
 from Local.runSimLocal import *
 from ConvertFileType.convertToStep import *
 from GUI.workers import MorphWorker
 import pickle
-from MeshGeneration.pcaBasis import (
+from ShapeParameterization.pcaBasis import (
     build_pca_cache
 )
 
@@ -351,6 +351,52 @@ class MeshViewer(QWidget):
         self.debug_checkbox.setChecked(True)
         self.debug_checkbox.stateChanged.connect(lambda: setattr(self, 'debug_mode', self.debug_checkbox.isChecked()))
         self.main_layout.addWidget(self.debug_checkbox)
+        
+        
+    def add_designmodeler_scale_bar(self):
+        import vtk
+
+        actor = vtk.vtkLegendScaleActor()
+
+        # show only bottom scale
+        actor.SetBottomAxisVisibility(True)
+        actor.SetTopAxisVisibility(False)
+        actor.SetLeftAxisVisibility(False)
+        actor.SetRightAxisVisibility(False)
+        actor.SetLegendVisibility(False)
+
+        # IMPORTANT: make custom font sizes take effect
+        actor.SetUseFontSizeFromProperty(True)
+
+        # -------- text styling --------
+        label_prop = actor.GetLegendLabelProperty()
+        label_prop.SetFontSize(15)          # increase this more if needed
+        label_prop.SetBold(False)
+        label_prop.SetColor(0.0, 0.0, 0.0)  # black text
+        label_prop.SetShadow(False)
+
+        title_prop = actor.GetLegendTitleProperty()
+        title_prop.SetFontSize(15)
+        title_prop.SetBold(False)
+        title_prop.SetColor(0.0, 0.0, 0.0)
+        title_prop.SetShadow(False)
+
+        # also forward text settings to axis text
+        axes_text = vtk.vtkTextProperty()
+        axes_text.SetFontSize(15)
+        axes_text.SetBold(False)
+        axes_text.SetColor(0.0, 0.0, 0.0)
+        axes_text.SetShadow(False)
+        actor.SetAxesTextProperty(axes_text)
+
+        # -------- line/tick styling --------
+        axes_prop = vtk.vtkProperty2D()
+        axes_prop.SetColor(0.0, 0.0, 0.0)   # black bar/ticks
+        axes_prop.SetLineWidth(2.5)
+        actor.SetAxesProperty(axes_prop)
+
+        self.plotter.renderer.AddActor(actor)
+        self.scale_actor = actor
 
     def _add_mesh_to_plotter(self):
         self.plotter.clear()
@@ -367,6 +413,11 @@ class MeshViewer(QWidget):
                     mesh,
                     color=color,
                     show_edges=True,
+                    lighting=True,
+                    specular=0.08,
+                    specular_power=20,
+                    ambient=0.25,
+                    diffuse=0.75,
                     pickable=True,
                     show_scalar_bar=True,
                     scalar_bar_args=sargs
@@ -386,16 +437,9 @@ class MeshViewer(QWidget):
 
         # optional but very useful:
         try:
-            self.plotter.show_bounds(
-                grid='back',
-                location='outer',
-                all_edges=True,
-                xtitle='X',
-                ytitle='Y',
-                ztitle='Z'
-            )
+            self.add_designmodeler_scale_bar()
         except Exception as e:
-            self.log(f"[WARN] Failed to show bounds: {e}")
+            self.log(f"[WARN] Failed to show distance ruler: {e}")
 
         self.plotter.set_visible(True) if hasattr(self.plotter, "set_visible") else None
         self.plotter.setVisible(True)

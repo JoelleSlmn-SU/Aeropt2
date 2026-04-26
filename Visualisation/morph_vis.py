@@ -8,7 +8,7 @@ def load_morph_case(json_path):
     with open(json_path, "r") as f:
         data = json.load(f)
 
-    out_dir = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\viz"
+    out_dir = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\\examples\param1"
     n = 0
 
     # Path to the morphed T-surface (adjust name as needed)
@@ -18,7 +18,7 @@ def load_morph_case(json_path):
 
     if not os.path.exists(surface_path):
         # try alternative naming
-        alt = os.path.join(out_dir, "surfaces", f"n_{n}", "T_surface.vtm")
+        alt = os.path.join(out_dir, "surfaces", f"n_{n}", "output.vtk")
         if os.path.exists(alt):
             surface_path = alt
         else:
@@ -205,7 +205,7 @@ def visualise_morph(
 
 # ----------------- Example driver for many morphs ----------------- #
 if __name__ == "__main__":
-    out_path = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\viz\surfaces\n_0"
+    out_path = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\param1\surfaces\n_0"
     for i in range(0,5):
         fpath = f"morph_config_n_{i+1}.json"
         json_path = os.path.join(out_path, fpath)
@@ -224,7 +224,7 @@ if __name__ == "__main__":
             mesh_path,
             cn,
             disp,
-            scale=20.0,                 # can increase to exaggerate arrow visibility
+            scale=2.0,                 # can increase to exaggerate arrow visibility
             screenshot_path=screenshot,
             window_size=(1600, 1200),
         )

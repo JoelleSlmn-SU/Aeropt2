@@ -106,6 +106,19 @@ class MainWindow(QMainWindow):
             if not ok:
                 QMessageBox.warning(self, "Connection Failed", "Falling back to local execution.")
                 self.run_mode = "Local"
+                
+        self.monitor_config = {
+            "interval": 50,
+            "enabled": True,
+            "monitors": [
+                {
+                    "type": "pressure_recovery",
+                    "name": "pressure_recovery",
+                    "enabled": True
+                }
+            ]
+        }
+        self.monitors_saved = False
 
     
     def get_project_basename(self):
@@ -382,6 +395,30 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.logger.log(f"[{action_name}][HPC][ERROR] Failed to refresh staged files: {e}")
             return False
+        
+    def stage_monitor_config_to_remote(self):
+        if self.run_mode != "HPC" or not getattr(self, "ssh_client", None):
+            return ""
+
+        import os, posixpath, json, tempfile
+        cfg = getattr(self, "monitor_config", None)
+        if not cfg:
+            return ""
+
+        local_tmp = tempfile.mkdtemp()
+        local_path = os.path.join(local_tmp, "monitors.json")
+        with open(local_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+
+        remote_path = posixpath.join(self.remote_output_dir, "orig", "monitors.json")
+        sftp = self.ssh_client.open_sftp()
+        try:
+            sftp.put(local_path, remote_path)
+        finally:
+            sftp.close()
+
+        self.logger.log(f"[MON] Uploaded monitor config to {remote_path}")
+        return remote_path
 
     def new_file(self):
         """Start a fresh project: clear viewers, state, docks, logs."""
@@ -724,6 +761,7 @@ class MainWindow(QMainWindow):
             ("Geometry Definition", self.open_geometry_window),
             ("Solver Settings", self.activate_tab_3),
             ("Optimisation Settings", self.activate_tab_2),
+            ("Monitors", self.open_monitor_editor),
             ("Train Mesh Classifier", self.on_train_mesh_classifier_clicked),
         ]
         
@@ -735,6 +773,7 @@ class MainWindow(QMainWindow):
             self.button_layout.addSpacing(12)
             
             if text == "Train Mesh Classifier":
+                self.button_layout.addSpacing(12)
                 self.train_mesh_classifier_btn = btn
                 
         self.train_mesh_classifier_btn.setEnabled(False)
@@ -810,9 +849,12 @@ class MainWindow(QMainWindow):
 
         # --- ask how many morphs ---
         from PyQt5.QtWidgets import QInputDialog
-        n_cases, ok = QInputDialog.getInt(self, "Morph", "How many morphed meshes would you like?", 5, 1, 1000, 1)
-        if not ok:
+        dialog = MorphDialog(self, default_cases=5)
+        if dialog.exec_() != QDialog.Accepted:
             return
+        vals = dialog.values()
+        n_cases = int(vals["n_cases"])
+        run_mode = str(vals["run_mode"])
 
         import os, json, posixpath, tempfile
         from datetime import datetime
@@ -843,13 +885,14 @@ class MainWindow(QMainWindow):
             "cad_units": getattr(self, "cad_units", "mm"),
             "parallel_domains": int(getattr(self, "parallel_domains", 80)),
             "n_cases": int(n_cases),
+            "run_mode": str(run_mode),
 
             # optional knobs (remoteMorph will default if missing)
             "coeff_sigma": 0.5,   # random coeff distribution
             "seed": None,         # or an int for repeatability
             "n_cases": n_cases,   # or however many
             "batch_size": 10,     # how many to run at once
-            "poll_s": 200         # how long to wait to check if batch has been run
+            "poll_s": 45         # how long to wait to check if batch has been run
         }
 
         with open(morph_json, "w", encoding="utf-8") as f:
@@ -931,6 +974,8 @@ class MainWindow(QMainWindow):
         if getattr(self, "run_mode", "") == "HPC":
             if not self._stage_before_hpc_run("SIM"):
                 return
+
+        self.stage_monitor_config_to_remote()
 
         # Launch on a worker thread
         from PyQt5.QtCore import QThread
@@ -1324,6 +1369,8 @@ class MainWindow(QMainWindow):
         if not self._stage_before_hpc_run("OPT"):
             return
         
+        monitor_remote_path = self.stage_monitor_config_to_remote()
+        
         remote_basis_path = self.export_morph_basis_for_opt(remote_run)
         if not remote_basis_path:
             self.logger.log("[OPT][WARN] Morph basis not available; optimisation may run with zero morphing.")
@@ -1348,6 +1395,7 @@ class MainWindow(QMainWindow):
         s["parallel"] = self.parallel
         # NEW: include path to morph_basis.json on the cluster
         s["morph_basis_json"] = remote_basis_path
+        s["monitor_config_json"] = monitor_remote_path
         
         s["base_name"] = self.base
         s["input_dir"] = posixpath.join(self.remote_output_dir, "orig")
@@ -1511,6 +1559,30 @@ class MainWindow(QMainWindow):
         self.logger.log(f"[TRAIN][HPC] Submitted: {out}")
         self.logger.log(f"[TRAIN][HPC] Run dir: {remote_run}")
 
+    def open_monitor_editor(self):
+        if not hasattr(self, "mesh_viewer") or self.mesh_viewer is None or self.mesh_viewer.mesh_obj is None:
+            QMessageBox.warning(self, "No mesh loaded", "Please load a mesh first so surface IDs can be selected.")
+            return
+
+        dlg = MonitorEditor(
+            parent=self,
+            mesh_obj=self.mesh_viewer.mesh_obj,
+            config=getattr(self, "monitor_config", None)
+        )
+        if dlg.exec_() == QDialog.Accepted:
+            self.monitor_config = dlg.get_config()
+            self.monitors_saved = True
+
+            # save locally if output dir exists
+            if getattr(self, "output_directory", None):
+                import json, os
+                out_path = os.path.join(self.output_directory, "monitors.json")
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(self.monitor_config, f, indent=2)
+                self.logger.log(f"[MON] Monitor settings saved to {out_path}")
+
+            n_mon = len(self.monitor_config.get("monitors", []))
+            self.logger.log(f"[MON] Saved {n_mon} monitor definition(s).")
 
     def create_stack_pages(self):
         """Create pages for the stacked layout."""
@@ -2290,7 +2362,7 @@ class ParallelSimEditor(QDialog):
         layout.addLayout(row_btns)
 
         # Pre-fill one sensible default row
-        self._add_row(defaults=["36000", "3", "1.2", "1e6", "1", "2", "1.0"])
+        self._add_row(defaults=["36000", "3", "1.3", "1e6", "1", "2", "1.0"])
 
         # OK/Cancel
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -2324,7 +2396,7 @@ class ParallelSimEditor(QDialog):
                     "AoA":        float(_txt(1)),
                     "Mach":       float(_txt(2))  if _txt(2)  else 1.2,
                     "Re":         float(_txt(3))  if _txt(3)  else 1e6,
-                    "TurbModel":  int(_txt(4))    if _txt(4)  else 2,
+                    "TurbModel":  int(_txt(4))    if _txt(4)  else 1,
                     "EngineFlow": int(_txt(5))    if _txt(5)  else 1,
                     "MassFlow":   float(_txt(6))  if _txt(6)  else 1.0
                 })
@@ -2592,7 +2664,7 @@ class ObjectiveEditor(QDialog):
                 "AoA":        float(_txt(1)) if _txt(1) else 3.0,
                 "Mach":       float(_txt(2)) if _txt(2) else 1.2,
                 "Re":         float(_txt(3)) if _txt(3) else 1e6,
-                "TurbModel":  int(_txt(4))   if _txt(4) else 2,
+                "TurbModel":  int(_txt(4))   if _txt(4) else 1,
                 "EngineFlow": int(_txt(5))   if _txt(5) else 1,
                 "MassFlow":   float(_txt(6)) if _txt(6) else 1.0,
                 "Weight":     float(_txt(7)) if _txt(7) else 1.0
@@ -2609,6 +2681,199 @@ class ObjectiveEditor(QDialog):
             "expression": expr,
             "conditions": conds,
             "constraints": cons
+        }
+        
+class MonitorEditor(QDialog):
+    def __init__(self, parent=None, mesh_obj=None, config=None):
+        super().__init__(parent)
+        self.setWindowTitle("Monitor Settings")
+        self.resize(820, 620)
+
+        self.mesh_obj = mesh_obj
+        self.config = config or {}
+
+        layout = QVBoxLayout(self)
+
+        # ---- interval ----
+        interval_row = QFormLayout()
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(1, 100000)
+        self.interval_spin.setValue(int(self.config.get("interval", 50)))
+        interval_row.addRow("Monitor interval (iterations):", self.interval_spin)
+        layout.addLayout(interval_row)
+
+        # ---- pressure recovery ----
+        self.pr_group = QGroupBox("Pressure Recovery")
+        pr_form = QFormLayout(self.pr_group)
+        self.pr_enable = QCheckBox("Enable pressure recovery monitor")
+        self.pr_enable.setChecked(self._find_enabled("pressure_recovery", default=True))
+        pr_form.addRow(self.pr_enable)
+
+        self.pr_surfaces = QListWidget()
+        self.pr_surfaces.setSelectionMode(QAbstractItemView.MultiSelection)
+        self._populate_surface_list(self.pr_surfaces, self._find_surface_ids("pressure_recovery"))
+        pr_form.addRow("Surfaces:", self.pr_surfaces)
+
+        layout.addWidget(self.pr_group)
+
+        # ---- drag ----
+        self.drag_group = QGroupBox("Drag Monitor")
+        drag_form = QFormLayout(self.drag_group)
+
+        self.drag_enable = QCheckBox("Enable drag monitor")
+        self.drag_enable.setChecked(self._find_enabled("drag", default=False))
+        drag_form.addRow(self.drag_enable)
+
+        self.drag_name = QLineEdit(self._find_name("drag", "drag"))
+        drag_form.addRow("Name:", self.drag_name)
+
+        self.drag_dir = QComboBox()
+        self.drag_dir.addItems(["x", "y", "z"])
+        self.drag_dir.setCurrentText(self._find_direction("drag", "x"))
+        drag_form.addRow("Direction:", self.drag_dir)
+
+        self.drag_sym = QComboBox()
+        self.drag_sym.addItems(["1", "2", "4"])
+        self.drag_sym.setCurrentText(str(int(self._find_symmetry("drag", 2))))
+        drag_form.addRow("Symmetry factor:", self.drag_sym)
+
+        self.drag_surfaces = QListWidget()
+        self.drag_surfaces.setSelectionMode(QAbstractItemView.MultiSelection)
+        self._populate_surface_list(self.drag_surfaces, self._find_surface_ids("drag"))
+        drag_form.addRow("Surfaces:", self.drag_surfaces)
+
+        layout.addWidget(self.drag_group)
+
+        # ---- lift ----
+        self.lift_group = QGroupBox("Lift Monitor")
+        lift_form = QFormLayout(self.lift_group)
+
+        self.lift_enable = QCheckBox("Enable lift monitor")
+        self.lift_enable.setChecked(self._find_enabled("lift", default=False))
+        lift_form.addRow(self.lift_enable)
+
+        self.lift_name = QLineEdit(self._find_name("lift", "lift"))
+        lift_form.addRow("Name:", self.lift_name)
+
+        self.lift_dir = QComboBox()
+        self.lift_dir.addItems(["x", "y", "z"])
+        self.lift_dir.setCurrentText(self._find_direction("lift", "z"))
+        lift_form.addRow("Direction:", self.lift_dir)
+
+        self.lift_sym = QComboBox()
+        self.lift_sym.addItems(["1", "2", "4"])
+        self.lift_sym.setCurrentText(str(int(self._find_symmetry("lift", 2))))
+        lift_form.addRow("Symmetry factor:", self.lift_sym)
+
+        self.lift_surfaces = QListWidget()
+        self.lift_surfaces.setSelectionMode(QAbstractItemView.MultiSelection)
+        self._populate_surface_list(self.lift_surfaces, self._find_surface_ids("lift"))
+        lift_form.addRow("Surfaces:", self.lift_surfaces)
+
+        layout.addWidget(self.lift_group)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._validate_and_accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _all_surface_items(self):
+        if self.mesh_obj is None:
+            return []
+        out = []
+        for name in self.mesh_obj.get_surface_names():
+            try:
+                sid = int(self.mesh_obj.get_surface_id(name))
+                out.append((sid, name))
+            except Exception:
+                pass
+        return out
+
+    def _populate_surface_list(self, widget, selected_ids):
+        selected_ids = set(int(x) for x in (selected_ids or []))
+        for sid, name in self._all_surface_items():
+            item = QListWidgetItem(f"{sid} : {name}")
+            item.setData(Qt.UserRole, sid)
+            widget.addItem(item)
+            if sid in selected_ids:
+                item.setSelected(True)
+
+    def _selected_surface_ids(self, widget):
+        out = []
+        for item in widget.selectedItems():
+            sid = item.data(Qt.UserRole)
+            if sid is not None:
+                out.append(int(sid))
+        return out
+
+    def _find_monitor(self, mtype):
+        for m in self.config.get("monitors", []):
+            if str(m.get("type", "")).strip().lower() == mtype:
+                return m
+        return {}
+
+    def _find_enabled(self, mtype, default=False):
+        return bool(self._find_monitor(mtype).get("enabled", default))
+
+    def _find_name(self, mtype, default):
+        return str(self._find_monitor(mtype).get("name", default))
+
+    def _find_direction(self, mtype, default):
+        return str(self._find_monitor(mtype).get("direction", default))
+
+    def _find_symmetry(self, mtype, default):
+        return float(self._find_monitor(mtype).get("symmetry_factor", default))
+
+    def _find_surface_ids(self, mtype):
+        return list(self._find_monitor(mtype).get("surface_ids", []))
+
+    def _validate_and_accept(self):
+        if self.pr_enable.isChecked() and not self._selected_surface_ids(self.pr_surfaces):
+            QMessageBox.warning(self, "Pressure recovery monitor", "Please select at least one surface for pressure recovery.")
+            return
+        if self.drag_enable.isChecked() and not self._selected_surface_ids(self.drag_surfaces):
+            QMessageBox.warning(self, "Drag monitor", "Please select at least one surface for drag.")
+            return
+        if self.lift_enable.isChecked() and not self._selected_surface_ids(self.lift_surfaces):
+            QMessageBox.warning(self, "Lift monitor", "Please select at least one surface for lift.")
+            return
+        self.accept()
+
+    def get_config(self):
+        monitors = []
+
+        if self.pr_enable.isChecked():
+            monitors.append({
+                "type": "pressure_recovery",
+                "name": "pressure_recovery",
+                "enabled": True,
+                "surface_ids": self._selected_surface_ids(self.pr_surfaces),
+            })
+
+        if self.drag_enable.isChecked():
+            monitors.append({
+                "type": "drag",
+                "name": self.drag_name.text().strip() or "drag",
+                "enabled": True,
+                "surface_ids": self._selected_surface_ids(self.drag_surfaces),
+                "direction": self.drag_dir.currentText(),
+                "symmetry_factor": int(self.drag_sym.currentText())
+            })
+
+        if self.lift_enable.isChecked():
+            monitors.append({
+                "type": "lift",
+                "name": self.lift_name.text().strip() or "lift",
+                "enabled": True,
+                "surface_ids": self._selected_surface_ids(self.lift_surfaces),
+                "direction": self.lift_dir.currentText(),
+                "symmetry_factor": int(self.lift_sym.currentText())
+            })
+
+        return {
+            "interval": int(self.interval_spin.value()),
+            "enabled": True,
+            "monitors": monitors
         }
 
 class TrainMeshClassifierDialog(QDialog):
@@ -2644,7 +2909,47 @@ class TrainMeshClassifierDialog(QDialog):
 
     def values(self):
         return int(self.n_cases.value()), int(self.batch_size.value()), int(self.poll_s.value())
+    
 
+class MorphDialog(QDialog):
+    def __init__(self, parent=None, default_cases: int = 5):
+        super().__init__(parent)
+        self.setWindowTitle("Run Morph Cases")
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.n_cases_spin = QSpinBox()
+        self.n_cases_spin.setRange(1, 10000)
+        self.n_cases_spin.setValue(int(default_cases))
+        form.addRow("Number of cases:", self.n_cases_spin)
+        layout.addLayout(form)
+
+        mode_group = QGroupBox("Run mode")
+        mode_layout = QVBoxLayout(mode_group)
+        self.rb_displacements = QRadioButton("Generate displacement vectors only")
+        self.rb_morph_only = QRadioButton("Generate morphs")
+        self.rb_morph_and_volume = QRadioButton("Generate morphs and volume meshes")
+        self.rb_morph_only.setChecked(True)
+        mode_layout.addWidget(self.rb_displacements)
+        mode_layout.addWidget(self.rb_morph_only)
+        mode_layout.addWidget(self.rb_morph_and_volume)
+        layout.addWidget(mode_group)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def values(self):
+        if self.rb_displacements.isChecked():
+            run_mode = "disp"
+        elif self.rb_morph_and_volume.isChecked():
+            run_mode = "vol"
+        else:
+            run_mode = "morph"
+        return {"n_cases": int(self.n_cases_spin.value()), "run_mode": run_mode}
+    
 
 class BoundsDialog(QDialog):
     def __init__(self, meta, lb, ub, parent=None):

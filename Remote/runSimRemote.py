@@ -9,10 +9,11 @@ from scipy.spatial import cKDTree
 # project paths
 sys.path.append(os.path.dirname("ConvertFileType"))
 sys.path.append(os.path.dirname("MeshGeneration"))
+sys.path.append(os.path.dirname("ShapeParameterization"))
 sys.path.append(os.path.dirname("FileRW"))
 
 from ConvertFileType.convertVtmtoFro import vtm_to_fro
-from MeshGeneration.controlNodeDisp import (
+from ShapeParameterization.controlNodeDisp import (
     _surface_normals,
     _map_normals_to_control,
     _spectral_coeffs,

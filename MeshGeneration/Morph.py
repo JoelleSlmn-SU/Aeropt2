@@ -20,7 +20,7 @@ from MeshGeneration.ShapeParameterSelection import *
 from MeshGeneration.BasisFunctions import get_bf
 from Utilities.PointClouds import *
 from ConvertFileType.convertFrotoEnsight import convert_fro_to_ensight
-from MeshFailureClassifier.sweep.classifier_inputs import *
+from MeshFailureClassifier.classifier_inputs import *
 
 colors = [
     Color("red").hex_rgb,
@@ -124,6 +124,102 @@ def dedup_sf(S, F, tol=1e-6):
     uniq_idx = np.sort(uniq_idx)
     return S[uniq_idx], F[uniq_idx]
 
+def compute_adaptive_rbf_params(control_nodes, d_verts, anchor_points=None,
+                                k_nn=3,
+                                beta=1.0,
+                                min_clip_frac=0.01,
+                                max_clip_frac=0.15):
+    """
+    Returns:
+        min_R_frac, fallback_R_frac, R_scale
+
+    Idea:
+      - Use kNN spacing between control nodes as the main locality measure
+      - Convert to fractions of the T/U patch scale L
+      - Keep R_scale as the main global multiplier knob
+    """
+    ctrl = np.asarray(control_nodes, dtype=float)
+    T = np.asarray(d_verts, dtype=float)
+
+    if ctrl.ndim != 2 or ctrl.shape[1] != 3:
+        raise ValueError(f"control_nodes must be (N,3), got {ctrl.shape}")
+    if T.ndim != 2 or T.shape[1] != 3:
+        raise ValueError(f"d_verts must be (M,3), got {T.shape}")
+
+    # Patch scale used by transformT internally as well
+    mins = T.min(axis=0)
+    maxs = T.max(axis=0)
+    L = float(np.linalg.norm(maxs - mins))
+    L = max(L, 1e-12)
+
+    n_ctrl = ctrl.shape[0]
+
+    # ---- one-control special case ----
+    if n_ctrl == 1:
+        if anchor_points is not None and len(anchor_points) > 0:
+            A = np.asarray(anchor_points, dtype=float).reshape(-1, 3)
+            da = np.linalg.norm(A - ctrl[0][None, :], axis=1)
+            d_ref = float(np.median(da)) if da.size else 0.05 * L
+        else:
+            d_ref = 0.05 * L
+
+        d_ref = float(np.clip(d_ref, min_clip_frac * L, max_clip_frac * L))
+        min_R_frac = d_ref / L
+        fallback_R_frac = d_ref / L
+        R_scale = beta
+        return min_R_frac, fallback_R_frac, R_scale
+
+    # ---- control-node kNN spacing ----
+    try:
+        from scipy.spatial import cKDTree
+        tree = cKDTree(ctrl)
+        k_eff = min(max(2, k_nn + 1), n_ctrl)   # +1 because self is included
+        dists, _ = tree.query(ctrl, k=k_eff)
+        # last column = distance to k_nn-th neighbour
+        d_knn = dists[:, -1]
+    except Exception:
+        # fallback brute force
+        diff = ctrl[:, None, :] - ctrl[None, :, :]
+        D = np.linalg.norm(diff, axis=2)
+        np.fill_diagonal(D, np.inf)
+        k_eff = min(max(1, k_nn), n_ctrl - 1)
+        d_knn = np.partition(D, kth=k_eff - 1, axis=1)[:, k_eff - 1]
+
+    d_knn = np.asarray(d_knn, float)
+    d_knn = d_knn[np.isfinite(d_knn)]
+    if d_knn.size == 0:
+        d_knn = np.array([0.05 * L], dtype=float)
+
+    # Robust spacing stats
+    d_p10 = float(np.percentile(d_knn, 10))
+    d_p50 = float(np.percentile(d_knn, 50))
+    d_p90 = float(np.percentile(d_knn, 90))
+
+    # Clip to sensible fractions of patch size
+    d_min = float(np.clip(d_p10, min_clip_frac * L, max_clip_frac * L))
+    d_typ = float(np.clip(d_p50, min_clip_frac * L, max_clip_frac * L))
+    d_max = float(np.clip(d_p90, min_clip_frac * L, max_clip_frac * L))
+
+    # Convert to transformT-style parameters
+    min_R_frac = d_min / L
+    fallback_R_frac = d_typ / L
+
+    # beta is your main locality knob:
+    #   smaller beta -> more local
+    #   larger beta  -> smoother / more global
+    R_scale = float(beta)
+
+    print(
+        "[ADAPT-RBF] "
+        f"L={L:.6f}, "
+        f"d10={d_p10:.6f}, d50={d_p50:.6f}, d90={d_p90:.6f}, "
+        f"min_R_frac={min_R_frac:.6f}, "
+        f"fallback_R_frac={fallback_R_frac:.6f}, "
+        f"R_scale={R_scale:.6f}"
+    )
+
+    return min_R_frac, fallback_R_frac, R_scale
+
 class DummyLogger:
     def log(self, msg):
         print(msg)
@@ -183,12 +279,37 @@ def MorphMesh(mesh_in: FroFile, base_name, morph_model, viewer, output_dir,
     if len(anchor_gids) == len(d_gids):
         logger.log("[WARNING] All D nodes are anchored to C. Nothing can move.")
 
+    min_R_frac, fallback_R_frac, R_scale = compute_adaptive_rbf_params(
+        control_nodes=morph_model.control_nodes,
+        d_verts=d_verts,
+        anchor_points=anchor_points,
+        k_nn=5,
+        beta=2.0,        # < 1.0 = more local, > 1.0 = smoother
+        min_clip_frac=0.01,
+        max_clip_frac=0.4,
+    )
+
+    # optional: tighten seam correction a bit too
+    corr_R_frac = max(0.5 * min_R_frac, 0.008)
+    corr_band_frac = max(0.75 * fallback_R_frac, 0.02)
+
+    print(
+        "[ADAPT-RBF] "
+        f"corr_R_frac={corr_R_frac:.6f}, "
+        f"corr_band_frac={corr_band_frac:.6f}"
+    )
+
     # deform D directly
     d_verts_m = morph_model.transformT(
         d_verts,
         anchor_points=anchor_points,
-        anchor_taper=False,        # <-- this restores variance
-        boundary_recover=True,     # <-- seam fixed via pass-2 correction
+        min_R_frac=min_R_frac,
+        fallback_R_frac=fallback_R_frac,
+        R_scale=R_scale,
+        anchor_taper=False,
+        boundary_recover=True,
+        corr_R_frac=corr_R_frac,
+        corr_band_frac=corr_band_frac,
     )
 
     # split D back into T and U using the gid→local maps
