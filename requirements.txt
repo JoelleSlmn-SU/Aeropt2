@@ -18,3 +18,4 @@ pyOpenGL>=3.1.10
 cma>=4.4.0
 networkx>=3.4,<3.5
 shap
+pillow

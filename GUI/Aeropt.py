@@ -79,6 +79,15 @@ class MainWindow(QMainWindow):
         self.control_node_source = "mesh"
         
         self.use_pca_reduced = False
+        self.restart_from_previous = False
+        self.previous_solution_config = {
+            "enabled": False,
+            "location": "remote",
+            "directory": "",
+            "base": "",
+            "Boundary_mode": "same_id",
+            "num_comp": 6,
+        }
         
         self.rbf_original = None
         self.rbf_current  = None
@@ -1396,6 +1405,7 @@ class MainWindow(QMainWindow):
         # NEW: include path to morph_basis.json on the cluster
         s["morph_basis_json"] = remote_basis_path
         s["monitor_config_json"] = monitor_remote_path
+        s["previous_solution"] = self.get_previous_solution_config_for_cluster()
         
         s["base_name"] = self.base
         s["input_dir"] = posixpath.join(self.remote_output_dir, "orig")
@@ -1999,6 +2009,39 @@ class MainWindow(QMainWindow):
 
         widget.setLayout(layout)
         return widget
+    
+    def get_previous_solution_config_for_cluster(self) -> dict:
+        cfg = dict(getattr(self, "previous_solution_config", {}) or {})
+        cfg["enabled"] = bool(getattr(self, "restart_from_previous", False)) and bool(cfg.get("directory")) and bool(cfg.get("base"))
+        cfg.setdefault("boundary_mode", "same_id")
+        cfg.setdefault("num_comp", 7)
+        return cfg
+    
+    def on_previous_solution_toggled(self, checked: bool):
+        if not checked:
+            self.restart_from_previous = False
+            self.previous_solution_config["enabled"] = False
+            if hasattr(self, "prev_solution_summary"):
+                self.prev_solution_summary.setText("No previous solution selected")
+            self.logger.log("[Solver] Previous-solution initialisation disabled.")
+            return
+
+        dlg = PreviousSolutionDialog(self)
+        if dlg.exec_() != QDialog.Accepted:
+            self.prev_solution_cb.blockSignals(True)
+            self.prev_solution_cb.setChecked(False)
+            self.prev_solution_cb.blockSignals(False)
+            self.restart_from_previous = False
+            self.previous_solution_config["enabled"] = False
+            return
+
+        cfg = dlg.values()
+        self.previous_solution_config = cfg
+        self.restart_from_previous = True
+
+        msg = f"{cfg['location']}: {cfg['directory']} | base={cfg['base']}"
+        self.prev_solution_summary.setText(msg)
+        self.logger.log(f"[Solver] Initialise from previous solution: {msg}")
 
     def create_solver_page(self):
         """Create the Solver page with a text editor for solver input files."""
@@ -2079,6 +2122,15 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(rung_grp)
         layout.addLayout(rg_btns)
+
+        self.prev_solution_cb = QCheckBox("Initialise from previous solution")
+        self.prev_solution_cb.setChecked(False)
+        self.prev_solution_cb.toggled.connect(self.on_previous_solution_toggled)
+        layout.addWidget(self.prev_solution_cb)
+
+        self.prev_solution_summary = QLabel("No previous solution selected")
+        self.prev_solution_summary.setStyleSheet("color: #555;")
+        layout.addWidget(self.prev_solution_summary)
 
         # Text editor
         self.solver_editor = QPlainTextEdit()
@@ -2328,6 +2380,264 @@ class MainWindow(QMainWindow):
             print(f"[DEBUG] Error during MainWindow close: {e}")
         event.accept()
 
+
+class PreviousSolutionDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.main = parent
+        self.setWindowTitle("Initialise from Previous Solution")
+        self.resize(760, 460)
+
+        layout = QVBoxLayout(self)
+
+        mode_row = QHBoxLayout()
+        self.local_rb = QRadioButton("Local")
+        self.remote_rb = QRadioButton("Remote")
+        self.remote_rb.setChecked(getattr(parent, "run_mode", "") == "HPC")
+        self.local_rb.setChecked(not self.remote_rb.isChecked())
+        mode_row.addWidget(QLabel("Solution location:"))
+        mode_row.addWidget(self.local_rb)
+        mode_row.addWidget(self.remote_rb)
+        mode_row.addStretch()
+        layout.addLayout(mode_row)
+
+        path_row = QHBoxLayout()
+        self.path_edit = QLineEdit()
+        self.path_edit.setPlaceholderText("Select or type previous solution directory...")
+        self.browse_btn = QPushButton("Browse")
+        self.up_btn = QPushButton("Up")
+        path_row.addWidget(self.path_edit, 1)
+        path_row.addWidget(self.browse_btn)
+        path_row.addWidget(self.up_btn)
+        layout.addLayout(path_row)
+
+        self.dir_list = QListWidget()
+        layout.addWidget(self.dir_list, 1)
+
+        base_row = QHBoxLayout()
+        self.base_edit = QLineEdit()
+        self.base_edit.setPlaceholderText("Previous base name, e.g. corner_1")
+        self.detect_btn = QPushButton("Auto-detect base")
+        base_row.addWidget(QLabel("Previous base:"))
+        base_row.addWidget(self.base_edit, 1)
+        base_row.addWidget(self.detect_btn)
+        layout.addLayout(base_row)
+
+        opts_row = QHBoxLayout()
+        self.num_comp_spin = QSpinBox()
+        self.num_comp_spin.setRange(1, 20)
+        self.num_comp_spin.setValue(7)
+
+        self.boundary_combo = QComboBox()
+        self.boundary_combo.addItems(["same_id", "nearest", "none"])
+
+        opts_row.addWidget(QLabel("Components:"))
+        opts_row.addWidget(self.num_comp_spin)
+        opts_row.addWidget(QLabel("Boundary mode:"))
+        opts_row.addWidget(self.boundary_combo)
+        opts_row.addStretch()
+        layout.addLayout(opts_row)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #555;")
+        layout.addWidget(self.status_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.validate_btn = QPushButton("Validate")
+        buttons.addButton(self.validate_btn, QDialogButtonBox.ActionRole)
+        layout.addWidget(buttons)
+
+        self.browse_btn.clicked.connect(self.browse)
+        self.up_btn.clicked.connect(self.go_up)
+        self.detect_btn.clicked.connect(self.auto_detect_base)
+        self.validate_btn.clicked.connect(self.validate_selection)
+        self.dir_list.itemDoubleClicked.connect(self.enter_selected_dir)
+        self.local_rb.toggled.connect(self.refresh_mode)
+
+        buttons.accepted.connect(self.accept_if_valid)
+        buttons.rejected.connect(self.reject)
+
+        cfg = getattr(parent, "previous_solution_config", {}) or {}
+        self.path_edit.setText(cfg.get("directory", ""))
+        self.base_edit.setText(cfg.get("base", ""))
+        self.num_comp_spin.setValue(int(cfg.get("num_comp", 7)))
+        self.boundary_combo.setCurrentText(cfg.get("boundary_mode", "same_id"))
+
+        if self.path_edit.text().strip():
+            self.refresh_listing()
+
+    def is_remote(self):
+        return self.remote_rb.isChecked()
+
+    def refresh_mode(self):
+        self.dir_list.clear()
+        self.status_label.setText("")
+
+    def browse(self):
+        if self.is_remote():
+            start = self.path_edit.text().strip()
+            if not start:
+                start = f"/scratch/{self.main.ssh_creds['username']}/aeropt/aeropt_out"
+            self.path_edit.setText(start)
+            self.refresh_listing()
+        else:
+            start = self.path_edit.text().strip() or getattr(self.main, "output_directory", os.getcwd())
+            d = QFileDialog.getExistingDirectory(self, "Select Previous Solution Directory", start)
+            if d:
+                self.path_edit.setText(d)
+                self.refresh_listing()
+                self.auto_detect_base()
+
+    def _remote_listdir(self, path):
+        sftp = self.main.ssh_client.open_sftp()
+        try:
+            entries = sftp.listdir_attr(path)
+        finally:
+            sftp.close()
+
+        dirs = []
+        files = []
+        import stat
+        for e in entries:
+            if stat.S_ISDIR(e.st_mode):
+                dirs.append(e.filename)
+            else:
+                files.append(e.filename)
+        return sorted(dirs), sorted(files)
+
+    def refresh_listing(self):
+        path = self.path_edit.text().strip()
+        self.dir_list.clear()
+        if not path:
+            return
+
+        try:
+            if self.is_remote():
+                dirs, files = self._remote_listdir(path)
+            else:
+                dirs = sorted([x for x in os.listdir(path) if os.path.isdir(os.path.join(path, x))])
+                files = sorted([x for x in os.listdir(path) if os.path.isfile(os.path.join(path, x))])
+
+            for d in dirs:
+                self.dir_list.addItem(f"📁 {d}")
+            for f in files:
+                if f.endswith((".unk", ".res", ".plt", ".rsd", ".rst", ".inp", ".reg")):
+                    self.dir_list.addItem(f"   {f}")
+
+            self.status_label.setText(f"Listed: {path}")
+        except Exception as e:
+            self.status_label.setStyleSheet("color: #a33;")
+            self.status_label.setText(f"Could not list directory: {e}")
+
+    def enter_selected_dir(self, item):
+        txt = item.text().strip()
+        if not txt.startswith("📁"):
+            return
+
+        name = txt.replace("📁", "", 1).strip()
+        cur = self.path_edit.text().strip()
+
+        if self.is_remote():
+            import posixpath
+            new_path = posixpath.normpath(posixpath.join(cur, name))
+        else:
+            new_path = os.path.normpath(os.path.join(cur, name))
+
+        self.path_edit.setText(new_path)
+        self.refresh_listing()
+        self.auto_detect_base()
+
+    def go_up(self):
+        cur = self.path_edit.text().strip()
+        if not cur:
+            return
+        if self.is_remote():
+            import posixpath
+            self.path_edit.setText(posixpath.dirname(cur.rstrip("/")))
+        else:
+            self.path_edit.setText(os.path.dirname(cur.rstrip("/\\")))
+        self.refresh_listing()
+
+    def _list_files(self, path):
+        if self.is_remote():
+            _dirs, files = self._remote_listdir(path)
+            return files
+        return os.listdir(path)
+
+    def auto_detect_base(self):
+        path = self.path_edit.text().strip()
+        if not path:
+            return
+
+        try:
+            files = self._list_files(path)
+            candidates = []
+            for f in files:
+                root, ext = os.path.splitext(f)
+                if ext in [".unk", ".res"]:
+                    candidates.append(root)
+
+            # Prefer .unk base if available
+            unk_bases = [os.path.splitext(f)[0] for f in files if f.endswith(".unk")]
+            if unk_bases:
+                self.base_edit.setText(sorted(unk_bases)[0])
+            elif candidates:
+                self.base_edit.setText(sorted(candidates)[0])
+
+            if self.base_edit.text():
+                self.status_label.setStyleSheet("color: #285;")
+                self.status_label.setText(f"Detected base: {self.base_edit.text()}")
+        except Exception as e:
+            self.status_label.setStyleSheet("color: #a33;")
+            self.status_label.setText(f"Auto-detect failed: {e}")
+
+    def validate_selection(self):
+        path = self.path_edit.text().strip()
+        base = self.base_edit.text().strip()
+
+        if not path or not base:
+            self.status_label.setStyleSheet("color: #a33;")
+            self.status_label.setText("Please select a directory and provide a base name.")
+            return False
+
+        try:
+            files = self._list_files(path)
+            has_unk = f"{base}.unk" in files
+            has_res = f"{base}.res" in files
+            has_plotreg = "plotreg.reg" in files
+
+            if not has_unk and not has_res:
+                self.status_label.setStyleSheet("color: #a33;")
+                self.status_label.setText(f"Missing {base}.unk or {base}.res.")
+                return False
+
+            if has_res and not has_plotreg:
+                self.status_label.setStyleSheet("color: #a33;")
+                self.status_label.setText("Found .res but missing plotreg.reg, so makeplot2 cannot create .unk.")
+                return False
+
+            self.status_label.setStyleSheet("color: #285;")
+            self.status_label.setText("Previous solution looks valid.")
+            return True
+
+        except Exception as e:
+            self.status_label.setStyleSheet("color: #a33;")
+            self.status_label.setText(f"Validation failed: {e}")
+            return False
+
+    def accept_if_valid(self):
+        if self.validate_selection():
+            self.accept()
+
+    def values(self):
+        return {
+            "enabled": True,
+            "location": "remote" if self.is_remote() else "local",
+            "directory": self.path_edit.text().strip(),
+            "base": self.base_edit.text().strip(),
+            "boundary_mode": self.boundary_combo.currentText(),
+            "num_comp": int(self.num_comp_spin.value()),
+        }
 
 # Objective Editor (GUI)
 class ParallelSimEditor(QDialog):
@@ -2713,8 +3023,22 @@ class MonitorEditor(QDialog):
         self.pr_surfaces.setSelectionMode(QAbstractItemView.MultiSelection)
         self._populate_surface_list(self.pr_surfaces, self._find_surface_ids("pressure_recovery"))
         pr_form.addRow("Surfaces:", self.pr_surfaces)
-
+        
         layout.addWidget(self.pr_group)
+        
+        # ---- DC60 ----
+        self.dc_group = QGroupBox("Distortion")
+        dc_form = QFormLayout(self.dc_group)
+        self.dc_enable = QCheckBox("Enable distortion monitor")
+        self.dc_enable.setChecked(self._find_enabled("distortion", default=True))
+        dc_form.addRow(self.dc_enable)
+
+        self.dc_surfaces = QListWidget()
+        self.dc_surfaces.setSelectionMode(QAbstractItemView.MultiSelection)
+        self._populate_surface_list(self.dc_surfaces, self._find_surface_ids("distortion"))
+        dc_form.addRow("Surfaces:", self.dc_surfaces)
+
+        layout.addWidget(self.dc_group)
 
         # ---- drag ----
         self.drag_group = QGroupBox("Drag Monitor")
@@ -2831,6 +3155,9 @@ class MonitorEditor(QDialog):
         if self.pr_enable.isChecked() and not self._selected_surface_ids(self.pr_surfaces):
             QMessageBox.warning(self, "Pressure recovery monitor", "Please select at least one surface for pressure recovery.")
             return
+        if self.dc_enable.isChecked() and not self._selected_surface_ids(self.dc_surfaces):
+            QMessageBox.warning(self, "DC60 monitor", "Please select at least one surface for distortion.")
+            return
         if self.drag_enable.isChecked() and not self._selected_surface_ids(self.drag_surfaces):
             QMessageBox.warning(self, "Drag monitor", "Please select at least one surface for drag.")
             return
@@ -2848,6 +3175,14 @@ class MonitorEditor(QDialog):
                 "name": "pressure_recovery",
                 "enabled": True,
                 "surface_ids": self._selected_surface_ids(self.pr_surfaces),
+            })
+            
+        if self.dc_enable.isChecked():
+            monitors.append({
+                "type": "distortion",
+                "name": "distortion",
+                "enabled": True,
+                "surface_ids": self._selected_surface_ids(self.dc_surfaces),
             })
 
         if self.drag_enable.isChecked():

@@ -104,6 +104,13 @@ class ClusterPipelineManager:
         self.monitor_config_json = config_dict.get("monitor_config_json", "")
         self.monitor_interval = int(config_dict.get("monitor_interval", 50))
         
+        self.previous_solution = config_dict.get("previous_solution", {}) or {}
+        self.restart_from_previous = bool(self.previous_solution.get("enabled", False))
+        self.interpu_script = config_dict.get(
+            "interpu_script",
+            "$HOME/aeropt/Scripts/Utilities/interpu.py"
+        )
+        
         self.job_ids = {}
         pp = int(config_dict.get("parallel_processes", 160))
         self.sol_parallel_domains = max(1, pp)
@@ -319,7 +326,92 @@ class ClusterPipelineManager:
         self.job_ids[f"guardcheck_{tag_slug}"] = check_job
         self.job_ids[f"guarddecide_{tag_slug}"] = decide_job
         return decide_job
+    
+    def _append_previous_solution_initialisation(self, bf, sol_dir: str):
+        """
+        Add interpu-based initialisation lines to solver batchfile.
+        Must be called after the new .inp has been copied/patched.
+        """
+        if not self.restart_from_previous:
+            return
 
+        prev = self.previous_solution
+        old_dir = prev.get("directory", "").strip()
+        old_base = prev.get("base", "").strip()
+        boundary_mode = prev.get("boundary_mode", "same_id")
+        num_comp = int(prev.get("num_comp", 7))
+
+        new_base = f"{self.base_name}_{self.n}"
+
+        if not old_dir or not old_base:
+            bf.lines.append('echo "[INTERPU][WARN] Previous solution enabled but old_dir/old_base missing."')
+            bf.lines.append("exit 2")
+            return
+
+        bf.lines.append("")
+        bf.lines.append(f"cp base.plt {new_base}.plt")
+        bf.lines.append("# ---------------- Previous-solution interpolation ----------------")
+        bf.lines.append('echo "[INTERPU] Initialising solution from previous run..."')
+        bf.lines.append(f'OLD_DIR="{old_dir}"')
+        bf.lines.append(f'OLD_BASE="{old_base}"')
+        bf.lines.append(f'NEW_DIR="{sol_dir}"')
+        bf.lines.append(f'NEW_BASE="{new_base}"')
+        bf.lines.append(f'SCRIPT="{self.interpu_script}"')
+        bf.lines.append(f'NUM_COMP="{num_comp}"')
+        bf.lines.append(f'BOUNDARY_MODE="{boundary_mode}"')
+        bf.lines.append(f'MAKEPLOT_EXE="{self.makeplot_exe}"')
+        bf.lines.append(f'SPLITPLOT_EXE="{self.splitplot_exe}"')
+
+        bf.lines.append('if [ ! -d "$OLD_DIR" ]; then echo "[INTERPU][ERROR] OLD_DIR missing: $OLD_DIR"; exit 2; fi')
+        bf.lines.append('if [ ! -f "$OLD_DIR/${OLD_BASE}.unk" ]; then')
+        bf.lines.append('  echo "[INTERPU] ${OLD_BASE}.unk not found; creating from ${OLD_BASE}.res"')
+        bf.lines.append('  cd "$OLD_DIR"')
+        bf.lines.append('  "$MAKEPLOT_EXE" <<EOF')
+        bf.lines.append('plotreg.reg')
+        bf.lines.append('${OLD_BASE}.res')
+        bf.lines.append('${OLD_BASE}.unk')
+        bf.lines.append('F')
+        bf.lines.append('T')
+        bf.lines.append('EOF')
+        bf.lines.append('fi')
+
+        bf.lines.append('cd "$NEW_DIR"')
+        bf.lines.append('python "$SCRIPT" \\')
+        bf.lines.append('  --old-dir "$OLD_DIR" \\')
+        bf.lines.append('  --old-base "$OLD_BASE" \\')
+        bf.lines.append('  --new-dir "$NEW_DIR" \\')
+        bf.lines.append('  --new-base "$NEW_BASE" \\')
+        bf.lines.append('  --boundary-mode "$BOUNDARY_MODE" \\')
+        bf.lines.append('  --num-comp "$NUM_COMP"')
+
+        bf.lines.append('if [ ! -s "${NEW_BASE}.unk" ]; then')
+        bf.lines.append('  echo "[INTERPU][ERROR] Failed to create non-empty ${NEW_BASE}.unk"')
+        bf.lines.append('  exit 3')
+        bf.lines.append('fi')
+        
+        bf.lines.append('  "$SPLITPLOT_EXE" <<EOF')
+        bf.lines.append('plotreg.reg')
+        bf.lines.append('${NEW_BASE}.unk')
+        bf.lines.append('${NEW_BASE}.rst')
+        bf.lines.append('T')
+        bf.lines.append('EOF')
+        bf.lines.append('fi')
+
+        bf.lines.append("# Force solver restartNumber = 1 only after .unk exists")
+        bf.lines.append("python3 - <<'PY'")
+        bf.lines.append("import re")
+        bf.lines.append(f"p = '{new_base}.inp'")
+        bf.lines.append("with open(p, 'r', encoding='utf-8', errors='ignore') as f:")
+        bf.lines.append("    txt = f.read()")
+        bf.lines.append(r"pat = r'(?im)^(?P<p>\s*ivd%restartNumber\s*=\s*)(?P<n>\d+)(?P<trail>\s*,?)'")
+        bf.lines.append("txt2, n = re.subn(pat, r'\\g<p>1\\g<trail>', txt, count=1)")
+        bf.lines.append("if n == 0:")
+        bf.lines.append("    print('[INTERPU][WARN] ivd%restartNumber not found; appending it')")
+        bf.lines.append("    txt2 = txt.rstrip() + '\\nivd%restartNumber = 1,\\n'")
+        bf.lines.append("with open(p, 'w', encoding='utf-8', newline='\\n') as f:")
+        bf.lines.append("    f.write(txt2)")
+        bf.lines.append("print('[INTERPU] restartNumber set to 1')")
+        bf.lines.append("PY")
 
     def _write_morph_config(self):
         """Write morph configuration JSON for one design (self.n)."""
@@ -879,6 +971,7 @@ class ClusterPipelineManager:
         bf.lines.append("PY")
         bf.lines.append("")
         
+        self._append_previous_solution_initialisation(bf, sol_dir)
         
         # Safe defaults used later by PR monitor / ensight conversion
         mach_for_post = float(cond.get("Mach", cond.get("M", 1.0)))

@@ -144,7 +144,8 @@ def orchestrate_run(run_dir: str):
         wait_tag = None
 
         for n in range(i, j_end + 1):
-            modal_coeffs = (rng.normal(0.0, sigma, size=coeff_len)).tolist()
+            #modal_coeffs = (rng.normal(0.0, sigma, size=coeff_len)).tolist()
+            modal_coeffs = (rng.normal(1.0, 1.0, size=coeff_len)).tolist()
 
             config = {
                 "remote_output": remote_output,

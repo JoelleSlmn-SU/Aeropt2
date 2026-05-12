@@ -248,7 +248,7 @@ def animate_fro_morph_surface(
     pl = pv.Plotter(off_screen=True)
     pl.set_background("white")
 
-    pl.add_mesh(base_mesh, color="white", style="wireframe", line_width=0.01, opacity=0.1, show_scalar_bar=False)
+    pl.add_mesh(base_mesh, color="white", style="wireframe", line_width=0.03, opacity=0.1, show_scalar_bar=False)
     #pl.add_mesh(base_mesh, opacity=base_opacity, show_edges=False, show_scalar_bar=False)
 
     if color_by_displacement:
@@ -612,14 +612,14 @@ if __name__ == "__main__":
     from pathlib import Path
     
     folder = [
-        "param3"
+        "param4"
     ]
 
     #x_case = 7
     gen = "0"
     filename = "corner"
     
-    for x_case in range(43,201):
+    for x_case in range(1,11):
         base = Path(r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples")
         case_root = base / folder[0]
 
@@ -627,7 +627,7 @@ if __name__ == "__main__":
         morp_fro = str(case_root / "surfaces" / f"n_{gen}" / f"{filename}_{str(x_case)}.fro")
         cfg_json = str(case_root / "surfaces" / f"n_{gen}" / f"morph_config_n_1.json")
 
-        # 1) MP4 animations└
+        # 1) MP4 animations
         surfaces = get_surfaces_from_morph_config(cfg_json, mode="T")
         out_1 = str(case_root / "surfaces" / f"n_{gen}" / f"n0_{str(x_case)}_morph_TU")
         out_2 = str(case_root / "surfaces" / f"n_{gen}" / f"n0_{str(x_case)}_morph_split_TU")
@@ -639,7 +639,7 @@ if __name__ == "__main__":
             save_mp4=False, save_gif=True,
         )
         
-        '''animate_split_screen_fro_surface_both(
+        '''animate_split_screen_fro_surface_both(○
             orig_fro, morp_fro, surface_id=surfaces,
             out_path=out_2,
             n_frames=90, fps=25, deform_scale=1.5,
@@ -648,7 +648,7 @@ if __name__ == "__main__":
 
         # 2) Interactive mesh
         export = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Morph\surfaces\n_0"
-        surfaces = get_surfaces_from_morph_config(cfg_json, mode="T")
-        #interactive_fro_morph_surface(orig_fro, morp_fro, surface_id=surfaces, deform_scale=2.0, show_edges=False)
+        surfaces = get_surfaces_from_morph_config(cfg_json, mode="TU")
+        interactive_fro_morph_surface(orig_fro, morp_fro, surface_id=surfaces, deform_scale=2.0, show_edges=False)
         #export_morph_series_multiblock(orig_fro, morp_fro, surface_ids=surfaces, out_dir=export, base_name="corner_morph", n_frames=90, deform_scale=1.0)
     pass

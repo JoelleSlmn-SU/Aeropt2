@@ -31,8 +31,8 @@ os.makedirs(OUT_DIR, exist_ok=True)
 METHODS = [
     MethodConfig(name="xyz",        folder="param1", dof=6),
     MethodConfig(name="dn",         folder="param2", dof=6),
-    MethodConfig(name="lap",        folder="param3", dof=6),
-    MethodConfig(name="lap_global", folder="param4", dof=6),
+    MethodConfig(name="lap",        folder="param3", dof=12),
+    MethodConfig(name="lap_global", folder="param4", dof=12),
 ]
 
 # Toggle this on to additionally compare morph smoothness / robustness
@@ -827,7 +827,7 @@ def plot_bar(df: pd.DataFrame, col: str, title: str, path: str) -> None:
 
 
 
-def plot_pca_scatter(all_data: Dict[str, Dict], path: str) -> None:
+def plot_pca_scatter_2(all_data: Dict[str, Dict], path: str) -> None:
     from sklearn.decomposition import PCA
 
     plt.figure(figsize=(7, 6))
@@ -844,7 +844,78 @@ def plot_pca_scatter(all_data: Dict[str, Dict], path: str) -> None:
     plt.savefig(path, dpi=200)
     plt.close()
 
+def plot_pca_scatter(all_data: Dict[str, Dict], path: str) -> None:
+    from sklearn.decomposition import PCA
+    import plotly.express as px
+    import pandas as pd
+    import os
 
+    # collect all samples first
+    rows = []
+    X_all = []
+    sample_keys = []
+
+    for name, data in all_data.items():
+        X = data["X"]
+
+        for i, x in enumerate(X):
+            X_all.append(x)
+            sample_keys.append((name, i))
+
+    X_all = np.vstack(X_all)
+
+    # fit ONE common PCA for all methods
+    X2 = PCA(n_components=2).fit_transform(X_all)
+
+    for idx, ((method, i), xy) in enumerate(zip(sample_keys, X2)):
+        data = all_data[method]
+        x_flat = data["X"][i]
+
+        rows.append({
+            "method": method,
+            "sample_index": i,
+            "case": i + 1,
+            "PC1": xy[0],
+            "PC2": xy[1],
+            "dof": data.get("dof", ""),
+            "n_nodes_native": data.get("n_nodes_native", ""),
+            "n_nodes_ref": data.get("n_nodes_ref", ""),
+            "disp_norm": float(np.linalg.norm(x_flat)),
+            "disp_rms": float(np.sqrt(np.mean(x_flat**2))),
+            "disp_max_component": float(np.max(np.abs(x_flat))),
+        })
+
+    df = pd.DataFrame(rows)
+
+    fig = px.scatter(
+        df,
+        x="PC1",
+        y="PC2",
+        color="method",
+        hover_data=[
+            "method",
+            "case",
+            "sample_index",
+            "dof",
+            "n_nodes_native",
+            "n_nodes_ref",
+            "disp_norm",
+            "disp_rms",
+            "disp_max_component",
+        ],
+        title="Shape-space PCA projection (interactive)",
+    )
+
+    fig.update_traces(marker=dict(size=8, opacity=0.65))
+
+    html_path = os.path.splitext(path)[0] + ".html"
+    fig.write_html(html_path)
+
+    # Optional: still save a static PNG if kaleido is installed
+    try:
+        fig.write_image(path, scale=3)
+    except Exception:
+        pass
 
 def plot_metric_bars_from_summary(summary: pd.DataFrame, metrics: List[str], path_prefix: str, title_prefix: str) -> None:
     for metric in metrics:
@@ -904,6 +975,7 @@ def main():
     plot_bar(df_metrics, "avg_dist", "Average shape distance", os.path.join(OUT_DIR, "dist.png"))
     plot_heatmap(repr_df, "Cross-method representability", os.path.join(OUT_DIR, "repr.png"))
     plot_pca_scatter(all_data, os.path.join(OUT_DIR, "pca.png"))
+    plot_pca_scatter_2(all_data, os.path.join(OUT_DIR, "pca_inter.png"))
 
     df_metrics.to_csv(os.path.join(OUT_DIR, "metrics.csv"), index=False)
     repr_df.to_csv(os.path.join(OUT_DIR, "representability.csv"))

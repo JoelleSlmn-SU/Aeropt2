@@ -112,7 +112,7 @@ class ClusterTestManager:
     Test manager that runs ON THE CLUSTER.
     Uses ClusterPipelineManager (no SSH/SFTP).
     """
-    def __init__(self, remote_root, base_name, input_dir, executables, poll_s=120, morph_basis_json="", units="mm", parallel=80, monitor_config_json=""):
+    def __init__(self, remote_root, base_name, input_dir, executables, poll_s=120, morph_basis_json="", units="mm", parallel=80, monitor_config_json="", previous_solution=None):
         self.remote_root = os.path.abspath(remote_root)
         self.base_name = base_name
         self.input_dir = input_dir
@@ -124,6 +124,8 @@ class ClusterTestManager:
         self.parallel = parallel
         
         self.monitor_config_json = monitor_config_json or ""
+        
+        self.previous_solution = previous_solution or {}
         
         # Create logs directory
         self.log_dir = os.path.join(self.remote_root, "logs")
@@ -147,6 +149,8 @@ class ClusterTestManager:
             "morph_basis_json": self.morph_basis_json,
             "cad_units": self.units,
             "parallel_processes": self.parallel,
+            "monitor_config_json": self.monitor_config_json,
+            "previous_solution": self.previous_solution,
             **self.executables,
         }
 
@@ -344,6 +348,8 @@ def main():
     parallel = settings_json.get("parallel", 80)
     cad_units = settings_json.get("units", "mm")
     
+    previous_solution = settings_json.get("previous_solution", {}) or {}
+    
     # Executable paths (customize for your cluster)
     executables = {
         "parallel_domains": settings_json.get("parallel_domains", 1),
@@ -358,6 +364,7 @@ def main():
         "intel_module": "module load compiler/intel/2020/0",
         "gnu_module": "module load compiler/gnu/12/1.0",
         "mpi_intel_module": "module load mpi/intel/2020/0",
+        "interpu_script": "$HOME/aeropt/Scripts/Utilities/interpu.py",
     }
     
     # Create test manager (uses ClusterPipelineManager internally)
@@ -370,7 +377,8 @@ def main():
         morph_basis_json=morph_basis_json,
         units = cad_units,
         parallel = parallel,
-        monitor_config_json=monitor_config_json
+        monitor_config_json=monitor_config_json,
+        previous_solution=previous_solution
     )
     
     # Define init and eval functions for BO

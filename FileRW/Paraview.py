@@ -4,6 +4,7 @@
 from pathlib import Path
 import os, glob
 import numpy as np
+import vtk
 
 from paraview.simple import *
 from paraview.servermanager import Fetch
@@ -11,10 +12,10 @@ from vtk.util import numpy_support as ns
 
 # ---------- CONFIG ----------
 folder = [
-    "CB Opt"
+    "CB Opt 2"
 ]
 
-x_case = 1
+x_case = 5
 gen = 0
 base = Path(r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples")
 case_root = base / folder[0]
@@ -453,8 +454,9 @@ except Exception as e:
 
 # ---- FRESH START: Re-open the data file ----
 print(f"[INFO] Re-opening case file: {CASE_FILE}")
+# Keep the raw multiblock reader for AIP extraction.
+# Direct surface extraction needs the original block tree; do NOT MergeBlocks here.
 src_aip = open_case(CASE_FILE)
-src_aip = normalize_to_single_dataset(src_aip)
 UpdatePipeline(proxy=src_aip)
 Show(src_aip)
 
@@ -472,6 +474,7 @@ AIP_SELECTORS = [
     "/Root/Surfaces/Surface 111",
     "/Root/Surface 111",
     "/Root/Blocks/Surface 111",
+    "/Root/Block_111",
     "/Root/111",
 ]
 cx, cy, cz = AIP_CENTER
@@ -529,6 +532,80 @@ def _ensure_P0AIP_on(proxy):
     UpdatePipeline(proxy=calc_P0)
 
     return calc_P0, "P0_AIP"
+
+
+def _vtk_polydata_to_proxy(polydata, name="IsolatedSurface"):
+    """Wrap a client-side vtkPolyData as a ParaView proxy."""
+    if polydata is None or polydata.GetNumberOfPoints() == 0:
+        return None
+    prod = TrivialProducer(registrationName=name)
+    prod.GetClientSideObject().SetOutput(polydata)
+    UpdatePipeline(proxy=prod)
+    return prod
+
+def _direct_extract_surface_blocks_local(root, target_sids):
+    """
+    Direct multiblock extraction copied from the working remote monitor logic.
+
+    In the EnSight multiblock tree, `Surface N` corresponds to block index N,
+    so this avoids fragile selector strings and avoids thresholding on arrays that
+    may not exist locally. Returns a ParaView proxy containing triangulated,
+    cleaned surface polydata.
+    """
+    ds = Fetch(root)
+    if ds is None or not hasattr(ds, "GetNumberOfBlocks"):
+        print("[WARN] Direct block extraction skipped: root is not a multiblock dataset.")
+        return None
+
+    pieces = []
+    nblocks = int(ds.GetNumberOfBlocks())
+    print(f"[INFO] Direct block extraction for surfaces {target_sids}; root has {nblocks} blocks")
+
+    for sid in target_sids:
+        sid = int(sid)
+        if sid < 0 or sid >= nblocks:
+            print(f"[WARN] Surface {sid} is outside multiblock range 0..{nblocks-1}")
+            continue
+
+        block = ds.GetBlock(sid)
+        if block is None:
+            print(f"[WARN] Surface/block {sid} is None")
+            continue
+
+        pieces.append(block)
+        try:
+            npts = block.GetNumberOfPoints()
+        except Exception:
+            npts = -1
+        print(f"[OK] Grabbed block {sid} directly ({npts} points)")
+
+    if not pieces:
+        return None
+
+    if len(pieces) == 1:
+        merged_ds = pieces[0]
+    else:
+        append = vtk.vtkAppendFilter()
+        for blk in pieces:
+            append.AddInputData(blk)
+        append.Update()
+        merged_ds = append.GetOutput()
+
+    geom = vtk.vtkGeometryFilter()
+    geom.SetInputData(merged_ds)
+    geom.Update()
+
+    clean = vtk.vtkCleanPolyData()
+    clean.SetInputData(geom.GetOutput())
+    clean.Update()
+
+    tri = vtk.vtkTriangleFilter()
+    tri.SetInputData(clean.GetOutput())
+    tri.Update()
+
+    out = tri.GetOutput()
+    print(f"[OK] Direct surface extraction complete: {out.GetNumberOfPoints()} points, {out.GetNumberOfCells()} cells")
+    return _vtk_polydata_to_proxy(out, name="DirectSurfaceBlockExtract")
 
 def _threshold_set_local(thr, loc, arr_name, lo, hi):
     """Configure Threshold filter across ParaView versions."""
@@ -685,28 +762,57 @@ def _pick_aip_geometric_local(root, cx, cy, cz, r, dx=0.02, cos_tol=0.90):
         print(f"[OK] Geometric picking complete: {ds_final.GetNumberOfPoints()} points")
     return cln
 
-def isolate_aip_surface(root, cx, cy, cz, r):
-    """Try all three methods in sequence."""
-    
-    # Method 1: surface_id
-    print("[INFO] Method 1: Attempting surface_id threshold...")
-    surf = _threshold_surface_id_local(root, target_sid=111)
+def isolate_surface_ids(root, target_sids):
+    """Public helper: isolate one or more surface IDs as a ParaView proxy."""
+    surf = _direct_extract_surface_blocks_local(root, target_sids)
     if surf:
         return surf
-    
-    # Method 2: ExtractBlock
-    print("[INFO] Method 2: Attempting ExtractBlock...")
+
+    # Fallback for datasets where the surface id is stored as an array instead
+    # of being represented by multiblock indices.
+    pieces = []
+    for sid in target_sids:
+        piece = _threshold_surface_id_local(root, target_sid=int(sid))
+        if piece:
+            pieces.append(piece)
+
+    if len(pieces) == 1:
+        return pieces[0]
+    if len(pieces) > 1:
+        try:
+            app = AppendDatasets(Input=pieces)
+            UpdatePipeline(proxy=app)
+            surf_out = ExtractSurface(Input=app)
+            UpdatePipeline(proxy=surf_out)
+            return surf_out
+        except Exception as e:
+            print(f"[WARN] Could not append thresholded surfaces: {e}")
+
+    raise RuntimeError(f"Could not isolate requested surfaces: {target_sids}")
+
+def isolate_aip_surface(root, cx, cy, cz, r):
+    """Try the proven direct block extraction first, then robust fallbacks."""
+    print("[INFO] Method 1: Direct multiblock extraction of AIP surface ID 111...")
+    surf = _direct_extract_surface_blocks_local(root, [111])
+    if surf:
+        return surf
+
+    print("[INFO] Method 2: Attempting ExtractBlock selectors...")
     surf = _extract_block_local(root, AIP_SELECTORS)
     if surf:
         return surf
-    
-    # Method 3: Geometric picking (most robust)
-    print("[INFO] Method 3: Attempting geometric picking...")
+
+    print("[INFO] Method 3: Attempting surface_id threshold...")
+    surf = _threshold_surface_id_local(root, target_sid=111)
+    if surf:
+        return surf
+
+    print("[INFO] Method 4: Attempting geometric picking...")
     surf = _pick_aip_geometric_local(root, cx, cy, cz, r, dx=0.01, cos_tol=0.90)
     if surf:
         return surf
-    
-    raise RuntimeError("All three AIP isolation methods failed!")
+
+    raise RuntimeError("All AIP isolation methods failed!")
 
 # ========== FREESTREAM TOTAL PRESSURE ==========
 

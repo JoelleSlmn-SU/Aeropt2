@@ -283,7 +283,7 @@ def MorphMesh(mesh_in: FroFile, base_name, morph_model, viewer, output_dir,
         control_nodes=morph_model.control_nodes,
         d_verts=d_verts,
         anchor_points=anchor_points,
-        k_nn=5,
+        k_nn=3,
         beta=2.0,        # < 1.0 = more local, > 1.0 = smoother
         min_clip_frac=0.01,
         max_clip_frac=0.4,
@@ -292,6 +292,14 @@ def MorphMesh(mesh_in: FroFile, base_name, morph_model, viewer, output_dir,
     # optional: tighten seam correction a bit too
     corr_R_frac = max(0.5 * min_R_frac, 0.008)
     corr_band_frac = max(0.75 * fallback_R_frac, 0.02)
+    
+    if len(morph_model.control_nodes) == 1:
+        min_R_frac = 0.5
+        fallback_R_frac = 0.75
+        R_scale = 2.0
+
+        corr_R_frac = 0.01
+        corr_band_frac = 0.10
 
     print(
         "[ADAPT-RBF] "

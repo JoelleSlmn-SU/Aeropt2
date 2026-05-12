@@ -8,7 +8,7 @@ def load_morph_case(json_path):
     with open(json_path, "r") as f:
         data = json.load(f)
 
-    out_dir = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\\examples\param1"
+    out_dir = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\\examples\CB Opt 2"
     n = 0
 
     # Path to the morphed T-surface (adjust name as needed)
@@ -205,8 +205,8 @@ def visualise_morph(
 
 # ----------------- Example driver for many morphs ----------------- #
 if __name__ == "__main__":
-    out_path = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\param1\surfaces\n_0"
-    for i in range(0,5):
+    out_path = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Opt 2\surfaces\n_0"
+    for i in range(0,1):
         fpath = f"morph_config_n_{i+1}.json"
         json_path = os.path.join(out_path, fpath)
 

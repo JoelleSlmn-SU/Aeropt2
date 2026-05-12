@@ -413,6 +413,260 @@ def _extract_block(root, selectors):
             pass
     return None
 
+def _plane_indices(axis="x"):
+    axis = str(axis).lower()
+    if axis == "x":
+        return 0, 1, 2   # normal=x, plane=(y,z)
+    if axis == "y":
+        return 1, 0, 2   # normal=y, plane=(x,z)
+    if axis == "z":
+        return 2, 0, 1   # normal=z, plane=(x,y)
+    raise ValueError(f"Unsupported AIP axis: {axis}")
+
+
+def _total_pressure_from_arrays(rho, energy, vel, gamma=GAMMA):
+    rho = np.asarray(rho, float)
+    energy = np.asarray(energy, float)
+    vel = np.asarray(vel, float)
+
+    vmag2 = np.sum(vel**2, axis=1)
+
+    # Same convention as the existing pressure recovery code
+    p = (energy - 0.5 * rho * vmag2) * (gamma - 1.0)
+
+    good = (
+        np.isfinite(rho)
+        & np.isfinite(energy)
+        & np.isfinite(p)
+        & np.all(np.isfinite(vel), axis=1)
+        & (rho > 0.0)
+        & (p > 0.0)
+    )
+
+    P0 = np.full_like(p, np.nan, dtype=float)
+    q = np.full_like(p, np.nan, dtype=float)
+    mach = np.full_like(p, np.nan, dtype=float)
+
+    a = np.sqrt(gamma * p[good] / rho[good])
+    V = np.sqrt(vmag2[good])
+    mach[good] = V / a
+    q[good] = 0.5 * rho[good] * vmag2[good]
+
+    P0[good] = p[good] * (
+        1.0 + 0.5 * (gamma - 1.0) * mach[good] ** 2
+    ) ** (gamma / (gamma - 1.0))
+
+    return P0, p, q, mach, good
+
+
+def generate_aip_rake_points(center, radius, axis="x", n_angles=5, n_radial=8,
+                             r_inner=0.0, include_endpoint=False):
+    """
+    Generate rake points on an AIP plane.
+
+    For axis='x', the AIP plane is y-z and x is fixed.
+    """
+    center = np.asarray(center, float).reshape(3)
+    radius = float(radius)
+    r_inner = float(r_inner)
+
+    if radius <= 0:
+        raise ValueError("AIP radius must be positive.")
+    if n_angles < 1 or n_radial < 1:
+        raise ValueError("n_angles and n_radial must be >= 1.")
+    if r_inner < 0 or r_inner >= radius:
+        raise ValueError("r_inner must satisfy 0 <= r_inner < radius.")
+
+    normal_i, a_i, b_i = _plane_indices(axis)
+
+    if include_endpoint:
+        theta = np.linspace(0.0, 2.0 * np.pi, int(n_angles))
+    else:
+        theta = np.linspace(0.0, 2.0 * np.pi, int(n_angles), endpoint=False)
+
+    dr = (radius - r_inner) / float(n_radial)
+    radii = r_inner + (np.arange(int(n_radial), dtype=float) + 0.5) * dr
+
+    pts = []
+    angle_ids = []
+    radial_ids = []
+
+    for ia, th in enumerate(theta):
+        for ir, rr in enumerate(radii):
+            p = center.copy()
+            p[a_i] = center[a_i] + rr * np.cos(th)
+            p[b_i] = center[b_i] + rr * np.sin(th)
+            p[normal_i] = center[normal_i]
+            pts.append(p)
+            angle_ids.append(ia)
+            radial_ids.append(ir)
+
+    return np.asarray(pts, float), theta, radii, np.asarray(angle_ids), np.asarray(radial_ids)
+
+
+def _circular_delta(a, b):
+    """
+    Smallest signed angular difference a-b in radians.
+    """
+    return (a - b + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def _extract_sampled_surface_arrays(root, aip_poly):
+    """
+    Resample solution fields from root onto the selected AIP surface.
+    Returns points, rho, energy, velocity.
+    """
+    aip_src = TrivialProducer()
+    aip_src.GetClientSideObject().SetOutput(aip_poly)
+    UpdatePipeline(proxy=aip_src)
+
+    sampled = ResampleWithDataset(SourceDataArrays=root, DestinationMesh=aip_src)
+    sampled.PassPointArrays = 1
+    sampled.PassCellArrays = 1
+    sampled.CellLocator = "Static Cell Locator"
+    UpdatePipeline(proxy=sampled)
+
+    sampled, rho_nm = ensure_pointdata(sampled, NAME_RHO)
+    sampled, e_nm = ensure_pointdata(sampled, NAME_ENERGY)
+    sampled, u_nm = ensure_pointdata(sampled, NAME_U)
+    UpdatePipeline(proxy=sampled)
+
+    ds = Fetch(sampled)
+    leaf = _first_dataset_with_pointdata(ds)
+    if leaf is None:
+        raise RuntimeError("No sampled AIP point-data dataset found for DC60.")
+
+    pts = ns.vtk_to_numpy(leaf.GetPoints().GetData()).astype(float)
+    rho = ns.vtk_to_numpy(leaf.GetPointData().GetArray(rho_nm)).astype(float)
+    energy = ns.vtk_to_numpy(leaf.GetPointData().GetArray(e_nm)).astype(float)
+    vel = ns.vtk_to_numpy(leaf.GetPointData().GetArray(u_nm)).astype(float)
+
+    if pts.size == 0:
+        raise RuntimeError("Selected AIP surface contains no points.")
+
+    return leaf, pts, rho, energy, vel
+
+
+def compute_dc60_distortion(root, monitor):
+    """
+    Compute DC60-style circumferential total-pressure distortion from a selected AIP surface.
+
+    Method:
+      1. isolate selected AIP surface
+      2. resample solution fields onto that surface
+      3. generate rake points
+      4. snap each rake point to closest AIP mesh node
+      5. compute total pressure at sampled nodes
+      6. DC60 = (mean(P0) - min_60deg_sector_mean(P0)) / mean(q)
+
+    Config keys:
+      surface_ids, center, radius, axis, n_angles, n_radial,
+      r_inner, sector_deg, denominator
+    """
+    center = monitor.get("center", AIP_CENTER)
+    radius = float(monitor.get("radius", AIP_RADIUS))
+    axis = monitor.get("axis", "x")
+
+    n_angles = int(monitor.get("n_angles", 5))
+    n_radial = int(monitor.get("n_radial", 8))
+    r_inner = float(monitor.get("r_inner", 0.0))
+    sector_deg = float(monitor.get("sector_deg", 60.0))
+    denominator_mode = str(monitor.get("denominator", "q_mean")).lower()
+
+    sids = list(monitor.get("surface_ids", []))
+    if sids:
+        aip_poly = isolate_surface_ids(root, sids)
+    else:
+        aip_poly = isolate_aip_surface(root, center[0], center[1], center[2], radius)
+
+    leaf, surf_pts, rho, energy, vel = _extract_sampled_surface_arrays(root, aip_poly)
+
+    rake_pts, rake_theta, rake_radii, angle_ids, radial_ids = generate_aip_rake_points(
+        center=center,
+        radius=radius,
+        axis=axis,
+        n_angles=n_angles,
+        n_radial=n_radial,
+        r_inner=r_inner,
+        include_endpoint=False,
+    )
+
+    # VTK closest-node lookup on the sampled AIP surface
+    locator = vtk.vtkStaticPointLocator()
+    locator.SetDataSet(leaf)
+    locator.BuildLocator()
+
+    closest_ids = np.array(
+        [int(locator.FindClosestPoint(p.tolist())) for p in rake_pts],
+        dtype=int,
+    )
+
+    sampled_pts = surf_pts[closest_ids]
+    sampled_rho = rho[closest_ids]
+    sampled_energy = energy[closest_ids]
+    sampled_vel = vel[closest_ids]
+
+    P0, p_static, q, mach, good = _total_pressure_from_arrays(
+        sampled_rho, sampled_energy, sampled_vel, gamma=GAMMA
+    )
+
+    if not np.any(good):
+        raise RuntimeError("No valid rake samples for DC60 computation.")
+
+    P0_valid = P0[good]
+    q_valid = q[good]
+
+    P0_mean = float(np.nanmean(P0_valid))
+    q_mean = float(np.nanmean(q_valid))
+
+    # Compute worst sector from rake angular positions
+    theta_all = rake_theta[angle_ids]
+    theta_valid = theta_all[good]
+
+    half_sector = np.deg2rad(sector_deg) / 2.0
+    sector_means = []
+
+    for th0 in rake_theta:
+        in_sector = np.abs(_circular_delta(theta_valid, th0)) <= half_sector
+
+        # With 5 rakes and a 60 degree sector, this may capture one rake.
+        # That is okay; it becomes equivalent to worst rake mean.
+        if not np.any(in_sector):
+            nearest = np.argmin(np.abs(_circular_delta(theta_valid, th0)))
+            in_sector = np.zeros_like(theta_valid, dtype=bool)
+            in_sector[nearest] = True
+
+        sector_means.append(float(np.nanmean(P0_valid[in_sector])))
+
+    sector_means = np.asarray(sector_means, float)
+    P0_sector_min = float(np.nanmin(sector_means))
+
+    if denominator_mode == "p0_mean":
+        denom = P0_mean
+    elif denominator_mode == "constant":
+        denom = float(monitor.get("denominator_value", 1.0))
+    else:
+        denom = q_mean
+
+    DC60 = (P0_mean - P0_sector_min) / denom if denom > 0.0 else float("nan")
+
+    # useful diagnostics
+    unique_nodes = int(len(np.unique(closest_ids)))
+    max_snap_dist = float(np.max(np.linalg.norm(sampled_pts - rake_pts, axis=1)))
+    mean_snap_dist = float(np.mean(np.linalg.norm(sampled_pts - rake_pts, axis=1)))
+
+    return {
+        "DC60": float(DC60),
+        "P0_mean": P0_mean,
+        "P0_sector_min": P0_sector_min,
+        "q_mean": q_mean,
+        "denom": float(denom),
+        "n_rake": int(len(rake_pts)),
+        "n_unique_nodes": unique_nodes,
+        "max_snap_dist": max_snap_dist,
+        "mean_snap_dist": mean_snap_dist,
+    }
+
 def _pick_aip_geometric(root, cx, cy, cz, r, dx=0.02, cos_tol=0.90):
     surf = ExtractSurface(Input=root)
     UpdatePipeline(proxy=surf)
@@ -712,6 +966,11 @@ def main():
                 results["P0_inf_median_Pa"] = P0_inf
                 results["P0_mean_AIP_Pa"] = P0_mean
                 results[name] = pr
+                
+            elif mtype in ("dc60", "distortion", "distortion_dc60"):
+                dc = compute_dc60_distortion(r, mon)
+
+                results[name] = dc["DC60"]
 
             elif mtype == "drag":
                 drag_res = compute_surface_pressure_drag(
@@ -722,10 +981,7 @@ def main():
                     gamma=GAMMA,
                 )
 
-                results[name + "_force"] = drag_res["drag_force"]
                 results[name + "_over_q"] = drag_res["drag_over_q"]
-                results[name + "_proj_area"] = drag_res["proj_area"]
-                results[name + "_cd_proj"] = drag_res["cd_proj"]
 
             else:
                 print(f"[MON][WARN] Unsupported monitor type: {mtype}", flush=True)
