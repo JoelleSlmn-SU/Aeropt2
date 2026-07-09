@@ -22,11 +22,58 @@ from OCP.BRepTools import BRepTools
 from OCP.Geom import Geom_BSplineSurface
 from OCP.GeomAdaptor import GeomAdaptor_Surface
 
+from OCP.STEPControl import STEPControl_Reader
+from OCP.IFSelect import IFSelect_RetDone
+from OCP.BRepMesh import BRepMesh_IncrementalMesh
+from OCP.StlAPI import StlAPI_Writer
+
+
 def _capsule_from_hwnd(hwnd: int, name: bytes = b"HWND"):
     PyCapsule_New = ctypes.pythonapi.PyCapsule_New
     PyCapsule_New.restype = ctypes.py_object
     PyCapsule_New.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
     return PyCapsule_New(ctypes.c_void_p(hwnd), name, None)
+
+
+def step_to_stl(step_path, stl_path, linear_deflection=0.5, angular_deflection=0.5):
+    """
+    Convert a STEP file to STL.
+
+    Parameters
+    ----------
+    step_path : str
+        Input STEP (.step/.stp)
+    stl_path : str
+        Output STL
+    linear_deflection : float
+        Maximum linear deviation (smaller = finer mesh)
+    angular_deflection : float
+        Maximum angular deviation (radians)
+    """
+
+    reader = STEPControl_Reader()
+
+    status = reader.ReadFile(step_path)
+    if status != IFSelect_RetDone:
+        raise RuntimeError(f"Failed to read STEP file:\n{step_path}")
+
+    reader.TransferRoots()
+    shape = reader.OneShape()
+
+    print("[STEP->STL] Meshing...")
+
+    BRepMesh_IncrementalMesh(
+        shape,
+        linear_deflection,
+        False,
+        angular_deflection,
+        True
+    )
+
+    writer = StlAPI_Writer()
+    writer.Write(shape, stl_path)
+
+    print(f"[STEP->STL] STL written to:\n{stl_path}")
 
 def face_to_bspline(face_like):
     """

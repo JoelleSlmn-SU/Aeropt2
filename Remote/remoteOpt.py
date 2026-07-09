@@ -44,68 +44,124 @@ def _metrics_path(remote_root, n, gen, cond_index: int, base_name):
         f"{base_name}_{n}.rsd",
     )
     
+def _strip_outer_minmax(expr_raw: str):
+    """Return (sense, inner_expr). sense is min or max."""
+    expr_raw = (expr_raw or "").strip()
+    m = re.match(r"^\s*(min|max)\s*\(\s*(.*)\s*\)\s*$", expr_raw, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).lower(), m.group(2).strip()
+    return "min", expr_raw
+
+
 def _build_objective_callable(objective_dict: dict):
     """
-    Returns (obj_func, pretty_expr)
-      - obj_func(metrics: dict) -> float   (ALWAYS "minimised" form)
-      - pretty_expr: str                  (what we're minimising)
-    Supports:
-      - objective_type: Drag | Lift | Lift-to-Drag | Custom Expression
-      - expression examples:
-          "max(CL)", "min(CD)", "max(CL/CD - 0.1*abs(CM))", "CD + abs(CM)"
-    """
+    Build a safe scalar objective evaluator.
 
+    New format:
+      objective_dict["expression"] may reference any symbols produced by:
+        - .rsd parser: CL, CD, CM, CL_over_CD
+        - monitor parser: objective symbols such as PR_s5, DC60_s5, CD_s2_3_4
+
+    Backwards compatible with old objective_type values: Drag, Lift, Lift-to-Drag.
+    Returned objective is always in minimisation form for BO.
+    """
     obj_type = (objective_dict.get("objective_type", "") or "").strip()
     expr_raw = (objective_dict.get("expression", "") or "").strip()
 
-    # 1) Choose a default expression if user selected a preset
-    if obj_type.lower() == "drag" or expr_raw.lower() == "drag":
-        expr_raw = "min(CD)"
-    elif obj_type.lower() == "lift" or expr_raw.lower() == "lift":
-        expr_raw = "max(CL)"
-    elif obj_type.lower() in ("lift-to-drag", "lift to drag") or expr_raw.lower() in ("lift-to-drag", "lift to drag"):
-        expr_raw = "max(CL/CD)"
-    else:
-        # custom: keep what they typed; if empty fall back to drag
-        expr_raw = expr_raw if expr_raw else "min(CD)"
+    if not expr_raw or expr_raw.lower() == "drag" or obj_type.lower() == "drag":
+        expr_raw = "CD"
+    elif expr_raw.lower() == "lift" or obj_type.lower() == "lift":
+        expr_raw = "-CL"
+    elif expr_raw.lower() in ("lift-to-drag", "lift to drag") or obj_type.lower() in ("lift-to-drag", "lift to drag"):
+        expr_raw = "-(CL/CD)"
 
-    # 2) Parse "min(...)" / "max(...)" wrapper (if present)
-    m = re.match(r"^\s*(min|max)\s*\(\s*(.*)\s*\)\s*$", expr_raw, flags=re.IGNORECASE)
-    if m:
-        sense = m.group(1).lower()      # "min" or "max"
-        inner = m.group(2).strip()      # expression inside
-    else:
-        # No wrapper given -> assume minimisation (consistent default)
-        sense = "min"
-        inner = expr_raw.strip()
+    sense, inner = _strip_outer_minmax(expr_raw)
+    # expression symbols cannot contain '/', so also expose CL_over_CD
+    inner = inner.replace("CL/CD", "CL_over_CD")
 
-    # 3) Restricted eval environment
     allowed_funcs = {
         "abs": abs,
         "min": min,
         "max": max,
+        "pow": pow,
+        "sqrt": lambda x: float(np.sqrt(x)),
+        "log": lambda x: float(np.log(x)),
+        "exp": lambda x: float(np.exp(x)),
     }
     safe_globals = {"__builtins__": {}}
     safe_globals.update(allowed_funcs)
 
-    def _eval_inner(mdict: dict) -> float:
-        local_vars = {
-            "CL": float(mdict.get("CL", 0.0)),
-            "CD": float(mdict.get("CD", 1e9)),
-            "CM": float(mdict.get("CM", 0.0)),
-        }
-        return float(eval(inner, safe_globals, local_vars))
-
     def obj_func(mdict: dict) -> float:
         try:
-            val = _eval_inner(mdict)
-            # Convert "max(f)" -> minimise -f
+            local_vars = {}
+            for k, v in (mdict or {}).items():
+                if re.match(r"^[A-Za-z_]\w*$", str(k)):
+                    try:
+                        local_vars[str(k)] = float(v)
+                    except Exception:
+                        pass
+            local_vars.setdefault("CL", 0.0)
+            local_vars.setdefault("CD", 1e9)
+            local_vars.setdefault("CM", 0.0)
+            if "CL_over_CD" not in local_vars:
+                local_vars["CL_over_CD"] = local_vars["CL"] / max(local_vars["CD"], 1e-30)
+            val = float(eval(inner, safe_globals, local_vars))
             return -val if sense == "max" else val
-        except Exception:
+        except Exception as e:
+            print(f"[OBJECTIVE][ERROR] Could not evaluate '{inner}' with metrics={mdict}: {e}", flush=True)
             return 1e9
 
-    pretty = f"{'-(' + inner + ')' if sense=='max' else inner}"
+    pretty = f"-{inner}" if sense == "max" else inner
     return obj_func, pretty
+
+
+def _reduce_values(values, reduction="last", default=1e9, window_frac=0.30, min_window=5, osc_rel_tol=0.02, unstable_policy="last"):
+    vals = []
+    for v in values:
+        try:
+            fv = float(v)
+            if np.isfinite(fv):
+                vals.append(fv)
+        except Exception:
+            pass
+    if not vals:
+        return float(default)
+    reduction = str(reduction or "last").lower()
+    if reduction == "time_average":
+        n = len(vals)
+        w = max(int(np.ceil(window_frac * n)), min_window)
+        w = min(w, n)
+
+        tail = np.asarray(vals[-w:], dtype=float)
+        mean = float(np.mean(tail))
+
+        amp = float(np.max(tail) - np.min(tail))
+        scale = max(abs(mean), 1e-12)
+        rel_amp = amp / scale
+
+        if rel_amp <= osc_rel_tol:
+            return mean
+
+        if unstable_policy == "penalty":
+            return float(default)
+
+        return float(vals[-1])
+    return float(vals[-1])
+
+
+def _metric_aliases(metric: str):
+    m = str(metric or "").strip().lower()
+    aliases = {
+        "pressure_recovery": ["pressure_recovery", "pr", "p0_recovery"],
+        "distortion": ["distortion", "dc60", "DC60"],
+        "drag": ["drag", "CD", "cd", "duct_drag"],
+        "lift": ["lift", "CL", "cl"],
+        "moment": ["moment", "CM", "cm"],
+        "CD": ["CD", "cd", "drag", "duct_drag"],
+        "CL": ["CL", "cl", "lift"],
+        "CM": ["CM", "cm", "moment"],
+    }
+    return aliases.get(metric, aliases.get(m, [metric, m]))
 
 class ClusterTestManager:
     """
@@ -122,9 +178,7 @@ class ClusterTestManager:
         self.morph_basis_json = morph_basis_json or ""
         self.units = units
         self.parallel = parallel
-        
         self.monitor_config_json = monitor_config_json or ""
-        
         self.previous_solution = previous_solution or {}
         
         # Create logs directory
@@ -193,17 +247,11 @@ class ClusterTestManager:
             self._start_one(gen_num, n_index, x, conds)
     
     def evaluate_generation(self, X_list, gen_num, conds):
-        """Wait for solver completion markers (not rsd existence), then parse rsd."""
+        """Wait for solver completion markers, then parse .rsd plus monitor CSVs."""
         num_conds = len(conds)
 
         def _sol_dir(n_index: int, nc: int) -> str:
-            return os.path.join(
-                self.remote_root,
-                "solutions",
-                f"n_{gen_num}",
-                f"cond_{nc}",
-                f"{n_index}",
-            )
+            return os.path.join(self.remote_root, "solutions", f"n_{gen_num}", f"cond_{nc}", f"{n_index}")
 
         def _done_path(n_index: int, nc: int) -> str:
             return os.path.join(_sol_dir(n_index, nc), "SOLVER_DONE")
@@ -211,30 +259,27 @@ class ClusterTestManager:
         def _rsd_path(n_index: int, nc: int) -> str:
             return os.path.join(_sol_dir(n_index, nc), f"{self.base_name}_{n_index}.rsd")
 
-        # Build list of required DONE markers
         need_done = []
         for i, _x in enumerate(X_list, 1):
             n_index = self._alloc_n_index(gen_num, i)
             for nc in range(1, num_conds + 1):
-                need_done.append(( _done_path(n_index, nc), n_index, nc ))
+                need_done.append((_done_path(n_index, nc), n_index, nc))
 
         print(f"[CLUSTER-TM] Waiting for {len(need_done)} SOLVER_DONE markers.", flush=True)
-
         unfinished = set(p for (p, _, _) in need_done)
         while unfinished:
             done_now = {p for p in list(unfinished) if os.path.exists(p)}
             unfinished -= done_now
             if unfinished:
-                # print one example path for debugging
                 example = next(iter(unfinished))
                 print(f"[CLUSTER-TM] Still waiting for {len(unfinished)} markers... e.g. {example}", flush=True)
                 time.sleep(self.poll_s)
 
-        print("[CLUSTER-TM] All SOLVER_DONE markers present. Parsing RSD files.", flush=True)
+        print("[CLUSTER-TM] All SOLVER_DONE markers present. Parsing objective metrics.", flush=True)
 
-        def parse_one(path):
+        def parse_rsd(path):
             try:
-                with open(path, "r") as f:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
                     lines = f.read().splitlines()
                 last = None
                 for raw in reversed(lines):
@@ -243,25 +288,98 @@ class ClusterTestManager:
                         last = toks
                         break
                 if not last:
-                    return {"CL": 0.0, "CD": 1e9, "CM": 0.0}
-                CL = float(last[2])
-                CD = float(last[3]) # TODO: FIX THIS
-                CM = float(last[4])
-                return {"CL": CL, "CD": CD, "CM": CM}
+                    return {"CL": 0.0, "CD": 1e9, "CM": 0.0, "CL_over_CD": 0.0}
+                # Existing convention in your code: CL=tokens[2], CD=tokens[3], CM=tokens[4] if present.
+                CL = float(last[2]) if len(last) > 2 else 0.0
+                CD = float(last[3]) if len(last) > 3 else 1e9
+                CM = float(last[4]) if len(last) > 4 else 0.0
+                return {"CL": CL, "CD": CD, "CM": CM, "CL_over_CD": CL / max(CD, 1e-30)}
             except Exception as e:
                 print(f"[CLUSTER-TM] Error parsing {path}: {e}", flush=True)
-                return {"CL": 0.0, "CD": 1e9, "CM": 0.0}
+                return {"CL": 0.0, "CD": 1e9, "CM": 0.0, "CL_over_CD": 0.0}
 
-        # Collect results per design in X_list order
+        def read_monitor_rows(sol_dir):
+            import csv
+            candidates = [
+                os.path.join(sol_dir, "Monitors", "monitors.csv"),
+                os.path.join(sol_dir, "Monitors", "pressure_recovery.csv"),
+            ]
+            rows = []
+            for path in candidates:
+                if not os.path.exists(path):
+                    continue
+                try:
+                    with open(path, "r", encoding="utf-8", errors="ignore", newline="") as f:
+                        sample = f.read(4096)
+                        f.seek(0)
+                        if "," in sample and any(h in sample.lower() for h in ["iter", "pressure", "drag", "distortion", "dc60"]):
+                            rdr = csv.DictReader(f)
+                            rows.extend([{k: v for k, v in row.items()} for row in rdr])
+                        else:
+                            # fallback for simple CSV with no reliable header
+                            for line in f:
+                                toks = [x.strip() for x in line.split(",")]
+                                if len(toks) >= 2:
+                                    rows.append({"pressure_recovery": toks[-1]})
+                except Exception as e:
+                    print(f"[CLUSTER-TM][WARN] Failed reading monitor csv {path}: {e}", flush=True)
+            return rows
+
+        def parse_monitors(sol_dir, base_metrics):
+            metrics = dict(base_metrics)
+            rows = read_monitor_rows(sol_dir)
+            if not rows:
+                return metrics
+
+            # Add last numeric value for every column using both original and sanitised names.
+            by_col = {}
+            for row in rows:
+                for k, v in row.items():
+                    if k is None:
+                        continue
+                    try:
+                        fv = float(v)
+                    except Exception:
+                        continue
+                    by_col.setdefault(str(k).strip(), []).append(fv)
+            for k, vals in by_col.items():
+                safe = re.sub(r"\W+", "_", k).strip("_")
+                metrics[safe] = _reduce_values(vals, "last", default=0.0)
+
+            # Objective terms define the symbols we actually need.
+            for term in getattr(self, "objective_terms", []):
+                if str(term.get("source", "")).lower() != "monitor":
+                    continue
+                symbol = str(term.get("symbol", "")).strip()
+                metric = str(term.get("metric", "")).strip()
+                reduction = term.get("reduction", "last")
+                vals = []
+                # Prefer exact objective_symbol/name matching if paraview_cluster writes it.
+                for row in rows:
+                    row_name = str(row.get("name", row.get("monitor", row.get("objective_symbol", "")))).strip()
+                    if row_name and row_name == symbol:
+                        for alias in _metric_aliases(metric) + ["value", symbol]:
+                            if alias in row:
+                                vals.append(row.get(alias))
+                    else:
+                        for alias in _metric_aliases(metric) + [symbol]:
+                            if alias in row:
+                                vals.append(row.get(alias))
+                if symbol:
+                    metrics[symbol] = _reduce_values(vals, reduction, default=metrics.get(symbol, 1e9))
+            return metrics
+
         results = []
         for i, _x in enumerate(X_list, 1):
             n_index = self._alloc_n_index(gen_num, i)
             per_cond = []
             for nc in range(1, num_conds + 1):
-                rsd = _rsd_path(n_index, nc)
-                per_cond.append(parse_one(rsd))
+                sol_dir = _sol_dir(n_index, nc)
+                m = parse_rsd(_rsd_path(n_index, nc))
+                m = parse_monitors(sol_dir, m)
+                per_cond.append(m)
+                print(f"[CLUSTER-TM] gen={gen_num} n={n_index} cond={nc} metrics={m}", flush=True)
             results.append(per_cond)
-
         return results
 
 def main():
@@ -335,7 +453,9 @@ def main():
     
     # Build objective function from GUI config (Drag/Lift/Lift-to-Drag/Custom)
     obj_func, obj_expr = _build_objective_callable(objective)
-    _log(f"[REMOTE-OPT] Objective expression (minimised): {obj_expr}", log_path)    
+    objective_terms = objective.get("terms", []) or []
+    _log(f"[REMOTE-OPT] Objective expression (minimised): {obj_expr}", log_path)
+    _log(f"[REMOTE-OPT] Objective terms: {objective_terms}", log_path)    
     
     _log(f"[REMOTE-OPT] Conditions: {conds}", log_path)
     _log(f"[REMOTE-OPT] Weights: {weights}", log_path)
@@ -347,7 +467,6 @@ def main():
     input_dir = settings_json.get("input_dir", os.path.join(remote_root, "orig"))
     parallel = settings_json.get("parallel", 80)
     cad_units = settings_json.get("units", "mm")
-    
     previous_solution = settings_json.get("previous_solution", {}) or {}
     
     # Executable paths (customize for your cluster)
@@ -355,8 +474,8 @@ def main():
         "parallel_domains": settings_json.get("parallel_domains", 1),
         "surface_mesher": "/home/s.o.hassan/XieZ/work/Meshers/volume/src/a.Surf3D",
         "volume_mesher": "/home/s.o.hassan/XieZ/work/Meshers/volume/src/a.Mesh3D",
-        "prepro_exe": "/home/s.o.hassan/bin/Gen3d_jj",
-        "solver_exe": "/home/s.o.hassan/bin/UnsMgnsg3d",
+        "prepro_exe": "/home/s.engevabj/codes/PrePro_uns/Gen3d",
+        "solver_exe": "/home/s.engevabj/codes/FLITE_uns/UnsMgnsg3d",
         "combine_exe": "/home/s.engevabj/codes/utilities/makeplot2",
         "ensight_exe": "/home/s.engevabj/codes/utilities/engen_tet",
         "splitplot_exe": "/home/s.engevabj/codes/utilities/splitplot2",
@@ -380,6 +499,7 @@ def main():
         monitor_config_json=monitor_config_json,
         previous_solution=previous_solution
     )
+    tm.objective_terms = objective_terms
     
     # Define init and eval functions for BO
     def init_func(X_list, gen_num):

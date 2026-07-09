@@ -82,8 +82,8 @@ class ClusterPipelineManager:
         self.paraview_script = "$HOME/aeropt/Scripts/Remote/paraview_cluster.py"
         self.surface_mesher = config_dict.get("surface_mesher", "/home/s.o.hassan/XieZ/work/Meshers/surface/src/a.Surf3D")
         self.volume_mesher = config_dict.get("volume_mesher", "/home/s.o.hassan/XieZ/work/Meshers/volume/src/a.Mesh3D")
-        self.prepro_exe = config_dict.get("prepro_exe", "/home/s.o.hassan/bin/Gen3d_jj")
-        self.solver_exe = config_dict.get("solver_exe", "/home/s.engevabj/codes/FLITE_uns/UnsMgnsg3d") # TODO: CHANGE TO BENS SOLVER OR USE MAKEPLOT AND SPLITPLOT FROM OUBAY
+        self.prepro_exe = config_dict.get("prepro_exe", "/home/s.engevabj/codes/PrePro_uns/Gen3d")
+        self.solver_exe = config_dict.get("solver_exe", "/home/s.engevabj/codes/FLITE_uns/UnsMgnsg3d")
         self.combine_exe = config_dict.get("combine_exe", "/home/s.engevabj/codes/utilities/makeplot2")
         self.ensight_exe = config_dict.get("ensight_exe", "/home/s.engevabj/codes/utilities/engen_tet")
         self.splitplot_exe = config_dict.get("splitplot_exe", "/home/s.engevabj/codes/utilities/splitplot2")
@@ -395,7 +395,6 @@ class ClusterPipelineManager:
         bf.lines.append('${NEW_BASE}.rst')
         bf.lines.append('T')
         bf.lines.append('EOF')
-        bf.lines.append('fi')
 
         bf.lines.append("# Force solver restartNumber = 1 only after .unk exists")
         bf.lines.append("python3 - <<'PY'")
@@ -412,6 +411,200 @@ class ClusterPipelineManager:
         bf.lines.append("    f.write(txt2)")
         bf.lines.append("print('[INTERPU] restartNumber set to 1')")
         bf.lines.append("PY")
+
+    def _append_paraview_monitoring_section(self, bf, mach_for_post: float):
+        """
+        Append ParaView/monitor logic to the solver batchfile.
+
+        Steady:
+            Uses BASE.res* and BASE.rsd as before.
+
+        Transient:
+            Uses BASE_1.res* and BASE_1.rsd with the same monitoring logic as
+            the steady-state path. We do not cycle through BASE_2, BASE_3, ...
+            here because the monitor should track the first transient solution
+            family in the same way the steady monitor tracks BASE.
+        """
+        bf.lines.append("")
+        bf.lines.append("# ---------------- Pressure-recovery / monitors ----------------")
+        bf.lines.append("module load paraview/2019 || true")
+
+        bf.lines.append(f"BASE='{self.base_name}_{self.n}'")
+        bf.lines.append(f"INTERVAL={int(self.monitor_interval)}")
+        bf.lines.append("SLEEP_S=20")
+
+        bf.lines.append("PR_DIR=Monitors")
+        bf.lines.append("WORK_DIR=\"$PR_DIR/work\"")
+        bf.lines.append("UNK_DIR=\"$PR_DIR/unk\"")
+        bf.lines.append("CSV_OUT=\"$PR_DIR/monitors.csv\"")
+        bf.lines.append("MON_LOG=\"$PR_DIR/monitor.log\"")
+        bf.lines.append("MON_JSON_SRC=\"{0}\"".format(self.monitor_config_json or ""))
+        bf.lines.append("MON_JSON=\"$PR_DIR/monitors.json\"")
+        bf.lines.append("STATE_FILE=\"$PR_DIR/state_abs_iter.txt\"")
+        bf.lines.append("LOCK_DIR=\"$PR_DIR/lockdir\"")
+        bf.lines.append("PV_SCRIPT=\"$PR_DIR/paraview_cluster.py\"")
+        bf.lines.append("mkdir -p \"$PR_DIR\" \"$UNK_DIR\"")
+        bf.lines.append("touch \"$MON_LOG\"")
+
+        bf.lines.append(f"cp {self.paraview_script} \"$PV_SCRIPT\"")
+
+        bf.lines.append("if [ -n \"$MON_JSON_SRC\" ] && [ -f \"$MON_JSON_SRC\" ]; then")
+        bf.lines.append("  cp \"$MON_JSON_SRC\" \"$MON_JSON\"")
+        bf.lines.append("fi")
+        bf.lines.append("if [ ! -f \"$MON_JSON\" ]; then")
+        bf.lines.append("  echo '{\"interval\":50,\"enabled\":true,\"monitors\":[]}' > \"$MON_JSON\"")
+        bf.lines.append("fi")
+
+        bf.lines.append("rm -f SOLVER_DONE")
+
+        # Parse solver mode from the already-patched input file.
+        bf.lines.append("")
+        bf.lines.append("# ---- Parse steady/unsteady settings from solver input ----")
+        bf.lines.append("FLOW_TYPE=$(python3 - <<'PY'")
+        bf.lines.append("import re")
+        bf.lines.append(f"txt=open('{self.base_name}_{self.n}.inp', encoding='utf-8', errors='ignore').read()")
+        bf.lines.append("m=re.search(r'(?im)^\\s*ivd%flowType\\s*=\\s*([-+]?\\d+)', txt)")
+        bf.lines.append("print(int(m.group(1)) if m else 0)")
+        bf.lines.append("PY")
+        bf.lines.append(")")
+        bf.lines.append('echo "[MON] FLOW_TYPE=$FLOW_TYPE interval=$INTERVAL" >> "$MON_LOG"')
+
+        # Map solver mode to actual .res base.
+        # Steady:    BASE.res*
+        # Transient: BASE_1.res*  (same logic as steady, just different base name)
+        bf.lines.append("")
+        bf.lines.append("post_base_for_abs_iter() {")
+        bf.lines.append("  if [ \"$FLOW_TYPE\" -eq 1 ]; then")
+        bf.lines.append("    echo \"${BASE}_1\"")
+        bf.lines.append("  else")
+        bf.lines.append("    echo \"${BASE}\"")
+        bf.lines.append("  fi")
+        bf.lines.append("}")
+
+        bf.lines.append("local_iter_for_abs_iter() {")
+        bf.lines.append("  abs_it=\"$1\"")
+        bf.lines.append("  echo \"$abs_it\"")
+        bf.lines.append("}")
+
+        # For steady, use BASE.rsd.
+        # For unsteady, use POST_BASE.rsd if it exists; otherwise allow the post attempt
+        # once matching .res files exist.
+        bf.lines.append("")
+        bf.lines.append("latest_local_iter_for_base() {")
+        bf.lines.append("  pb=\"$1\"")
+        bf.lines.append("  required_it=\"${2:-0}\"")
+        bf.lines.append("  rsd=\"${pb}.rsd\"")
+        bf.lines.append("  if [ -f \"$rsd\" ]; then")
+        bf.lines.append("    awk 'NF>0 && $1 ~ /^[0-9]+$/ {it=$1} END{print it+0}' \"$rsd\" 2>/dev/null || echo 0")
+        bf.lines.append("    return")
+        bf.lines.append("  fi")
+        bf.lines.append("  if ls \"${pb}.res\"* >/dev/null 2>&1; then")
+        bf.lines.append("    # If no .rsd exists yet but .res files exist, allow one post attempt.")
+        bf.lines.append("    echo \"$required_it\"")
+        bf.lines.append("  else")
+        bf.lines.append("    echo 0")
+        bf.lines.append("  fi")
+        bf.lines.append("}")
+
+        bf.lines.append("")
+        bf.lines.append("run_post() {")
+        bf.lines.append("  abs_it=\"$1\"")
+        bf.lines.append("  [ -n \"$abs_it\" ] || return 0")
+        bf.lines.append("  [ \"$abs_it\" -gt 0 ] || return 0")
+
+        bf.lines.append("  POST_BASE=$(post_base_for_abs_iter \"$abs_it\")")
+        bf.lines.append("  LOCAL_IT=$(local_iter_for_abs_iter \"$abs_it\")")
+        bf.lines.append("  HAVE_IT=$(latest_local_iter_for_base \"$POST_BASE\" \"$LOCAL_IT\")")
+
+        bf.lines.append("  if [ \"$HAVE_IT\" -lt \"$LOCAL_IT\" ]; then")
+        bf.lines.append("    echo \"[MON] skip abs_it=$abs_it POST_BASE=$POST_BASE local=$LOCAL_IT have=$HAVE_IT\" >> \"$MON_LOG\"")
+        bf.lines.append("    return 0")
+        bf.lines.append("  fi")
+
+        bf.lines.append("  mkdir \"$LOCK_DIR\" 2>/dev/null || { echo \"[MON] lock active, skip abs_it=$abs_it\" >> \"$MON_LOG\"; return 0; }")
+        bf.lines.append("  trap 'rm -rf \"$WORK_DIR\" 2>/dev/null || true; rmdir \"$LOCK_DIR\" 2>/dev/null || true' RETURN")
+        bf.lines.append("  MON_LOG_ABS=\"$(pwd)/$MON_LOG\"")
+        bf.lines.append("  echo \"[MON] abs_it=$abs_it POST_BASE=$POST_BASE local_it=$LOCAL_IT: makeplot2 -> engen_tet -> pvpython\" >> \"$MON_LOG_ABS\"")
+
+        bf.lines.append("  rm -rf \"$WORK_DIR\" && mkdir -p \"$WORK_DIR\"")
+        bf.lines.append("  ln -sf \"$(pwd)/${POST_BASE}.res\"* \"$WORK_DIR/\" 2>/dev/null || true")
+        bf.lines.append("  ln -sf \"$(pwd)/base.plt\" \"$WORK_DIR/${POST_BASE}.plt\" 2>/dev/null || true")
+        bf.lines.append("  ln -sf \"$(pwd)/plotreg.reg\" \"$WORK_DIR/\" 2>/dev/null || true")
+        bf.lines.append("  [ -f \"${POST_BASE}.rsd\" ] && ln -sf \"$(pwd)/${POST_BASE}.rsd\" \"$WORK_DIR/\" || true")
+
+        bf.lines.append("  pushd \"$WORK_DIR\" >/dev/null || return 0")
+
+        bf.lines.append(f"  \"{self.makeplot_exe}\" <<INPUT1 >> \"$MON_LOG_ABS\" 2>&1")
+        bf.lines.append("plotreg.reg")
+        bf.lines.append("${POST_BASE}.res")
+        bf.lines.append("${POST_BASE}.unk")
+        bf.lines.append("F")
+        bf.lines.append("T")
+        bf.lines.append("INPUT1")
+
+        bf.lines.append("  if [ -s \"${POST_BASE}.unk\" ]; then")
+        bf.lines.append("    cp -f \"${POST_BASE}.unk\" \"../unk/${BASE}_abs_${abs_it}_${POST_BASE}.unk\"")
+        bf.lines.append("  else")
+        bf.lines.append("    echo \"[MON][WARN] missing/non-empty ${POST_BASE}.unk at abs_it=$abs_it\" >> \"$MON_LOG_ABS\"")
+        bf.lines.append("  fi")
+
+        bf.lines.append(f"  \"{self.ensight_exe}\" <<INPUT2 >> \"$MON_LOG_ABS\" 2>&1")
+        bf.lines.append("${POST_BASE}")
+        bf.lines.append("T")
+        bf.lines.append(f"{mach_for_post:.8f}")
+        bf.lines.append("298")
+        bf.lines.append("106000")
+        bf.lines.append("1006")
+        bf.lines.append("INPUT2")
+
+        bf.lines.append("  case_path=\"${POST_BASE}.case\"")
+        bf.lines.append("  if [ ! -f \"$case_path\" ]; then")
+        bf.lines.append("    case_path=$(find . -maxdepth 1 -name '*.case' | head -n 1)")
+        bf.lines.append("  fi")
+        bf.lines.append("  echo \"[MON] case_path=$case_path csv_out=../monitors.csv\" >> \"$MON_LOG_ABS\"")
+        bf.lines.append("  if [ ! -f \"$case_path\" ]; then echo \"[MON][WARN] missing case for abs_it=$abs_it\" >> \"$MON_LOG_ABS\"; popd >/dev/null || true; return 0; fi")
+
+        bf.lines.append("  set +e")
+        bf.lines.append("  pvpython --force-offscreen-rendering \"../paraview_cluster.py\" \\")
+        bf.lines.append("    --case \"$case_path\" \\")
+        bf.lines.append("    --iter \"$abs_it\" \\")
+        bf.lines.append(f"    --mach {mach_for_post:.8f} \\")
+        bf.lines.append("    --monitors \"../monitors.json\" \\")
+        bf.lines.append("    --out \"../monitors.csv\" \\")
+        bf.lines.append("    --append >> \"$MON_LOG_ABS\" 2>&1")
+        bf.lines.append("  rc=$?")
+        bf.lines.append("  set -e")
+        bf.lines.append("  echo \"[MON] pvpython rc=$rc for abs_it=$abs_it POST_BASE=$POST_BASE\" >> \"$MON_LOG_ABS\"")
+        bf.lines.append("  popd >/dev/null || true")
+        bf.lines.append("}")
+
+        bf.lines.append("")
+        bf.lines.append("monitor_pr() {")
+        bf.lines.append("  last_abs=0")
+        bf.lines.append("  [ -f \"$STATE_FILE\" ] && last_abs=$(cat \"$STATE_FILE\" 2>/dev/null || echo 0)")
+        bf.lines.append("  echo \"[MON] start: last_abs=$last_abs interval=$INTERVAL\" >> \"$MON_LOG\"")
+        bf.lines.append("  while true; do")
+        bf.lines.append("    next=$(( (last_abs / INTERVAL + 1) * INTERVAL ))")
+        bf.lines.append("    run_post \"$next\" || true")
+
+        bf.lines.append("    POST_BASE=$(post_base_for_abs_iter \"$next\")")
+        bf.lines.append("    LOCAL_IT=$(local_iter_for_abs_iter \"$next\")")
+        bf.lines.append("    HAVE_IT=$(latest_local_iter_for_base \"$POST_BASE\" \"$LOCAL_IT\")")
+        bf.lines.append("    if [ \"$HAVE_IT\" -ge \"$LOCAL_IT\" ]; then")
+        bf.lines.append("      echo \"$next\" > \"$STATE_FILE\"")
+        bf.lines.append("      last_abs=\"$next\"")
+        bf.lines.append("    fi")
+
+        bf.lines.append("    [ -f SOLVER_DONE ] && break")
+        bf.lines.append("    sleep \"$SLEEP_S\"")
+        bf.lines.append("  done")
+        bf.lines.append("}")
+
+        bf.lines.append("")
+        bf.lines.append("monitor_pr &")
+        bf.lines.append("PR_PID=$!")
+        bf.lines.append("# -----------------------------------------------------------")
+        bf.lines.append("")
 
     def _write_morph_config(self):
         """Write morph configuration JSON for one design (self.n)."""
@@ -505,6 +698,17 @@ class ClusterPipelineManager:
                         f"param={parameterisation_method} "
                         f"use_pca={use_pca} coeffs_len={int(coeffs.size)}"
                     )
+                    
+                    use_protection = bool(basis.get("use_protection", False))
+                    protected_nodes = [int(i) for i in basis.get("protected_control_nodes", [])]
+                    protection_radius = basis.get("protection_radius", None)
+
+                    if protection_radius is not None:
+                        protection_radius = float(protection_radius)
+
+                    if not use_protection:
+                        protected_nodes = []
+                        protection_radius = None
 
                     # -------------------------------------------------
                     # DIRECT PARAMETERISATION
@@ -535,6 +739,8 @@ class ClusterPipelineManager:
                             amp_alpha=float(basis.get("amp_alpha", 0.005)),
                             parameterisation_method="direct",
                             direct_parameterisation_subtype=subtype,
+                            protected_nodes=protected_nodes,
+                            radius=protection_radius,
                         )
 
                     # -------------------------------------------------
@@ -572,6 +778,8 @@ class ClusterPipelineManager:
                             basis_axes=basis_axes,
                             use_local_modes=use_local_modes,
                             global_only=global_only,
+                            protected_nodes=protected_nodes,
+                            radius=protection_radius,
                         )
 
                     # -------------------------------------------------
@@ -628,6 +836,8 @@ class ClusterPipelineManager:
                             parameterisation_method="modal",
                             use_local_modes=use_local_modes,
                             global_only=global_only,
+                            protected_nodes=protected_nodes,
+                            radius=protection_radius,
                         )
 
                     d_ctrl = np.asarray(d_ctrl, dtype=float)
@@ -688,7 +898,7 @@ class ClusterPipelineManager:
         # Create batch file
         batch_name = f"morph_n{self.gen}_{n}"
         bf = Batchfile(batch_name)
-        bf.sbatch_params["time"] = "02-00:00"
+        bf.sbatch_params["time"] = "00-01:00"
         bf.sbatch_params["mem"] = "0"
         
         bf.lines.append(f"cd {surf_dir}")
@@ -973,143 +1183,13 @@ class ClusterPipelineManager:
         
         self._append_previous_solution_initialisation(bf, sol_dir)
         
-        # Safe defaults used later by PR monitor / ensight conversion
+        # Safe defaults used later by monitor / ensight conversion
         mach_for_post = float(cond.get("Mach", cond.get("M", 1.0)))
-                # --- background PR monitor (runs during solver) ---
-        bf.lines.append("")
-        bf.lines.append("# ---------------- Pressure-recovery monitor ----------------")
-        bf.lines.append("module load paraview/2019 || true")
-
-        bf.lines.append(f"BASE='{self.base_name}_{self.n}'")
-        bf.lines.append("RSD=\"${BASE}.rsd\"")
-        bf.lines.append(f"INTERVAL={int(self.monitor_interval)}")
-        bf.lines.append("SLEEP_S=20")
-
-        bf.lines.append("PR_DIR=pr_monitor")
-        bf.lines.append("ENS_DIR=\"$PR_DIR/ensight\"")
-        bf.lines.append("CSV_OUT=\"$PR_DIR/monitors.csv\"")
-        bf.lines.append("MON_JSON_SRC=\"{0}\"".format(self.monitor_config_json or ""))
-        bf.lines.append("MON_JSON=\"$PR_DIR/monitors.json\"")
-        bf.lines.append("STATE_FILE=\"$PR_DIR/state_iter.txt\"")
-        bf.lines.append("LOCK_DIR=\"$PR_DIR/lockdir\"")
-        bf.lines.append("PV_SCRIPT=\"$PR_DIR/paraview_cluster.py\"")
-        bf.lines.append("mkdir -p \"$ENS_DIR\" \"$PR_DIR\"")
-
-        # write pvpython script into the run dir
-        bf.lines.append(f"cp {self.paraview_script} \"$PV_SCRIPT\"")
-        
-        bf.lines.append("if [ -n \"$MON_JSON_SRC\" ] && [ -f \"$MON_JSON_SRC\" ]; then")
-        bf.lines.append("  cp \"$MON_JSON_SRC\" \"$MON_JSON\"")
-        bf.lines.append("fi")
-
-        # helper: get latest completed integer iter from rsd
-        bf.lines.append("latest_iter() {")
-        bf.lines.append("  [ -f \"$RSD\" ] || { echo 0; return; }")
-        bf.lines.append("  awk 'NF>0 && $1 ~ /^[0-9]+$/ {it=$1} END{print it+0}' \"$RSD\" 2>/dev/null || echo 0")
-        bf.lines.append("}")
-
-        # helper: one post step
-        bf.lines.append("run_post() {")
-        bf.lines.append("  it=\"$1\"")
-        bf.lines.append("  [ -n \"$it\" ] || return 0")
-        bf.lines.append("  [ \"$it\" -gt 0 ] || return 0")
-        bf.lines.append("  mkdir \"$LOCK_DIR\" 2>/dev/null || { echo \"[PR] lock active, skip it=$it\"; return 0; }")
-        bf.lines.append("  trap 'rmdir \"$LOCK_DIR\" 2>/dev/null || true' RETURN")
-        bf.lines.append("  echo \"[PR] it=$it: makeplot2 -> engen_tet -> pvpython\"")
-
-        bf.lines.append("  stage=\"$PR_DIR/stage_${it}\"")
-        bf.lines.append("  rm -rf \"$stage\" && mkdir -p \"$stage\"")
-
-        bf.lines.append("  ln -sf \"$(pwd)/${BASE}.res_\"* \"$stage/\" 2>/dev/null || true")
-        bf.lines.append("  ln -sf \"$(pwd)/base.plt\" \"$stage/${BASE}.plt\" 2>/dev/null || true")
-        bf.lines.append("  ln -sf \"$(pwd)/plotreg.reg\" \"$stage/\" 2>/dev/null || true")
-        bf.lines.append("  ln -sf \"$(pwd)/${BASE}.rsd\" \"$stage/\" 2>/dev/null || true")
-
-        bf.lines.append("  pushd \"$stage\" >/dev/null || return 0")
-
-        bf.lines.append(f"  \"{self.makeplot_exe}\" <<INPUT1 > makeplot2_${{it}}.log 2>&1")
-        bf.lines.append("plotreg.reg")
-        bf.lines.append("${BASE}.res")
-        bf.lines.append("${BASE}.unk")
-        bf.lines.append("F")
-        bf.lines.append("T")
-        bf.lines.append("INPUT1")
-
-        bf.lines.append(f"  \"{self.ensight_exe}\" <<INPUT2 > engen_${{it}}.log 2>&1")
-        bf.lines.append("${BASE}")
-        bf.lines.append("T")
-        bf.lines.append(f"{mach_for_post:.8f}")
-        bf.lines.append("298")
-        bf.lines.append("106000")
-        bf.lines.append("1006")
-        bf.lines.append("INPUT2")
-
-        bf.lines.append("  out_it=\"../ensight/it_${it}\"")
-        bf.lines.append("  rm -rf \"$out_it\" && mkdir -p \"$out_it\"")
-        bf.lines.append("  rsync -a ./* \"$out_it/\" 2>/dev/null || true")
-        bf.lines.append("  popd >/dev/null || true")
-
-        bf.lines.append("  case_path=\"$ENS_DIR/it_${it}/${BASE}.case\"")
-        bf.lines.append("  if [ ! -f \"$case_path\" ]; then")
-        bf.lines.append("    case_path=$(find \"$ENS_DIR/it_${it}\" -maxdepth 1 -name '*.case' | head -n 1)")
-        bf.lines.append("  fi")
-        bf.lines.append("  echo \"[PR] case_path=$case_path\"")
-        bf.lines.append("  echo \"[PR] csv_out=$CSV_OUT\"")
-        bf.lines.append("  if [ ! -f \"$case_path\" ]; then echo \"[PR][WARN] missing case for it=$it\"; return 0; fi")
-
-        bf.lines.append("  set +e")
-        bf.lines.append("  pvpython --force-offscreen-rendering \"$PV_SCRIPT\" \\")
-        bf.lines.append("    --case \"$case_path\" \\")
-        bf.lines.append("    --iter \"$it\" \\")
-        bf.lines.append(f"    --mach {mach_for_post:.8f} \\")
-        bf.lines.append("    --monitors \"$MON_JSON\" \\")
-        bf.lines.append("    --out \"$CSV_OUT\" \\")
-        bf.lines.append("    --append > \"$PR_DIR/pvpython_${it}.log\" 2>&1")
-        bf.lines.append("  rc=$?")
-        bf.lines.append("  set -e")
-        bf.lines.append("  echo \"[PR] pvpython rc=$rc\"")
-        bf.lines.append("  if [ \"$rc\" -ne 0 ]; then")
-        bf.lines.append("    echo \"[PR][WARN] pvpython failed it=$it (see $PR_DIR/pvpython_${it}.log)\"")
-        bf.lines.append("  fi")
-        bf.lines.append("}")
-
-        # monitor loop in background
-        bf.lines.append("monitor_pr() {")
-        bf.lines.append("  last=0")
-        bf.lines.append("  [ -f \"$STATE_FILE\" ] && last=$(cat \"$STATE_FILE\" 2>/dev/null || echo 0)")
-        bf.lines.append("  while true; do")
-        bf.lines.append("    it=$(latest_iter)")
-        bf.lines.append("    next=$(( (last / INTERVAL + 1) * INTERVAL ))")
-        bf.lines.append("    while [ \"$it\" -ge \"$next\" ] && [ \"$next\" -gt \"$last\" ]; do")
-        bf.lines.append("      run_post \"$next\" || true")
-        bf.lines.append("      echo \"$next\" > \"$STATE_FILE\"")
-        bf.lines.append("      last=\"$next\"")
-        bf.lines.append("      next=$((next + INTERVAL))")
-        bf.lines.append("    done")
-        bf.lines.append("    [ -f SOLVER_DONE ] && break")
-        bf.lines.append("    sleep \"$SLEEP_S\"")
-        bf.lines.append("  done")
-        bf.lines.append("}")
-
-        bf.lines.append("monitor_pr &")
-        bf.lines.append("PR_PID=$!")
-        bf.lines.append("# -----------------------------------------------------------")
-        bf.lines.append("")
-
+        self._append_paraview_monitoring_section(bf, mach_for_post)
         
         # Run solver
         bf.lines.append(f"mpirun {self.solver_exe} < {self.base_name}_{self.n}.inp &> solver_output")
         bf.lines.append("touch SOLVER_DONE")
-
-        # final PR flush in case the monitor missed the last threshold before exit
-        bf.lines.append("final_it=$(latest_iter)")
-        bf.lines.append("last_done=0")
-        bf.lines.append("[ -f \"$STATE_FILE\" ] && last_done=$(cat \"$STATE_FILE\" 2>/dev/null || echo 0)")
-        bf.lines.append("final_snap=$(( final_it / INTERVAL * INTERVAL ))")
-        bf.lines.append("if [ \"$final_snap\" -gt \"$last_done\" ] && [ \"$final_snap\" -ge \"$INTERVAL\" ]; then")
-        bf.lines.append("  run_post \"$final_snap\" || true")
-        bf.lines.append("  echo \"$final_snap\" > \"$STATE_FILE\"")
-        bf.lines.append("fi")
 
         bf.lines.append("wait $PR_PID 2>/dev/null || true")
 
@@ -1143,7 +1223,7 @@ class ClusterPipelineManager:
             stdout_name="solver_output",
             solver_job_id=jobid,
             res_threshold=-3.0,
-            residual_csv=f"{self.base_name}_{self.n}.rsd",
+            residual_csv=f"{self.base_name}.rsd",
         )
         self.job_ids[f"solver_guard_{tag_slug}"] = guard_job
         self._save_state(stage="solver_submitted", solver_job=jobid, solver_guard_job=guard_job)

@@ -1006,6 +1006,87 @@ class MainWindow(QMainWindow):
         self.logger.log("[SIM] Preparing submission…")
         self.sim_thread.start()
         
+    
+    def _normalise_monitor_type_from_metric(self, metric: str) -> str:
+        m = str(metric).strip().lower()
+
+        return {
+            "pressure recovery": "pressure_recovery",
+            "pressure_recovery": "pressure_recovery",
+            "pr": "pressure_recovery",
+            "dc60": "distortion",
+            "distortion": "distortion",
+            "cd": "drag",
+            "drag": "drag",
+            "cl": "lift",
+            "lift": "lift",
+            "cm": "moment",
+            "moment": "moment",
+        }.get(m, m)
+
+
+    def _sync_objective_terms_to_monitor_config(self):
+        """
+        Adds surface-based objective terms to self.monitor_config automatically.
+        RSD terms are ignored because they come directly from the solver .rsd file.
+        """
+        obj = getattr(self, "objective_config", {}) or {}
+        terms = obj.get("terms", []) or []
+
+        if not hasattr(self, "monitor_config") or self.monitor_config is None:
+            self.monitor_config = {
+                "interval": 50,
+                "enabled": True,
+                "monitors": []
+            }
+
+        self.monitor_config.setdefault("interval", 50)
+        self.monitor_config.setdefault("enabled", True)
+        self.monitor_config.setdefault("monitors", [])
+
+        def monitor_key(mon):
+            return (
+                str(mon.get("type", "")).lower(),
+                tuple(int(x) for x in mon.get("surface_ids", []) or []),
+                str(mon.get("direction", "")).lower(),
+            )
+
+        existing = {monitor_key(m) for m in self.monitor_config["monitors"]}
+
+        for term in terms:
+            source = str(term.get("source", "auto")).lower()
+            metric = str(term.get("metric", "")).strip()
+            surface_ids = [int(x) for x in term.get("surface_ids", []) or []]
+
+            if source == "auto":
+                source = "monitor" if surface_ids else "rsd"
+
+            if source != "monitor":
+                continue
+
+            if not surface_ids:
+                continue
+
+            mon = {
+                "type": self._normalise_monitor_type_from_metric(metric),
+                "name": str(term.get("symbol", metric)),
+                "enabled": True,
+                "surface_ids": surface_ids,
+                "objective_symbol": str(term.get("symbol", metric)),
+                "reduction": str(term.get("reduction", "last")),
+            }
+
+            if mon["type"] in ("drag", "lift", "moment"):
+                mon["direction"] = str(term.get("direction", "x"))
+                mon["symmetry_factor"] = int(term.get("symmetry_factor", 1))
+
+            k = monitor_key(mon)
+            if k not in existing:
+                self.monitor_config["monitors"].append(mon)
+                existing.add(k)
+
+        return self.monitor_config
+        
     def export_morph_basis_for_opt(self, remote_run: str) -> str:
         """
         Build a morph_basis.json from the current MeshViewer settings and upload it
@@ -1073,6 +1154,16 @@ class MainWindow(QMainWindow):
             "bump_center": getattr(mv, "bump_center", None),
             "bump_radius": getattr(mv, "bump_radius", None),
             "bump_one_sided": getattr(mv, "bump_one_sided", False),
+            
+            "use_protection": bool(
+                getattr(mv, "use_protection", bool(getattr(mv, "protected_control_nodes", [])))
+            ),
+            "protected_control_nodes": [int(i) for i in getattr(mv, "protected_control_nodes", [])],
+            "protection_radius": (
+                float(getattr(mv, "protection_radius", 0.0))
+                if getattr(mv, "protection_radius", None) is not None
+                else None
+            ),
 
             "rigid_translation": getattr(mv, "rigid_boundary_translation", True),
         }
@@ -1192,7 +1283,21 @@ class MainWindow(QMainWindow):
                 files_to_upload[rel] = src
             else:
                 self.logger.log(f"[OPT][HPC][WARN] No local {rel} found in {search_dirs}")
-
+        
+        rel = f"surfaces/output.vtk"
+        src = find_first(rel)
+        if src:
+            files_to_upload[rel] = src
+        else:
+            self.logger.log(f"[OPT][HPC][WARN] No local {rel} found in {search_dirs}")
+        
+        rel = f"Control Nodes/modal_basis_T_surface.npz"
+        src = find_first(rel)
+        if src:
+            files_to_upload[rel] = src
+        else:
+            self.logger.log(f"[OPT][HPC][WARN] No local {rel} found in {search_dirs}")
+        
         # Generic "control" files (optional, very loose match)
         for pattern in (f"{base}*control*", "control*", f"Mesh3D_v50.ctl"):
             for d in search_dirs:
@@ -1378,6 +1483,7 @@ class MainWindow(QMainWindow):
         if not self._stage_before_hpc_run("OPT"):
             return
         
+        self._sync_objective_terms_to_monitor_config()
         monitor_remote_path = self.stage_monitor_config_to_remote()
         
         remote_basis_path = self.export_morph_basis_for_opt(remote_run)
@@ -1714,29 +1820,47 @@ class MainWindow(QMainWindow):
         
         self.objective_config = {
             "objective_type": "Drag",
-            "expression": "min(CD)",
-            "conditions": [{
-                "Altitude": 36000.0,
-                "AoA": 3.5,
-                "Mach": 1.2,
-                "Re": 1e6,
-                "TurbModel": 2,
-                "EngineFlow": 1,
-                "MassFlow": 1.0,
-                "Weight": 1.0
-            }],
+            "objective_mode": "expression",
+            "expression": "CD",
+            "terms": [
+                {
+                    "metric": "CD",
+                    "source": "rsd",
+                    "surface_ids": [],
+                    "reduction": "last",
+                    "symbol": "CD",
+                    "weight": 1.0,
+                    "direction": "x",
+                    "symmetry_factor": 2,
+                }
+            ],
+            "conditions": [
+                {
+                    "AoA": 3.0,
+                    "Mach": 1.3,
+                    "Re": 6.9e6,
+                    "TurbModel": 1,
+                    "EngineFlow": 2,
+                    "MassFlow": 0.189,
+                    "Weight": 1.0,
+                }
+            ],
             "constraints": []
-        }     
+        }    
         return widget
     
     def open_objective_editor(self):
-        dlg = ObjectiveEditor(self, config=getattr(self, "objective_config", None))
+        dlg = ObjectiveEditor(self)
+
         if dlg.exec_() == QDialog.Accepted:
             self.objective_config = dlg.get_config()
+            self._sync_objective_terms_to_monitor_config()
+
             self.logger.log(
-                f"[OPT] Objective config saved: "
-                f"{self.objective_config.get('expression', '')} "
-                f"with {len(self.objective_config.get('conditions', []))} condition(s)."
+                f"[OPT] Objective saved: expression = {self.objective_config.get('expression', '')}"
+            )
+            self.logger.log(
+                f"[OPT] Objective terms = {len(self.objective_config.get('terms', []))}"
             )
 
     def _get_bo_dimension_info(self):
@@ -2351,6 +2475,16 @@ class MainWindow(QMainWindow):
             if hasattr(self, "geom_window") and self.geom_window is not None:
                 self.geom_window.close()
                 self.geom_window = None
+                
+            try:
+                mv = getattr(self, "mesh_viewer", None)
+                if mv is not None and hasattr(mv, "modal_explorer_window"):
+                    win = mv.modal_explorer_window
+                    if win is not None:
+                        win.close()
+                    mv.modal_explorer_window = None
+            except Exception as e:
+                print(f"[DEBUG] Error closing modal explorer: {e}")
 
             if hasattr(self, "mesh_viewer") and self.mesh_viewer is not None:
                 plotter = self.mesh_viewer.plotter
@@ -2720,52 +2854,85 @@ class ParallelSimEditor(QDialog):
 
 class ObjectiveEditor(QDialog):
     """
-    Lets user define:
-      - Objective type (Drag, Lift, Lift-to-Drag, or Custom expression)
-      - Flow-condition rows with: Altitude, AoA, Mach, Re, TurbModel(1|2|3), EngineFlow(1|2), MassFlow, Weight
-      - Optional constraints (each line: e.g., 'CL >= 0.3' or 'CD <= 0.02')
+    Objective editor with surface-aware objective terms.
+
+    Design principle:
+      - global CL/CD/CM without surfaces -> read from solver .rsd
+      - surface-specific CL/CD/CM/pressure recovery/distortion/drag/lift -> require monitor output
+      - custom expression is evaluated using generated symbols, e.g.:
+          -1.0*PR_s5 + 0.25*DC60_s5 + 0.1*CD_s2_3_4
     """
-    def __init__(self, parent=None, config=None):
+    METRICS = ["CD", "CL", "CM", "CL/CD", "pressure_recovery", "distortion", "drag", "lift"]
+    SOURCES = ["auto", "rsd", "monitor"]
+    REDUCTIONS = ["last", "time_average"]
+
+    def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Define Objective & Flow Conditions")
-        self.resize(950, 560)
-
-        self.config = config or {}
+        self.resize(1150, 760)
+        self.parent_window = parent
 
         layout = QVBoxLayout(self)
 
-        # --- Objective type row ---
+        # --- top expression row ---
         obj_row = QHBoxLayout()
-        obj_row.addWidget(QLabel("Objective:"))
-
+        obj_row.addWidget(QLabel("Objective preset:"))
         self.obj_type = QComboBox()
         self.obj_type.addItems(["Drag", "Lift", "Lift-to-Drag", "Custom Expression"])
-
-        self.custom_expr = QLineEdit()
-        self.custom_expr.setPlaceholderText("e.g. max(CL), max(CL/CD), min(CD + 0.1*abs(CM))")
-
-        self.expr_preview = QLabel("")
-        self.expr_preview.setStyleSheet("color: #888; font-style: italic;")
-
-        self.obj_type.currentTextChanged.connect(self._on_objective_changed)
-        self.custom_expr.textChanged.connect(self._update_preview)
-
+        self.obj_type.currentTextChanged.connect(self._on_preset_changed)
         obj_row.addWidget(self.obj_type)
+
         obj_row.addWidget(QLabel("Expression:"))
+        self.custom_expr = QLineEdit()
+        self.custom_expr.setPlaceholderText("e.g. -1.0*PR_s5 + 0.25*DC60_s5 + 0.1*CD_s2_3_4")
         obj_row.addWidget(self.custom_expr, 1)
         layout.addLayout(obj_row)
-        layout.addWidget(self.expr_preview)
 
-        # --- Table of flow conditions ---
+        help_lbl = QLabel(
+            "Use generated symbols from the table below. BO minimises this scalar, "
+            "so maximise pressure recovery by using a negative coefficient."
+        )
+        help_lbl.setStyleSheet("color: #666; font-style: italic;")
+        layout.addWidget(help_lbl)
+
+        # --- objective terms table ---
+        layout.addWidget(QLabel("Objective terms / required monitors"))
+        self.term_table = QTableWidget(0, 8)
+        self.term_table.setHorizontalHeaderLabels([
+            "Metric", "Source", "Surface IDs", "Reduction", "Symbol", "Weight", "Direction", "Symmetry"
+        ])
+        self.term_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.term_table)
+
+        term_btns = QHBoxLayout()
+        add_term = QPushButton("+ Add Term")
+        del_term = QPushButton("– Remove Selected Term")
+        rebuild_expr = QPushButton("Build Expression From Terms")
+        add_term.clicked.connect(lambda: self._add_term_row())
+        del_term.clicked.connect(self._remove_term_rows)
+        rebuild_expr.clicked.connect(self._build_expression_from_terms)
+        term_btns.addWidget(add_term)
+        term_btns.addWidget(del_term)
+        term_btns.addWidget(rebuild_expr)
+        term_btns.addStretch(1)
+        layout.addLayout(term_btns)
+
+        # --- available surface IDs helper ---
+        surfaces = self._surface_id_strings()
+        if surfaces:
+            surf_lbl = QLabel("Available surfaces: " + ", ".join(surfaces[:40]) + (" ..." if len(surfaces) > 40 else ""))
+            surf_lbl.setStyleSheet("color: #777;")
+            layout.addWidget(surf_lbl)
+
+        # --- flow conditions ---
+        layout.addWidget(QLabel("Flow conditions"))
         self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels([
-            "Altitude (ft)", "AoA", "Mach", "Reynolds",
-            "Turb Model (1|2|3)", "Engine Flow (1|2)", "Mass Flow", "Weight"
+            "Altitude (ft)", "AoA", "Mach", "Reynolds", "Turb Model (1|2|3)",
+            "Engine Flow (1|2)", "Mass Flow", "Weight"
         ])
-        self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table)
 
-        # Add/remove condition buttons
         row_btns = QHBoxLayout()
         add_btn = QPushButton("+ Add Condition")
         del_btn = QPushButton("– Remove Selected")
@@ -2776,441 +2943,669 @@ class ObjectiveEditor(QDialog):
         row_btns.addStretch(1)
         layout.addLayout(row_btns)
 
-        # Constraints block
+        self._add_row(defaults=["36000", "3", "1.3", "6.9e6", "1", "2", "1.0", "1.0"])
+        self._add_term_row(metric="CD", source="rsd", surfaces="", reduction="last", symbol="CD", weight="1.0")
+        self._on_preset_changed(self.obj_type.currentText())
+
         layout.addWidget(QLabel("Constraints (optional, one per line; e.g. 'CL >= 0.3', 'CD <= 0.02')"))
         self.constraints_edit = QTextEdit()
         self.constraints_edit.setPlaceholderText("CL >= 0.3\nCD <= 0.02")
-        self.constraints_edit.setFixedHeight(90)
+        self.constraints_edit.setFixedHeight(80)
         layout.addWidget(self.constraints_edit)
 
-        # Buttons
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self._validate_and_accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
-        self._load_from_config()
+    def _combo(self, values, current):
+        cb = QComboBox()
+        cb.addItems(values)
+        if current in values:
+            cb.setCurrentText(current)
+        return cb
 
-    def _preset_expression(self, obj_type: str) -> str:
-        mapping = {
-            "Drag": "min(CD)",
-            "Lift": "max(CL)",
-            "Lift-to-Drag": "max(CL/CD)",
+    def _surface_id_strings(self):
+        mv = getattr(self.parent_window, "mesh_viewer", None)
+        mesh_obj = getattr(mv, "mesh_obj", None)
+        if mesh_obj is None:
+            return []
+        out = []
+        for name in mesh_obj.get_surface_names():
+            try:
+                sid = int(mesh_obj.get_surface_id(name))
+                out.append(str(sid))
+            except Exception:
+                pass
+        return out
+
+    def _make_symbol(self, metric, surfaces):
+        metric = str(metric or "metric")
+
+        metric_map = {
+            "Pressure Recovery": "PR",
+            "pressure_recovery": "PR",
+            "Distortion": "DC60",
+            "distortion": "DC60",
+            "Drag": "CD",
+            "drag": "CD",
+            "Lift": "CL",
+            "lift": "CL",
+            "Moment": "CM",
+            "moment": "CM",
+            "CD": "CD",
+            "CL": "CL",
+            "CM": "CM",
         }
-        return mapping.get(obj_type, "")
 
-    def _on_objective_changed(self, text):
-        is_custom = (text == "Custom Expression")
-        self.custom_expr.setEnabled(is_custom)
+        base = str(metric_map.get(metric, metric)).replace("/", "_over_").replace(" ", "_")
 
-        if not is_custom:
-            self.custom_expr.setText(self._preset_expression(text))
-            self.custom_expr.setReadOnly(True)
-        else:
-            self.custom_expr.setReadOnly(False)
-            if self.custom_expr.text().strip() in {
-                "min(CD)", "max(CL)", "max(CL/CD)", "Drag", "Lift", "Lift-to-Drag"
-            }:
-                self.custom_expr.clear()
+        surfaces = str(surfaces or "").strip()
+        if surfaces:
+            s = surfaces.replace(",", "_").replace(" ", "")
+            return f"{base}_s{s}"
 
-        self._update_preview()
+        return base
 
-    def _update_preview(self):
-        expr = self.custom_expr.text().strip()
-        if not expr:
-            self.expr_preview.setText("Parsed expression: —")
-            return
-        self.expr_preview.setText(f"Parsed expression: {expr}")
+    def _add_term_row(self, metric="CD", source="rsd", surfaces="", reduction="last", symbol="", weight="1.0", direction="x", symmetry="1"):
+        row = self.term_table.rowCount()
+        self.term_table.insertRow(row)
 
-    def _load_from_config(self):
-        cfg = self.config or {}
-        obj_type = (cfg.get("objective_type") or "Drag").strip()
-        expr = (cfg.get("expression") or "").strip()
+        metric_cb = self._combo(self.METRICS, metric)
+        source_cb = self._combo(self.SOURCES, source)
+        reduction_cb = self._combo(self.REDUCTIONS, reduction)
+        dir_cb = self._combo(["x", "y", "z"], direction)
+        sym_cb = self._combo(["1", "2", "4"], str(symmetry))
 
-        valid_types = ["Drag", "Lift", "Lift-to-Drag", "Custom Expression"]
-        if obj_type not in valid_types:
-            obj_type = "Custom Expression"
+        self.term_table.setCellWidget(row, 0, metric_cb)
+        self.term_table.setCellWidget(row, 1, source_cb)
+        self.term_table.setItem(row, 2, QTableWidgetItem(str(surfaces)))
+        self.term_table.setCellWidget(row, 3, reduction_cb)
+        self.term_table.setItem(row, 4, QTableWidgetItem(symbol or self._make_symbol(metric, surfaces)))
+        self.term_table.setItem(row, 5, QTableWidgetItem(str(weight)))
+        self.term_table.setCellWidget(row, 6, dir_cb)
+        self.term_table.setCellWidget(row, 7, sym_cb)
 
-        idx = self.obj_type.findText(obj_type)
-        if idx >= 0:
-            self.obj_type.setCurrentIndex(idx)
+        def refresh_symbol():
+            surf_txt = self.term_table.item(row, 2).text() if self.term_table.item(row, 2) else ""
+            self.term_table.setItem(row, 4, QTableWidgetItem(self._make_symbol(metric_cb.currentText(), surf_txt)))
+            if source_cb.currentText() == "auto":
+                source_cb.setCurrentText("monitor" if self._parse_surface_ids(surf_txt) or metric_cb.currentText() not in ("CD", "CL", "CM", "CL/CD") else "rsd")
 
-        if obj_type == "Custom Expression":
-            self.custom_expr.setReadOnly(False)
-            self.custom_expr.setEnabled(True)
-            self.custom_expr.setText(expr)
-        else:
-            self.custom_expr.setText(self._preset_expression(obj_type))
-            self.custom_expr.setReadOnly(True)
-            self.custom_expr.setEnabled(False)
+        metric_cb.currentTextChanged.connect(lambda _t: refresh_symbol())
 
-        conds = cfg.get("conditions", [])
-        if conds:
-            for c in conds:
-                self._add_row(defaults=[
-                    str(c.get("Altitude", 36000)),
-                    str(c.get("AoA", 3)),
-                    str(c.get("Mach", 1.3)),
-                    str(c.get("Re", 1e6)),
-                    str(c.get("TurbModel", 1)),
-                    str(c.get("EngineFlow", 2)),
-                    str(c.get("MassFlow", 1.0)),
-                    str(c.get("Weight", 1.0)),
-                ])
-        else:
-            self._add_row(defaults=["36000", "3", "1.3", "1e6", "1", "2", "1.0", "1.0"])
-
-        cons = cfg.get("constraints", [])
-        if cons:
-            self.constraints_edit.setPlainText("\n".join(cons))
-
-        self._update_preview()
+    def _remove_term_rows(self):
+        rows = sorted({i.row() for i in self.term_table.selectedIndexes()}, reverse=True)
+        for r in rows:
+            self.term_table.removeRow(r)
 
     def _add_row(self, defaults=None):
         row = self.table.rowCount()
         self.table.insertRow(row)
-        defaults = defaults or ["36000", "3", "1.3", "1e6", "1", "2", "1.0", "1.0"]
+        defaults = defaults or ["36000", "3", "1.3", "6.9e6", "1", "2", "1.0", "1.0"]
         for c, val in enumerate(defaults):
-            self.table.setItem(row, c, QTableWidgetItem(str(val)))
+            self.table.setItem(row, c, QTableWidgetItem(val))
 
     def _remove_rows(self):
         rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
         for r in rows:
             self.table.removeRow(r)
 
-    def _validate_expression(self, expr: str):
-        import re
+    def _parse_surface_ids(self, text):
+        if not text:
+            return []
+        out = []
+        for tok in str(text).replace(";", ",").split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                out.append(int(tok))
+            except ValueError:
+                pass
+        return out
 
-        expr = (expr or "").strip()
-        if not expr:
-            return False, "Objective expression cannot be empty."
+    def _term_dicts(self):
+        terms = []
+        for r in range(self.term_table.rowCount()):
+            metric = self.term_table.cellWidget(r, 0).currentText()
+            source = self.term_table.cellWidget(r, 1).currentText()
+            surfaces_txt = self.term_table.item(r, 2).text().strip() if self.term_table.item(r, 2) else ""
+            surface_ids = self._parse_surface_ids(surfaces_txt)
+            if source == "auto":
+                source = "monitor" if surface_ids or metric not in ("CD", "CL", "CM", "CL/CD") else "rsd"
+            symbol = self.term_table.item(r, 4).text().strip() if self.term_table.item(r, 4) else self._make_symbol(metric, surfaces_txt)
+            weight = float(self.term_table.item(r, 5).text()) if self.term_table.item(r, 5) and self.term_table.item(r, 5).text().strip() else 1.0
+            terms.append({
+                "metric": metric,
+                "source": source,
+                "surface_ids": surface_ids,
+                "reduction": self.term_table.cellWidget(r, 3).currentText(),
+                "symbol": symbol,
+                "weight": weight,
+                "direction": self.term_table.cellWidget(r, 6).currentText(),
+                "symmetry_factor": int(self.term_table.cellWidget(r, 7).currentText()),
+            })
+        return terms
 
-        allowed_pattern = r'^[A-Za-z0-9_+\-*/().<>=! \t]+$'
-        if not re.match(allowed_pattern, expr):
-            return False, "Expression contains unsupported characters."
+    def _build_expression_from_terms(self):
+        parts = []
+        for t in self._term_dicts():
+            w = float(t.get("weight", 1.0))
+            sym = t["symbol"]
+            if w == 1.0:
+                parts.append(sym)
+            elif w == -1.0:
+                parts.append(f"-{sym}")
+            else:
+                parts.append(f"{w:g}*{sym}")
+        self.obj_type.setCurrentText("Custom Expression")
+        self.custom_expr.setText(" + ".join(parts) if parts else "CD")
 
-        # Accept either wrapped objective or plain expression
-        m = re.match(r'^\s*(min|max)\s*\(\s*(.+)\s*\)\s*$', expr, flags=re.IGNORECASE)
-        inner = expr
-        if m:
-            inner = m.group(2).strip()
-
-        # only allow recognised variables/functions/tokens
-        tokens = set(re.findall(r'[A-Za-z_]+', inner))
-        allowed_tokens = {"CL", "CD", "CM", "abs", "min", "max"}
-        bad = sorted(tok for tok in tokens if tok not in allowed_tokens)
-        if bad:
-            return False, f"Unsupported symbol(s) in expression: {', '.join(bad)}"
-
-        return True, ""
+    def _on_preset_changed(self, text):
+        presets = {
+            "Drag": "CD",
+            "Lift": "-CL",
+            "Lift-to-Drag": "-(CL/CD)",
+        }
+        if text in presets:
+            self.custom_expr.setText(presets[text])
 
     def _validate_and_accept(self):
-        obj_type = self.obj_type.currentText()
-
-        if obj_type == "Custom Expression":
-            expr = self.custom_expr.text().strip()
-            ok, msg = self._validate_expression(expr)
-            if not ok:
-                QMessageBox.warning(self, "Invalid objective expression", msg)
+        # Basic validation: monitor terms need surfaces, except custom monitor definitions may be global later.
+        for t in self._term_dicts():
+            if t["source"] == "monitor" and not t.get("surface_ids"):
+                QMessageBox.warning(self, "Objective term", f"Monitor term '{t['symbol']}' needs at least one surface ID.")
                 return
-        else:
-            # enforce preset expression
-            self.custom_expr.setText(self._preset_expression(obj_type))
-
-        if self.table.rowCount() == 0:
-            QMessageBox.warning(self, "Missing conditions", "Please add at least one flow condition.")
-            return
-
-        conds_ok = False
-        for r in range(self.table.rowCount()):
-            try:
-                alt = float(self.table.item(r, 0).text().strip())
-                aoa = float(self.table.item(r, 1).text().strip())
-                mach = float(self.table.item(r, 2).text().strip())
-                reyn = float(self.table.item(r, 3).text().strip())
-                turb = int(self.table.item(r, 4).text().strip())
-                engf = int(self.table.item(r, 5).text().strip())
-                mflow = float(self.table.item(r, 6).text().strip())
-                weight = float(self.table.item(r, 7).text().strip())
-
-                if turb not in (1, 2, 3):
-                    raise ValueError("Turb Model must be 1, 2, or 3.")
-                if engf not in (1, 2):
-                    raise ValueError("Engine Flow must be 1 or 2.")
-                if mach <= 0:
-                    raise ValueError("Mach must be > 0.")
-                if reyn <= 0:
-                    raise ValueError("Reynolds must be > 0.")
-                if weight <= 0:
-                    raise ValueError("Weight must be > 0.")
-
-                conds_ok = True
-            except Exception as e:
-                QMessageBox.warning(self, "Invalid condition row", f"Row {r+1}: {e}")
-                return
-
-        if not conds_ok:
-            QMessageBox.warning(self, "Missing conditions", "Please define at least one valid flow condition.")
-            return
-
+        if not self.custom_expr.text().strip():
+            self._build_expression_from_terms()
         self.accept()
 
     def get_config(self):
         obj_type = self.obj_type.currentText()
-
-        if obj_type == "Custom Expression":
+        terms = self._term_dicts()
+        expr = self.custom_expr.text().strip()
+        if not expr:
+            self._build_expression_from_terms()
             expr = self.custom_expr.text().strip()
-        else:
-            expr = self._preset_expression(obj_type)
 
         conds = []
         for r in range(self.table.rowCount()):
             def _txt(c):
                 it = self.table.item(r, c)
                 return it.text().strip() if it else ""
+            try:
+                conds.append({
+                    "Altitude":   float(_txt(0)) if _txt(0) else 36000.0,
+                    "AoA":        float(_txt(1)) if _txt(1) else 3.0,
+                    "Mach":       float(_txt(2)) if _txt(2) else 1.2,
+                    "Re":         float(_txt(3)) if _txt(3) else 6.9e6,
+                    "TurbModel":  int(_txt(4)) if _txt(4) else 1,
+                    "EngineFlow": int(_txt(5)) if _txt(5) else 2,
+                    "MassFlow":   float(_txt(6)) if _txt(6) else 1.0,
+                    "Weight":     float(_txt(7)) if _txt(7) else 1.0,
+                })
+            except Exception:
+                pass
 
-            conds.append({
-                "Altitude":   float(_txt(0)) if _txt(0) else 36000.0,
-                "AoA":        float(_txt(1)) if _txt(1) else 3.0,
-                "Mach":       float(_txt(2)) if _txt(2) else 1.2,
-                "Re":         float(_txt(3)) if _txt(3) else 1e6,
-                "TurbModel":  int(_txt(4))   if _txt(4) else 1,
-                "EngineFlow": int(_txt(5))   if _txt(5) else 1,
-                "MassFlow":   float(_txt(6)) if _txt(6) else 1.0,
-                "Weight":     float(_txt(7)) if _txt(7) else 1.0
-            })
-
-        cons = []
-        for line in self.constraints_edit.toPlainText().splitlines():
-            ln = line.strip()
-            if ln:
-                cons.append(ln)
+        cons = [ln.strip() for ln in self.constraints_edit.toPlainText().splitlines() if ln.strip()]
 
         return {
             "objective_type": obj_type,
+            "objective_mode": "expression",
             "expression": expr,
+            "terms": terms,
             "conditions": conds,
-            "constraints": cons
+            "constraints": cons,
         }
         
-class MonitorEditor(QDialog):
-    def __init__(self, parent=None, mesh_obj=None, config=None):
-        super().__init__(parent)
-        self.setWindowTitle("Monitor Settings")
-        self.resize(820, 620)
-
+class _SurfaceSelectionBox(QGroupBox):
+    """Small reusable surface selector used by monitor dialogs."""
+    def __init__(self, mesh_obj, title="Surface IDs", selected=None, parent=None):
+        super().__init__(title, parent)
         self.mesh_obj = mesh_obj
-        self.config = config or {}
+        selected = set(int(x) for x in (selected or []) if str(x).strip() != "")
 
         layout = QVBoxLayout(self)
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QAbstractItemView.MultiSelection)
+        layout.addWidget(self.list_widget)
 
-        # ---- interval ----
-        interval_row = QFormLayout()
-        self.interval_spin = QSpinBox()
-        self.interval_spin.setRange(1, 100000)
-        self.interval_spin.setValue(int(self.config.get("interval", 50)))
-        interval_row.addRow("Monitor interval (iterations):", self.interval_spin)
-        layout.addLayout(interval_row)
+        btn_row = QHBoxLayout()
+        self.select_all_btn = QPushButton("Select all")
+        self.clear_btn = QPushButton("Clear")
+        btn_row.addWidget(self.select_all_btn)
+        btn_row.addWidget(self.clear_btn)
+        layout.addLayout(btn_row)
 
-        # ---- pressure recovery ----
-        self.pr_group = QGroupBox("Pressure Recovery")
-        pr_form = QFormLayout(self.pr_group)
-        self.pr_enable = QCheckBox("Enable pressure recovery monitor")
-        self.pr_enable.setChecked(self._find_enabled("pressure_recovery", default=True))
-        pr_form.addRow(self.pr_enable)
+        self.select_all_btn.clicked.connect(self.select_all)
+        self.clear_btn.clicked.connect(self.clear_selection)
+        self._populate(selected)
 
-        self.pr_surfaces = QListWidget()
-        self.pr_surfaces.setSelectionMode(QAbstractItemView.MultiSelection)
-        self._populate_surface_list(self.pr_surfaces, self._find_surface_ids("pressure_recovery"))
-        pr_form.addRow("Surfaces:", self.pr_surfaces)
-        
-        layout.addWidget(self.pr_group)
-        
-        # ---- DC60 ----
-        self.dc_group = QGroupBox("Distortion")
-        dc_form = QFormLayout(self.dc_group)
-        self.dc_enable = QCheckBox("Enable distortion monitor")
-        self.dc_enable.setChecked(self._find_enabled("distortion", default=True))
-        dc_form.addRow(self.dc_enable)
-
-        self.dc_surfaces = QListWidget()
-        self.dc_surfaces.setSelectionMode(QAbstractItemView.MultiSelection)
-        self._populate_surface_list(self.dc_surfaces, self._find_surface_ids("distortion"))
-        dc_form.addRow("Surfaces:", self.dc_surfaces)
-
-        layout.addWidget(self.dc_group)
-
-        # ---- drag ----
-        self.drag_group = QGroupBox("Drag Monitor")
-        drag_form = QFormLayout(self.drag_group)
-
-        self.drag_enable = QCheckBox("Enable drag monitor")
-        self.drag_enable.setChecked(self._find_enabled("drag", default=False))
-        drag_form.addRow(self.drag_enable)
-
-        self.drag_name = QLineEdit(self._find_name("drag", "drag"))
-        drag_form.addRow("Name:", self.drag_name)
-
-        self.drag_dir = QComboBox()
-        self.drag_dir.addItems(["x", "y", "z"])
-        self.drag_dir.setCurrentText(self._find_direction("drag", "x"))
-        drag_form.addRow("Direction:", self.drag_dir)
-
-        self.drag_sym = QComboBox()
-        self.drag_sym.addItems(["1", "2", "4"])
-        self.drag_sym.setCurrentText(str(int(self._find_symmetry("drag", 2))))
-        drag_form.addRow("Symmetry factor:", self.drag_sym)
-
-        self.drag_surfaces = QListWidget()
-        self.drag_surfaces.setSelectionMode(QAbstractItemView.MultiSelection)
-        self._populate_surface_list(self.drag_surfaces, self._find_surface_ids("drag"))
-        drag_form.addRow("Surfaces:", self.drag_surfaces)
-
-        layout.addWidget(self.drag_group)
-
-        # ---- lift ----
-        self.lift_group = QGroupBox("Lift Monitor")
-        lift_form = QFormLayout(self.lift_group)
-
-        self.lift_enable = QCheckBox("Enable lift monitor")
-        self.lift_enable.setChecked(self._find_enabled("lift", default=False))
-        lift_form.addRow(self.lift_enable)
-
-        self.lift_name = QLineEdit(self._find_name("lift", "lift"))
-        lift_form.addRow("Name:", self.lift_name)
-
-        self.lift_dir = QComboBox()
-        self.lift_dir.addItems(["x", "y", "z"])
-        self.lift_dir.setCurrentText(self._find_direction("lift", "z"))
-        lift_form.addRow("Direction:", self.lift_dir)
-
-        self.lift_sym = QComboBox()
-        self.lift_sym.addItems(["1", "2", "4"])
-        self.lift_sym.setCurrentText(str(int(self._find_symmetry("lift", 2))))
-        lift_form.addRow("Symmetry factor:", self.lift_sym)
-
-        self.lift_surfaces = QListWidget()
-        self.lift_surfaces.setSelectionMode(QAbstractItemView.MultiSelection)
-        self._populate_surface_list(self.lift_surfaces, self._find_surface_ids("lift"))
-        lift_form.addRow("Surfaces:", self.lift_surfaces)
-
-        layout.addWidget(self.lift_group)
-
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.accepted.connect(self._validate_and_accept)
-        btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
-
-    def _all_surface_items(self):
-        if self.mesh_obj is None:
-            return []
-        out = []
-        for name in self.mesh_obj.get_surface_names():
+    def _populate(self, selected):
+        names = []
+        try:
+            names = list(self.mesh_obj.get_surface_names())
+        except Exception:
+            names = []
+        for nm in names:
             try:
-                sid = int(self.mesh_obj.get_surface_id(name))
-                out.append((sid, name))
+                sid = int(self.mesh_obj.get_surface_id(nm))
+            except Exception:
+                sid = nm
+            item = QListWidgetItem(f"{sid}    {nm}")
+            item.setData(Qt.UserRole, sid)
+            self.list_widget.addItem(item)
+            try:
+                if int(sid) in selected:
+                    item.setSelected(True)
+            except Exception:
+                pass
+
+    def select_all(self):
+        for i in range(self.list_widget.count()):
+            self.list_widget.item(i).setSelected(True)
+
+    def clear_selection(self):
+        self.list_widget.clearSelection()
+
+    def selected_ids(self):
+        out = []
+        for it in self.list_widget.selectedItems():
+            try:
+                out.append(int(it.data(Qt.UserRole)))
             except Exception:
                 pass
         return out
+        
+class MonitorItemDialog(QDialog):
+    """Editor for one monitor definition."""
+    MONITOR_TYPES = [
+        ("pressure_recovery", "Pressure recovery"),
+        ("drag", "Drag / force coefficient"),
+        ("distortion", "DC60 distortion"),
+        ("line_probe", "Line probe / shock location"),
+        ("plane_integral", "Plane integral / mass flow"),
+        ("separation", "Separation"),
+    ]
 
-    def _populate_surface_list(self, widget, selected_ids):
-        selected_ids = set(int(x) for x in (selected_ids or []))
-        for sid, name in self._all_surface_items():
-            item = QListWidgetItem(f"{sid} : {name}")
-            item.setData(Qt.UserRole, sid)
-            widget.addItem(item)
-            if sid in selected_ids:
-                item.setSelected(True)
+    def __init__(self, mesh_obj, monitor=None, fixed_type=None, parent=None):
+        super().__init__(parent)
+        self.mesh_obj = mesh_obj
+        self.monitor = dict(monitor or {})
+        self.fixed_type = fixed_type
+        self.setWindowTitle("Monitor definition")
+        self.resize(760, 680)
 
-    def _selected_surface_ids(self, widget):
-        out = []
-        for item in widget.selectedItems():
-            sid = item.data(Qt.UserRole)
-            if sid is not None:
-                out.append(int(sid))
-        return out
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
 
-    def _find_monitor(self, mtype):
-        for m in self.config.get("monitors", []):
-            if str(m.get("type", "")).strip().lower() == mtype:
-                return m
-        return {}
+        self.type_combo = QComboBox()
+        for key, label in self.MONITOR_TYPES:
+            self.type_combo.addItem(label, key)
+        mtype = fixed_type or self.monitor.get("type", "pressure_recovery")
+        idx = self.type_combo.findData(mtype)
+        self.type_combo.setCurrentIndex(max(0, idx))
+        self.type_combo.setEnabled(fixed_type is None)
 
-    def _find_enabled(self, mtype, default=False):
-        return bool(self._find_monitor(mtype).get("enabled", default))
+        self.name_edit = QLineEdit(str(self.monitor.get("name", mtype)))
+        self.enabled_cb = QCheckBox("Enabled")
+        self.enabled_cb.setChecked(bool(self.monitor.get("enabled", True)))
 
-    def _find_name(self, mtype, default):
-        return str(self._find_monitor(mtype).get("name", default))
+        form.addRow("Type:", self.type_combo)
+        form.addRow("Name:", self.name_edit)
+        form.addRow("", self.enabled_cb)
+        layout.addLayout(form)
 
-    def _find_direction(self, mtype, default):
-        return str(self._find_monitor(mtype).get("direction", default))
+        self.stack = QStackedWidget()
+        layout.addWidget(self.stack, 1)
 
-    def _find_symmetry(self, mtype, default):
-        return float(self._find_monitor(mtype).get("symmetry_factor", default))
+        self.pages = {}
+        for key, _label in self.MONITOR_TYPES:
+            page = self._make_page(key)
+            self.pages[key] = page
+            self.stack.addWidget(page["widget"])
 
-    def _find_surface_ids(self, mtype):
-        return list(self._find_monitor(mtype).get("surface_ids", []))
+        self.type_combo.currentIndexChanged.connect(self._on_type_changed)
+        self._on_type_changed()
 
-    def _validate_and_accept(self):
-        if self.pr_enable.isChecked() and not self._selected_surface_ids(self.pr_surfaces):
-            QMessageBox.warning(self, "Pressure recovery monitor", "Please select at least one surface for pressure recovery.")
-            return
-        if self.dc_enable.isChecked() and not self._selected_surface_ids(self.dc_surfaces):
-            QMessageBox.warning(self, "DC60 monitor", "Please select at least one surface for distortion.")
-            return
-        if self.drag_enable.isChecked() and not self._selected_surface_ids(self.drag_surfaces):
-            QMessageBox.warning(self, "Drag monitor", "Please select at least one surface for drag.")
-            return
-        if self.lift_enable.isChecked() and not self._selected_surface_ids(self.lift_surfaces):
-            QMessageBox.warning(self, "Lift monitor", "Please select at least one surface for lift.")
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _vec_edit(self, value, default):
+        vals = value if value is not None else default
+        try:
+            txt = ", ".join(f"{float(v):g}" for v in vals)
+        except Exception:
+            txt = ", ".join(str(v) for v in default)
+        e = QLineEdit(txt)
+        e.setPlaceholderText("x, y, z")
+        return e
+
+    def _parse_vec(self, edit, name):
+        raw = edit.text().replace(";", ",").split(",")
+        try:
+            vals = [float(x.strip()) for x in raw if x.strip() != ""]
+        except Exception:
+            raise ValueError(f"{name} must contain three numeric values.")
+        if len(vals) != 3:
+            raise ValueError(f"{name} must contain exactly three values.")
+        return vals
+
+    def _make_page(self, mtype):
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        form = QFormLayout()
+        data = {"widget": w}
+        m = self.monitor if self.monitor.get("type", mtype) == mtype else {}
+
+        if mtype in ("pressure_recovery", "drag", "distortion", "separation"):
+            surf = _SurfaceSelectionBox(self.mesh_obj, "Selected surfaces", m.get("surface_ids", []))
+            data["surfaces"] = surf
+            layout.addWidget(surf)
+
+        if mtype == "pressure_recovery":
+            data["center"] = self._vec_edit(m.get("center"), [11.3, 0.4, 0.21])
+            data["radius"] = QDoubleSpinBox(); data["radius"].setRange(0.0, 1e6); data["radius"].setDecimals(6); data["radius"].setValue(float(m.get("radius", 0.37)))
+            data["axis"] = QComboBox(); data["axis"].addItems(["x", "y", "z"]); data["axis"].setCurrentText(str(m.get("axis", "x")))
+            form.addRow("Fallback AIP centre:", data["center"])
+            form.addRow("Fallback AIP radius:", data["radius"])
+            form.addRow("AIP normal axis:", data["axis"])
+            layout.addLayout(form)
+            layout.addWidget(QLabel("If surfaces are selected, they are used directly; otherwise the fallback geometric AIP selector is used."))
+
+        elif mtype == "drag":
+            data["direction"] = QComboBox(); data["direction"].addItems(["x", "y", "z"]); data["direction"].setCurrentText(str(m.get("direction", "x")))
+            data["sym"] = QSpinBox(); data["sym"].setRange(1, 100); data["sym"].setValue(int(m.get("symmetry_factor", 1)))
+            form.addRow("Force direction:", data["direction"])
+            form.addRow("Symmetry factor:", data["sym"])
+            layout.addLayout(form)
+
+        elif mtype == "distortion":
+            data["center"] = self._vec_edit(m.get("center"), [11.3, 0.4, 0.21])
+            data["radius"] = QDoubleSpinBox(); data["radius"].setRange(1e-12, 1e6); data["radius"].setDecimals(6); data["radius"].setValue(float(m.get("radius", 0.37)))
+            data["axis"] = QComboBox(); data["axis"].addItems(["x", "y", "z"]); data["axis"].setCurrentText(str(m.get("axis", "x")))
+            data["n_angles"] = QSpinBox(); data["n_angles"].setRange(1, 360); data["n_angles"].setValue(int(m.get("n_angles", 5)))
+            data["n_radial"] = QSpinBox(); data["n_radial"].setRange(1, 200); data["n_radial"].setValue(int(m.get("n_radial", 8)))
+            data["sector"] = QDoubleSpinBox(); data["sector"].setRange(1.0, 360.0); data["sector"].setDecimals(2); data["sector"].setValue(float(m.get("sector_deg", 60.0)))
+            form.addRow("AIP centre:", data["center"])
+            form.addRow("AIP radius:", data["radius"])
+            form.addRow("AIP normal axis:", data["axis"])
+            form.addRow("Rake angles:", data["n_angles"])
+            form.addRow("Radial samples per rake:", data["n_radial"])
+            form.addRow("Sector angle [deg]:", data["sector"])
+            layout.addLayout(form)
+
+        elif mtype == "line_probe":
+            data["point_a"] = self._vec_edit(m.get("point_a"), [0.0, 0.0, 0.0])
+            data["point_b"] = self._vec_edit(m.get("point_b"), [1.0, 0.0, 0.0])
+            data["n_samples"] = QSpinBox(); data["n_samples"].setRange(2, 10000); data["n_samples"].setValue(int(m.get("n_samples", 300)))
+            data["method"] = QComboBox(); data["method"].addItems(["combined_pressure_mach_gradient", "max_dpds", "min_dMds", "raw_probe"])
+            data["method"].setCurrentText(str(m.get("method", "combined_pressure_mach_gradient")))
+            data["variables"] = QLineEdit(", ".join(m.get("variables", ["pressure", "mach", "density", "velocity_magnitude"])))
+            data["variables"].setPlaceholderText("pressure, mach, density, velocity_magnitude")
+            form.addRow("Point A:", data["point_a"])
+            form.addRow("Point B:", data["point_b"])
+            form.addRow("Number of samples:", data["n_samples"])
+            form.addRow("Detection method:", data["method"])
+            form.addRow("Variables:", data["variables"])
+            layout.addLayout(form)
+            layout.addWidget(QLabel("Use this for shock-location tracking or any centreline/duct line history."))
+
+        elif mtype == "plane_integral":
+            data["mode"] = QComboBox(); data["mode"].addItems(["slice", "surface"]); data["mode"].setCurrentText(str(m.get("mode", "slice")))
+            data["origin"] = self._vec_edit(m.get("origin"), [0.0, 0.0, 0.0])
+            data["normal"] = self._vec_edit(m.get("normal"), [1.0, 0.0, 0.0])
+            data["quantity"] = QComboBox(); data["quantity"].addItems(["mass_flow", "area", "area_average_pressure", "area_average_total_pressure"])
+            data["quantity"].setCurrentText(str(m.get("quantity", "mass_flow")))
+            data["radius"] = QDoubleSpinBox(); data["radius"].setRange(0.0, 1e6); data["radius"].setDecimals(6); data["radius"].setValue(float(m.get("radius", 0.0)))
+            surf = _SurfaceSelectionBox(self.mesh_obj, "Optional selected surface for surface-mode", m.get("surface_ids", []))
+            data["surfaces"] = surf
+            form.addRow("Plane mode:", data["mode"])
+            form.addRow("Plane origin:", data["origin"])
+            form.addRow("Plane normal:", data["normal"])
+            form.addRow("Quantity:", data["quantity"])
+            form.addRow("Optional clipping radius (0=off):", data["radius"])
+            layout.addLayout(form)
+            layout.addWidget(surf)
+            layout.addWidget(QLabel("For mass-flow mismatch, create one plane_integral monitor for each section: capture, throat, AIP, etc."))
+
+        elif mtype == "separation":
+            data["streamwise"] = self._vec_edit(m.get("streamwise_direction"), [1.0, 0.0, 0.0])
+            data["max_dist"] = QDoubleSpinBox(); data["max_dist"].setRange(1e-12, 1e6); data["max_dist"].setDecimals(6); data["max_dist"].setValue(float(m.get("max_wall_distance", 0.02)))
+            data["normal_samples"] = QSpinBox(); data["normal_samples"].setRange(2, 500); data["normal_samples"].setValue(int(m.get("normal_samples", 20)))
+            data["method"] = QComboBox(); data["method"].addItems(["reversed_flow_fraction", "separation_thickness"])
+            data["method"].setCurrentText(str(m.get("method", "reversed_flow_fraction")))
+            form.addRow("Streamwise direction:", data["streamwise"])
+            form.addRow("Max wall-normal distance:", data["max_dist"])
+            form.addRow("Normal samples:", data["normal_samples"])
+            form.addRow("Method:", data["method"])
+            layout.addLayout(form)
+            layout.addWidget(QLabel("First robust metric is reversed-flow fraction; thickness can be added once the sampling is stable."))
+
+        layout.addStretch(1)
+        return data
+
+    def _on_type_changed(self):
+        mtype = self.type_combo.currentData()
+        keys = [k for k, _ in self.MONITOR_TYPES]
+        self.stack.setCurrentIndex(keys.index(mtype))
+        if not self.name_edit.text().strip() or self.name_edit.text().strip() in [k for k, _ in self.MONITOR_TYPES]:
+            self.name_edit.setText(mtype)
+
+    def _current_page(self):
+        return self.pages[self.type_combo.currentData()]
+
+    def accept_if_valid(self):
+        try:
+            m = self.get_monitor()
+            # basic sanity checks
+            if m["type"] in ("drag", "separation") and not m.get("surface_ids"):
+                raise ValueError(f"{m['type']} monitor needs at least one selected surface.")
+            if m["type"] == "distortion" and not m.get("surface_ids"):
+                # Allow geometric fallback, but radius/centre must be present.
+                pass
+            if m["type"] == "plane_integral" and m.get("mode") == "surface" and not m.get("surface_ids"):
+                raise ValueError("Surface-mode plane integral needs at least one selected surface.")
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid monitor", str(e))
             return
         self.accept()
 
-    def get_config(self):
-        monitors = []
-
-        if self.pr_enable.isChecked():
-            monitors.append({
-                "type": "pressure_recovery",
-                "name": "pressure_recovery",
-                "enabled": True,
-                "surface_ids": self._selected_surface_ids(self.pr_surfaces),
-            })
-            
-        if self.dc_enable.isChecked():
-            monitors.append({
-                "type": "distortion",
-                "name": "distortion",
-                "enabled": True,
-                "surface_ids": self._selected_surface_ids(self.dc_surfaces),
-            })
-
-        if self.drag_enable.isChecked():
-            monitors.append({
-                "type": "drag",
-                "name": self.drag_name.text().strip() or "drag",
-                "enabled": True,
-                "surface_ids": self._selected_surface_ids(self.drag_surfaces),
-                "direction": self.drag_dir.currentText(),
-                "symmetry_factor": int(self.drag_sym.currentText())
-            })
-
-        if self.lift_enable.isChecked():
-            monitors.append({
-                "type": "lift",
-                "name": self.lift_name.text().strip() or "lift",
-                "enabled": True,
-                "surface_ids": self._selected_surface_ids(self.lift_surfaces),
-                "direction": self.lift_dir.currentText(),
-                "symmetry_factor": int(self.lift_sym.currentText())
-            })
-
-        return {
-            "interval": int(self.interval_spin.value()),
-            "enabled": True,
-            "monitors": monitors
+    def get_monitor(self):
+        mtype = self.type_combo.currentData()
+        page = self._current_page()
+        out = {
+            "type": mtype,
+            "name": self.name_edit.text().strip() or mtype,
+            "enabled": bool(self.enabled_cb.isChecked()),
         }
 
+        if "surfaces" in page:
+            out["surface_ids"] = page["surfaces"].selected_ids()
+
+        if mtype == "pressure_recovery":
+            out.update({
+                "center": self._parse_vec(page["center"], "AIP centre"),
+                "radius": float(page["radius"].value()),
+                "axis": page["axis"].currentText(),
+            })
+        elif mtype == "drag":
+            out.update({
+                "direction": page["direction"].currentText(),
+                "symmetry_factor": int(page["sym"].value()),
+            })
+        elif mtype == "distortion":
+            out.update({
+                "center": self._parse_vec(page["center"], "AIP centre"),
+                "radius": float(page["radius"].value()),
+                "axis": page["axis"].currentText(),
+                "n_angles": int(page["n_angles"].value()),
+                "n_radial": int(page["n_radial"].value()),
+                "sector_deg": float(page["sector"].value()),
+                "denominator": "q_mean",
+            })
+        elif mtype == "line_probe":
+            variables = [v.strip() for v in page["variables"].text().split(",") if v.strip()]
+            out.update({
+                "point_a": self._parse_vec(page["point_a"], "Point A"),
+                "point_b": self._parse_vec(page["point_b"], "Point B"),
+                "n_samples": int(page["n_samples"].value()),
+                "method": page["method"].currentText(),
+                "variables": variables,
+            })
+        elif mtype == "plane_integral":
+            out.update({
+                "mode": page["mode"].currentText(),
+                "origin": self._parse_vec(page["origin"], "Plane origin"),
+                "normal": self._parse_vec(page["normal"], "Plane normal"),
+                "quantity": page["quantity"].currentText(),
+                "radius": float(page["radius"].value()),
+                "surface_ids": page["surfaces"].selected_ids(),
+            })
+        elif mtype == "separation":
+            out.update({
+                "streamwise_direction": self._parse_vec(page["streamwise"], "Streamwise direction"),
+                "max_wall_distance": float(page["max_dist"].value()),
+                "normal_samples": int(page["normal_samples"].value()),
+                "method": page["method"].currentText(),
+            })
+        return out
+
+
+class MonitorEditor(QDialog):
+    """Top-level monitor editor for AerOpt."""
+    def __init__(self, parent=None, mesh_obj=None, config=None):
+        super().__init__(parent)
+        self.mesh_obj = mesh_obj
+        self.config = dict(config or {"interval": 50, "enabled": True, "monitors": []})
+        self.monitors = [dict(m) for m in self.config.get("monitors", [])]
+
+        self.setWindowTitle("Monitors")
+        self.resize(900, 620)
+        layout = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        self.enabled_cb = QCheckBox("Enable monitors")
+        self.enabled_cb.setChecked(bool(self.config.get("enabled", True)))
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(1, 100000)
+        self.interval_spin.setValue(int(self.config.get("interval", 50)))
+        top.addWidget(self.enabled_cb)
+        top.addWidget(QLabel("Monitor interval [iterations]:"))
+        top.addWidget(self.interval_spin)
+        top.addStretch(1)
+        layout.addLayout(top)
+
+        mid = QHBoxLayout()
+        self.list_widget = QListWidget()
+        mid.addWidget(self.list_widget, 1)
+
+        btn_col = QVBoxLayout()
+        self.add_btn = QPushButton("Add…")
+        self.edit_btn = QPushButton("Edit")
+        self.dup_btn = QPushButton("Duplicate")
+        self.remove_btn = QPushButton("Remove")
+        btn_col.addWidget(self.add_btn)
+        btn_col.addWidget(self.edit_btn)
+        btn_col.addWidget(self.dup_btn)
+        btn_col.addWidget(self.remove_btn)
+        btn_col.addSpacing(12)
+
+        for key, label in MonitorItemDialog.MONITOR_TYPES:
+            b = QPushButton(f"+ {label}")
+            b.clicked.connect(lambda _=False, k=key: self.add_monitor(k))
+            btn_col.addWidget(b)
+        btn_col.addStretch(1)
+        mid.addLayout(btn_col)
+        layout.addLayout(mid, 1)
+
+        hint = QLabel(
+            "Tip: use line_probe for shock-location histories; use plane_integral for mass-flow planes; "
+            "use separation for wall reversed-flow/separation metrics."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.add_btn.clicked.connect(lambda: self.add_monitor(None))
+        self.edit_btn.clicked.connect(self.edit_current)
+        self.dup_btn.clicked.connect(self.duplicate_current)
+        self.remove_btn.clicked.connect(self.remove_current)
+        self.list_widget.itemDoubleClicked.connect(lambda _item: self.edit_current())
+
+        self.refresh_list()
+
+    def _summary(self, mon):
+        typ = mon.get("type", "?")
+        name = mon.get("name", typ)
+        enabled = "ON" if mon.get("enabled", True) else "OFF"
+        extra = ""
+        if mon.get("surface_ids"):
+            extra = f" surfaces={mon.get('surface_ids')}"
+        elif typ == "line_probe":
+            extra = f" A={mon.get('point_a')} B={mon.get('point_b')}"
+        elif typ == "plane_integral":
+            extra = f" {mon.get('quantity','')} origin={mon.get('origin')} normal={mon.get('normal')}"
+        return f"[{enabled}] {name}  ({typ}){extra}"
+
+    def refresh_list(self):
+        self.list_widget.clear()
+        for mon in self.monitors:
+            self.list_widget.addItem(self._summary(mon))
+
+    def _current_index(self):
+        row = self.list_widget.currentRow()
+        return row if 0 <= row < len(self.monitors) else -1
+
+    def add_monitor(self, fixed_type=None):
+        dlg = MonitorItemDialog(self.mesh_obj, fixed_type=fixed_type, parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            self.monitors.append(dlg.get_monitor())
+            self.refresh_list()
+            self.list_widget.setCurrentRow(len(self.monitors) - 1)
+
+    def edit_current(self):
+        idx = self._current_index()
+        if idx < 0:
+            return
+        dlg = MonitorItemDialog(self.mesh_obj, monitor=self.monitors[idx], parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            self.monitors[idx] = dlg.get_monitor()
+            self.refresh_list()
+            self.list_widget.setCurrentRow(idx)
+
+    def duplicate_current(self):
+        idx = self._current_index()
+        if idx < 0:
+            return
+        mon = dict(self.monitors[idx])
+        mon["name"] = f"{mon.get('name', mon.get('type', 'monitor'))}_copy"
+        self.monitors.insert(idx + 1, mon)
+        self.refresh_list()
+        self.list_widget.setCurrentRow(idx + 1)
+
+    def remove_current(self):
+        idx = self._current_index()
+        if idx < 0:
+            return
+        del self.monitors[idx]
+        self.refresh_list()
+        self.list_widget.setCurrentRow(min(idx, len(self.monitors) - 1))
+
+    def get_config(self):
+        return {
+            "interval": int(self.interval_spin.value()),
+            "enabled": bool(self.enabled_cb.isChecked()),
+            "monitors": [dict(m) for m in self.monitors],
+        }
+        
 class TrainMeshClassifierDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)

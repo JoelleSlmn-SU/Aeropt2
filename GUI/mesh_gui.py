@@ -1,10 +1,11 @@
 import os, sys
 import numpy as np
+import json
 import matplotlib.cm as cm
 from PyQt5.QtCore import Qt, pyqtSignal, QThread, QTimer, pyqtSlot, QMetaObject, Q_ARG, QObject, QEvent
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QPushButton, QLabel, QSizePolicy, QDialog, QComboBox, QSpinBox, QFormLayout,
-    QFileDialog, QLineEdit, QHBoxLayout, QInputDialog, QCheckBox, QListWidget, QDialogButtonBox, QTableWidget
+    QWidget, QVBoxLayout, QPushButton, QLabel, QSizePolicy, QDialog, QComboBox, QSpinBox, QFormLayout, QDoubleSpinBox,
+    QFileDialog, QLineEdit, QHBoxLayout, QInputDialog, QCheckBox, QListWidget, QDialogButtonBox, QTableWidget, QTableWidgetItem, QAbstractItemView
 )
 import pyvista as pv
 import vtk
@@ -92,6 +93,9 @@ class MeshViewer(QWidget):
         self.CSurfaces = []
         self.USurfaces = []
         self.hidden_surfaces = set()
+        
+        self.protected_control_nodes = []
+        self.protection_radius = None
         
         self.debug_mode = True
         
@@ -961,6 +965,8 @@ class MeshViewer(QWidget):
         
         self.plot_T_surfaces()
         
+        self.control_node_point_indices = np.asarray(self._manual_pick_ids, dtype=int)
+        
     def _on_global_modes_toggled(self, checked):
         if checked:
             existing = getattr(self, "global_mode_config", [])
@@ -1013,6 +1019,16 @@ class MeshViewer(QWidget):
         self.points, self.control_nodes = selectControlNodes(output_path, self.output_dir, num_input)
         surf_normals = _surface_normals(self.points, knn=16)
         self.control_normals = _map_normals_to_control(self.control_nodes, self.points, surf_normals, k=12)
+        
+        from scipy.spatial import cKDTree
+
+        tree = cKDTree(np.asarray(self.points, float))
+        dist, idx = tree.query(np.asarray(self.control_nodes, float), k=1)
+
+        if np.max(dist) > 1e-8:
+            self.log(f"[WARN] Some control nodes are not exact T-mesh nodes. max dist = {np.max(dist):.3e}")
+
+        self.control_node_point_indices = idx.astype(int)
 
         try:
             pts = np.asarray(self.points, float)
@@ -1165,6 +1181,48 @@ class MeshViewer(QWidget):
         self.USurfaces = [self.mesh_obj.friendly_names[nm] for nm in U_names]
         self.CSurfaces = [self.mesh_obj.friendly_names[nm] for nm in C_names]
         self.log(f"[EDIT] Updated surfaces: T={self.TSurfaces}, U={self.USurfaces}, C={self.CSurfaces}")
+
+    def open_protected_nodes_dialog(self):
+        if getattr(self, "control_nodes", None) is None:
+            self.log("[PROTECT][ERROR] No control nodes available.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Select protected control nodes")
+        dlg.resize(500, 500)
+
+        layout = QVBoxLayout(dlg)
+
+        table = QTableWidget()
+        table.setRowCount(len(self.control_nodes))
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(["CN", "x", "y", "z"])
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.MultiSelection)
+
+        protected = set(getattr(self, "protected_control_nodes", []))
+
+        for i, p in enumerate(np.asarray(self.control_nodes, float)):
+            table.setItem(i, 0, QTableWidgetItem(str(i)))
+            table.setItem(i, 1, QTableWidgetItem(f"{p[0]:.6e}"))
+            table.setItem(i, 2, QTableWidgetItem(f"{p[1]:.6e}"))
+            table.setItem(i, 3, QTableWidgetItem(f"{p[2]:.6e}"))
+
+            if i in protected:
+                table.selectRow(i)
+
+        layout.addWidget(QLabel("Select CN rows to protect. Protected nodes receive zero displacement."))
+        layout.addWidget(table)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+
+        if dlg.exec_() == QDialog.Accepted:
+            rows = sorted({idx.row() for idx in table.selectedIndexes()})
+            self.protected_control_nodes = rows
+            self.log(f"[PROTECT] Protected CN indices: {rows}")
 
     def plot_T_surfaces(self):
         try:
@@ -1340,6 +1398,29 @@ class MeshViewer(QWidget):
             self.frame_knn_spin.setRange(3, 200)
             self.frame_knn_spin.setValue(int(getattr(self, "frame_knn", 16)))
             self.form.addRow("Local-frame kNN:", self.frame_knn_spin)
+            
+            self.use_protection_cb = QCheckBox("Use protected control-node weighting")
+            self.use_protection_cb.setChecked(getattr(self, "use_protection", False))
+            self.form.addRow(self.use_protection_cb)
+
+            self.protection_radius_spin = QDoubleSpinBox()
+            self.protection_radius_spin.setRange(1e-9, 1e9)
+            self.protection_radius_spin.setDecimals(6)
+            self.protection_radius_spin.setSingleStep(1.0)
+            default_radius = getattr(self, "protection_radius", None)
+            if default_radius is None:
+                t_scale = getattr(self, "t_patch_scale", None)
+                if t_scale is None:
+                    t_scale = 1.0
+                default_radius = 0.05 * float(t_scale)
+
+            default_radius = float(default_radius)
+            self.protection_radius_spin.setValue(default_radius)
+            self.form.addRow("Protection radius:", self.protection_radius_spin)
+
+            self.select_protected_btn = QPushButton("Select protected control nodes")
+            self.select_protected_btn.clicked.connect(self.open_protected_nodes_dialog)
+            self.form.addRow(self.select_protected_btn)
 
             # local/global toggles
             self.use_local_modes_cb = QCheckBox("Use Laplacian local modes")
@@ -1409,6 +1490,11 @@ class MeshViewer(QWidget):
         self.main_layout.addWidget(self.form_container)
         self.main_layout.addWidget(self.save_btn)
         
+        self.modal_explorer_btn = QPushButton("Explore Modal Coefficients")
+        self.modal_explorer_btn.setEnabled(False)
+        self.modal_explorer_btn.clicked.connect(self.open_modal_explorer)
+        self.main_layout.addWidget(self.modal_explorer_btn)
+        
     def back_to_surface_selection(self):
         """Return to T/U/C surface selection view."""
         try:
@@ -1424,6 +1510,63 @@ class MeshViewer(QWidget):
             self._add_mesh_to_plotter()
         except Exception as e:
             self.log(f"[ERROR] Could not go back: {e}")
+            
+    
+    def open_modal_explorer(self):
+        if getattr(self, "parameterisation_method", None) != "modal":
+            self.log("[MODAL] Modal explorer is only available for modal parameterisation.")
+            return
+
+        if getattr(self, "control_nodes", None) is None:
+            self.log("[MODAL][ERROR] Save control nodes first.")
+            return
+
+        if getattr(self, "control_normals", None) is None:
+            self.log("[MODAL][ERROR] Control normals are missing.")
+            return
+
+        mesh_path = os.path.join(self.output_dir, "surfaces", "output.vtk")
+        if not os.path.exists(mesh_path):
+            self.log(f"[MODAL][ERROR] Could not find T-surface preview mesh: {mesh_path}")
+            return
+
+        from GUI.modal_explorer_gui import ModalSliderExplorer, ModalState
+
+        state = ModalState(
+            mesh_path=mesh_path,
+            control_nodes=np.asarray(self.control_nodes, float),
+            control_normals=np.asarray(self.control_normals, float),
+            output_dir=getattr(self, "output_dir", None),
+
+            k_modes=int(getattr(self, "k_modes", 5)),
+            knn=int(getattr(self, "frame_knn", 12)),
+            seed=int(getattr(self, "seed", 0)),
+
+            amp_alpha=float(getattr(self, "amp_alpha", 0.005)),
+            t_patch_scale=getattr(self, "t_patch_scale", None),
+            normal_project=bool(getattr(self, "normal_project", True)),
+            vector_mode=str(getattr(self, "vector_mode", "local_frame")),
+            frame_knn=int(getattr(self, "frame_knn", 12)),
+
+            global_modes=bool(getattr(self, "global_modes_selected", False)),
+            global_mode_config=getattr(self, "global_mode_config", []),
+
+            deform_scale=10.0,
+            rbf_kernel="thin_plate_spline",
+            rbf_smoothing=1e-8,
+            
+            graph_method=getattr(self, "graph_method", "mutual_knn"),
+            delaunay_cutoff_factor=float(getattr(self, "delaunay_cutoff_factor", 2.5)),
+
+            use_protection=bool(getattr(self, "use_protection", False)),
+            protected_control_nodes=getattr(self, "protected_control_nodes", []),
+            protection_radius=getattr(self, "protection_radius", None),
+        )
+
+        self.modal_explorer_window = ModalSliderExplorer(initial=state)
+        self.modal_explorer_window.show()
+
+        self.log("[MODAL] Opened modal coefficient explorer.")
 
     def save_controlnodes(self):
 
@@ -1513,6 +1656,10 @@ class MeshViewer(QWidget):
             self.pca_k_red = None if k_tmp <= 0 else k_tmp
             self.pca_k_final = getattr(self, "pca_k_final", None)
             self.pca_cache_path = getattr(self, "pca_cache_path", None)
+            
+            self.use_protection = bool(self.use_protection_cb.isChecked())
+            self.protection_radius = float(self.protection_radius_spin.value())
+            self.protected_control_nodes = getattr(self, "protected_control_nodes", [])
 
         # --------------------------------------------------
         # persist control nodes + normals to output directory
@@ -1557,6 +1704,9 @@ class MeshViewer(QWidget):
                 "pca_k_red": self.pca_k_red,
                 "pca_k_final": self.pca_k_final,
                 "pca_cache_path": self.pca_cache_path,
+                "use_protection": self.use_protection,
+                "protected_control_nodes": self.protected_control_nodes,
+                "protection_radius": self.protection_radius,
             }
 
             meta_path = os.path.join(cn_dir, "control_nodes_meta.json")
@@ -1601,6 +1751,27 @@ class MeshViewer(QWidget):
                 self.pca_cache_path = None
                 self.pca_k_final = None
 
+        if hasattr(self, "modal_explorer_btn"):
+            self.modal_explorer_btn.setEnabled(
+                getattr(self, "parameterisation_method", "modal") == "modal"
+            )
+
+        if self.parameterisation_method == "modal" and self.use_local_modes:
+            from ShapeParameterization.controlNodeDisp import build_t_surface_modal_cache
+
+            modal_cache_path = build_t_surface_modal_cache(
+                output_dir=self.output_dir,
+                control_nodes=np.asarray(self.control_nodes, float),
+                k_modes=int(self.k_modes),
+                frame_knn=int(self.frame_knn),
+                graph_method=getattr(self, "graph_method", "mutual_knn"),
+                delaunay_cutoff_factor=float(getattr(self, "delaunay_cutoff_factor", 2.5)),
+            )
+
+            self.modal_cache_path = modal_cache_path
+            meta["modal_cache_path"] = modal_cache_path
+            self.log(f"[MODAL] Saved T-surface modal cache -> {modal_cache_path}")
+            
         self.control_ready.emit()
         
     @pyqtSlot()

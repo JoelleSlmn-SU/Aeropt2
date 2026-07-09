@@ -22,17 +22,17 @@ class MethodConfig:
     dof: int
 
 
-MAIN_DIR = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples"
-CASE = "0"   # e.g. 0 -> n_0, "ell" -> n_ell, etc.
+MAIN_DIR = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\Old\Parameterization Comparison same DOF with MQ"
+CASE = "ell"   # e.g. 0 -> n_0, "ell" -> n_ell, etc.
 
 OUT_DIR = os.path.join(MAIN_DIR, f"analysis_results_{CASE}")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 METHODS = [
     MethodConfig(name="xyz",        folder="param1", dof=6),
-    MethodConfig(name="dn",         folder="param2", dof=6),
-    MethodConfig(name="lap",        folder="param3", dof=12),
-    MethodConfig(name="lap_global", folder="param4", dof=12),
+    MethodConfig(name="dn",         folder="param2", dof=18),
+    MethodConfig(name="lap",        folder="param3", dof=18),
+    MethodConfig(name="lap_global", folder="param4", dof=18),
 ]
 
 # Toggle this on to additionally compare morph smoothness / robustness
@@ -41,7 +41,7 @@ COMPARE_MORPH = True
 
 # Baseline/original .fro mesh used by features.py.
 # If left as None, the script will try a few automatic guesses.
-ORIG_FRO: Optional[str] = None
+ORIG_FRO: Optional[str] = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\Old\Parameterization Comparison same DOF with MQ\param3\surfaces\n_ell\ell.fro"
 
 # Optional path to morph_basis.json for region-aware features.
 # If None, the script tries to auto-discover one per method.
@@ -49,7 +49,7 @@ MORPH_BASIS_JSON: Optional[str] = None
 
 # Optional filename stem of the baseline mesh, e.g. "corner" or "crm".
 # If None, the script tries to infer it from morph_config*.json.
-BASE_MESH_STEM: Optional[str] = None
+BASE_MESH_STEM: Optional[str] = "ell"
 
 # Common comparison space when methods use different control-node sets
 # Options:

@@ -278,11 +278,11 @@ def slice_and_fit_bspline(points, plane_origin, plane_normal, thickness=0.01, sm
 
 
 # Load your VTK mesh
-filepath = os.path.join(os.getcwd(), "Inputs", "Mesh Data", "crm2.vtm")
+filepath = os.path.join(os.getcwd(), "examples", "ell opt", "ell.vtm")
 mesh = load_mesh(filepath)
 surf_names = mesh.get_surface_names()
 
-idx = 8
+idx = 1
 surf = mesh.get_surface_mesh(surf_names[idx])
 surf_poly = surf.extract_surface()
 surf_with_normals = surf_poly.compute_normals(point_normals=True, auto_orient_normals=True)
@@ -330,4 +330,3 @@ for i, s in enumerate(spline_list):
 
 surf = build_nurbs_surface_from_splines(spline_list, degree_u=3, degree_v=3)
 step_path = os.path.join(os.getcwd(), "Outputs", "NURBs", f"surface_{idx}.step")
-export_nurbs_to_step(surf, step_path)

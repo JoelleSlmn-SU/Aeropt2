@@ -21,6 +21,8 @@ import numpy as np
 # Keep this for your current Aeropt2 layout.
 sys.path.append(os.path.dirname("FileRW"))
 
+from FileRW.StpFile import step_to_stl
+
 # =====================
 # Robust OCP helpers
 # =====================
@@ -156,6 +158,53 @@ def _map_uv_to_surf_params(u, v, u_min, u_max, v_min, v_max, occ_surf):
     return U, V
 
 # =====================
+# Comparison
+# =====================
+
+import numpy as np
+import pyvista as pv
+from scipy.spatial import cKDTree
+
+
+def mesh_distance_report(reference_mesh_path, reconstructed_stl_path, sample_reconstructed=True):
+    """
+    Computes nearest-neighbour distance between:
+      reference mesh = morphed VTK/FRO-converted mesh
+      reconstructed mesh = STL from morphed STEP
+
+    Distances are measured:
+      reconstructed STL points → reference mesh points
+    """
+
+    ref = pv.read(reference_mesh_path).extract_surface().triangulate()
+    rec = pv.read(reconstructed_stl_path).extract_surface().triangulate()
+
+    ref_pts = np.asarray(ref.points)
+    rec_pts = np.asarray(rec.points)
+
+    tree = cKDTree(ref_pts)
+    d, idx = tree.query(rec_pts, k=1)
+
+    print("\n[Distance: STL → morphed mesh]")
+    print(f"reference points     : {len(ref_pts)}")
+    print(f"reconstructed points : {len(rec_pts)}")
+    print(f"mean error           : {d.mean():.6e}")
+    print(f"RMS error            : {np.sqrt(np.mean(d**2)):.6e}")
+    print(f"median error         : {np.median(d):.6e}")
+    print(f"95th percentile      : {np.percentile(d, 95):.6e}")
+    print(f"99th percentile      : {np.percentile(d, 99):.6e}")
+    print(f"max error            : {d.max():.6e}")
+
+    rec["distance_to_morphed_mesh"] = d
+
+    out_vtp = reconstructed_stl_path.replace(".stl", "_error.vtp")
+    rec.save(out_vtp)
+
+    print(f"\nSaved coloured error mesh:\n{out_vtp}")
+
+    return d, rec
+
+# =====================
 # STEP loading
 # =====================
 
@@ -180,6 +229,69 @@ def _load_step_shape_and_faces(step_path):
             faces.append(f)
         exp.Next()
     return shape, faces
+
+def diagnose_surface_bbox_overlap(step_path, fro_path, sid, pad_frac=0.02):
+    from FileRW.FroFile import FroFile
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+    import numpy as np
+
+    ff = FroFile.fromFile(fro_path)
+    _shape, faces = _load_step_shape_and_faces(step_path)
+
+    _, gids = ff.get_surface_nodes(sid)
+    gids = np.asarray(gids, dtype=np.int64)
+    pts = ff.nodes[gids]
+
+    mn = pts.min(axis=0)
+    mx = pts.max(axis=0)
+    diag = np.linalg.norm(mx - mn)
+    pad = pad_frac * diag
+
+    mn_p = mn - pad
+    mx_p = mx + pad
+
+    print(f"\n[FRO] Surface {sid}")
+    print(f"  nodes = {len(gids)}")
+    print(f"  bbox min = {mn}")
+    print(f"  bbox max = {mx}")
+    print(f"  pad      = {pad:.6e}")
+
+    hits = []
+
+    for i, face in enumerate(faces):
+        box = Bnd_Box()
+        BRepBndLib.Add_s(face, box)
+
+        try:
+            xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
+        except Exception:
+            continue
+
+        fmin = np.array([xmin, ymin, zmin], float)
+        fmax = np.array([xmax, ymax, zmax], float)
+
+        overlap = np.all(mx_p >= fmin) and np.all(fmax >= mn_p)
+
+        if overlap:
+            # overlap-box size, useful for ranking
+            omin = np.maximum(mn_p, fmin)
+            omax = np.minimum(mx_p, fmax)
+            osize = np.maximum(omax - omin, 0.0)
+            ovol = float(osize[0] * osize[1] * osize[2])
+
+            hits.append((i, ovol, fmin, fmax))
+
+    hits = sorted(hits, key=lambda x: -x[1])
+
+    print(f"\n[CAD] STEP faces whose bbox overlaps FRO surface {sid}: {len(hits)}")
+    for i, ovol, fmin, fmax in hits[:20]:
+        print(
+            f"  face={i:3d} | overlap_vol={ovol:.3e} | "
+            f"bbox_min={fmin} | bbox_max={fmax}"
+        )
+
+    return hits
 
 # =====================
 # Projection utilities
@@ -256,12 +368,36 @@ def _interpolate_scattered_points(uv_samples, xyz_samples, u_grid, v_grid):
 # =====================
 
 def _bspline_bounds(surf):
-    # Geom_BSplineSurface provides bounds via Bounds(...)
-    u1 = float(surf.FirstUParameter())
-    u2 = float(surf.LastUParameter())
-    v1 = float(surf.FirstVParameter())
-    v2 = float(surf.LastVParameter())
-    return u1, u2, v1, v2
+    """
+    Robust bounds for Geom_BSplineSurface / Geom_Surface in OCP.
+    """
+    # Try generic surface parameter methods first
+    for names in [
+        ("FirstUParameter", "LastUParameter", "FirstVParameter", "LastVParameter"),
+    ]:
+        try:
+            return (
+                float(getattr(surf, names[0])()),
+                float(getattr(surf, names[1])()),
+                float(getattr(surf, names[2])()),
+                float(getattr(surf, names[3])()),
+            )
+        except Exception:
+            pass
+
+    # For Geom_BSplineSurface, use knot ranges
+    try:
+        return (
+            float(surf.UKnot(1)),
+            float(surf.UKnot(surf.NbUKnots())),
+            float(surf.VKnot(1)),
+            float(surf.VKnot(surf.NbVKnots())),
+        )
+    except Exception:
+        pass
+
+    # Final fallback used by GeomAPI_PointsToBSplineSurface often
+    return 0.0, 1.0, 0.0, 1.0
 
 
 def _map_uv_linear(u, v, cad_uv_bounds, new_uv_bounds):
@@ -432,14 +568,18 @@ def _build_trimmed_face_from_original_uv(face_orig, occ_surf_new, uv_domain, n_e
 # Public API
 # =====================
 
-def build_step_fro_link(step_path, fro_path, link_npz_path, surface_to_face_index=None, require_in_bounds=True):
+def build_step_fro_link(step_path, fro_path, link_npz_path, surface_to_face_index=None, require_in_bounds=True, surfaces=None):
     """Build STEP↔FRO link storing (sid)->(gids, face_index, uv, proj0, dist0)."""
     from FileRW.FroFile import FroFile
 
     ff = FroFile.fromFile(fro_path)
     _shape, faces = _load_step_shape_and_faces(step_path)
 
-    sids = list(ff.get_surface_ids())
+    if surfaces is None:
+        sids = list(ff.get_surface_ids())
+    else:
+        sids = list(surfaces)
+        
     print(f"[link] FRO surfaces: {len(sids)}  |  STEP faces: {len(faces)}")
 
     link = {}
@@ -468,35 +608,286 @@ def build_step_fro_link(step_path, fro_path, link_npz_path, surface_to_face_inde
         mean_dist = float(best["score"])
         finite = best["dist0"][np.isfinite(best["dist0"])]
         max_dist = float(finite.max()) if finite.size else float("inf")
+        
+        for tol in [1e-6, 1e-4, 1e-3, 1e-2, 1e-1, 1.0]:
+            n_bad = int(np.sum(finite > tol))
+            print(f"    dist > {tol:.0e}: {n_bad}/{finite.size} = {100*n_bad/finite.size:.2f}%")
+
+        print("    p50 =", np.percentile(finite, 50))
+        print("    p90 =", np.percentile(finite, 90))
+        print("    p95 =", np.percentile(finite, 95))
+        print("    p99 =", np.percentile(finite, 99))
+        print("    max =", finite.max())
 
         if max_dist > 1e-2:
             print(f"[CAD-LINK][WARNING] Surface {sid:4d}: large proj error max={max_dist:.3e} mean={mean_dist:.3e}")
 
+        projection_tol = 0.2
+        keep = np.isfinite(best["dist0"]) & (best["dist0"] < projection_tol)
+
+        print(
+            f"[CAD-LINK] Surface {sid:4d}: keeping "
+            f"{int(keep.sum())}/{len(keep)} points under tol={projection_tol}"
+        )
+
         link[int(sid)] = dict(
-            gids=gids,
+            gids=gids[keep],
             face_index=int(best["face_index"]),
-            uv=np.asarray(best["uv"], float),
-            proj0=np.asarray(best["proj0"], float),
-            dist0=np.asarray(best["dist0"], float),
+            uv=np.asarray(best["uv"][keep], float),
+            proj0=np.asarray(best["proj0"][keep], float),
+            dist0=np.asarray(best["dist0"][keep], float),
         )
         print(f"[CAD-LINK] Surface {sid:4d}: points={len(gids):5d} | face={best['face_index']:3d} | dist mean={mean_dist:.3e}")
 
     np.savez_compressed(link_npz_path, link=link)
     print(f"[CAD-LINK] Saved link to {link_npz_path}")
 
+def _as_global_nodes_from_fro_elements(arr):
+    """
+    Best-effort extraction of node IDs from FRO triangle/quad records.
+    Handles records like [sid,n1,n2,n3], [n1,n2,n3,sid], etc.
+    """
+    a = np.asarray(arr, dtype=np.int64)
+    if a.ndim == 1:
+        a = a.reshape(1, -1)
+    return a
+
+
+def _surface_elements_for_sid(ff, sid):
+    """
+    Return element node IDs for one FRO surface.
+    Output is a list of tuples, each tuple being 3 or 4 global node IDs.
+    """
+    elems = []
+
+    for attr, nnode in [("boundary_triangles", 3), ("boundary_quads", 4)]:
+        raw = getattr(ff, attr, None)
+        if raw is None:
+            continue
+
+        arr = _as_global_nodes_from_fro_elements(raw)
+        if arr.size == 0:
+            continue
+
+        for row in arr:
+            row = list(map(int, row))
+
+            # Common layouts:
+            # [sid, n1, n2, n3]
+            # [n1, n2, n3, sid]
+            # [sid, n1, n2, n3, ...]
+            # [n1, n2, n3, ..., sid]
+            candidates = []
+
+            if len(row) >= nnode + 1 and row[0] == int(sid):
+                candidates.append(tuple(row[1:1+nnode]))
+
+            if len(row) >= nnode + 1 and row[-1] == int(sid):
+                candidates.append(tuple(row[:nnode]))
+
+            # Some FRO variants store surface id in column 3/4/5.
+            for k, val in enumerate(row):
+                if val == int(sid):
+                    nodes = row[:k] + row[k+1:]
+                    if len(nodes) >= nnode:
+                        candidates.append(tuple(nodes[:nnode]))
+
+            for c in candidates:
+                if len(set(c)) == len(c):
+                    elems.append(c)
+                    break
+
+    if not elems:
+        raise RuntimeError(f"No boundary triangles/quads found for FRO surface {sid}")
+
+    return elems
+
+
+def _order_boundary_loop_from_elements(elems):
+    """
+    Given triangles/quads as global node IDs, find edges used once and order the
+    largest boundary loop.
+    """
+    from collections import defaultdict, Counter
+
+    edge_count = Counter()
+
+    for e in elems:
+        e = list(map(int, e))
+        m = len(e)
+        for i in range(m):
+            a = e[i]
+            b = e[(i + 1) % m]
+            if a == b:
+                continue
+            edge = tuple(sorted((a, b)))
+            edge_count[edge] += 1
+
+    boundary_edges = [edge for edge, c in edge_count.items() if c == 1]
+    if not boundary_edges:
+        raise RuntimeError("No free boundary edges found. Surface may be closed or element parsing is wrong.")
+
+    adj = defaultdict(list)
+    for a, b in boundary_edges:
+        adj[a].append(b)
+        adj[b].append(a)
+
+    # Build all loops/chains, keep longest.
+    unused = set(boundary_edges)
+    loops = []
+
+    while unused:
+        a, b = next(iter(unused))
+        path = [a, b]
+        unused.remove(tuple(sorted((a, b))))
+
+        # grow forward
+        while True:
+            cur = path[-1]
+            prev = path[-2]
+            nxts = [n for n in adj[cur] if n != prev and tuple(sorted((cur, n))) in unused]
+            if not nxts:
+                break
+            nxt = nxts[0]
+            unused.remove(tuple(sorted((cur, nxt))))
+            path.append(nxt)
+            if nxt == path[0]:
+                break
+
+        loops.append(path)
+
+    loop = max(loops, key=len)
+
+    # remove duplicate closing node if present
+    if len(loop) > 1 and loop[0] == loop[-1]:
+        loop = loop[:-1]
+
+    print(f"[FRO-TRIM] boundary edges={len(boundary_edges)}, loops={len(loops)}, chosen loop nodes={len(loop)}")
+    return np.asarray(loop, dtype=np.int64)
+
+def _make_trimmed_face_from_fro_loop(
+    occ_surf_new,
+    boundary_gids,
+    rec,
+    uv_domain,
+    tol=1e-6,
+    max_loop_points=50,
+):
+    """
+    Trim fitted surface using FRO boundary nodes, but using their original linked CAD UV.
+    This avoids projecting morphed boundary XYZ back onto the fitted surface.
+    """
+    import numpy as np
+    from OCP.gp import gp_Pnt2d, gp_Dir2d, gp_Lin2d
+    from OCP.Geom2d import Geom2d_Line
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeWire, BRepBuilderAPI_MakeFace
+
+    rec_gids = np.asarray(rec["gids"], dtype=np.int64)
+    rec_uv = np.asarray(rec["uv"], dtype=float)
+
+    gid_to_uv = {int(g): rec_uv[i] for i, g in enumerate(rec_gids)}
+
+    uv = []
+    missing = 0
+    for g in boundary_gids:
+        g = int(g)
+        if g in gid_to_uv:
+            uv.append(gid_to_uv[g])
+        else:
+            missing += 1
+
+    uv = np.asarray(uv, dtype=float)
+
+    print(f"[FRO-TRIM] boundary nodes usable in link: {len(uv)}/{len(boundary_gids)} missing={missing}")
+
+    if len(uv) < 4:
+        raise RuntimeError("Too few FRO boundary nodes have linked UV coordinates.")
+
+    if max_loop_points is not None and len(uv) > int(max_loop_points):
+        idx = np.linspace(0, len(uv) - 1, int(max_loop_points), dtype=int)
+        uv = uv[idx]
+
+    # Map original CAD UV domain to new BSpline parameter domain
+    cu1, cu2, cv1, cv2 = map(float, uv_domain)
+    nu1, nu2, nv1, nv2 = _bspline_bounds(occ_surf_new)
+
+    du = (cu2 - cu1) if abs(cu2 - cu1) > 1e-14 else 1.0
+    dv = (cv2 - cv1) if abs(cv2 - cv1) > 1e-14 else 1.0
+
+    U = nu1 + (uv[:, 0] - cu1) * (nu2 - nu1) / du
+    V = nv1 + (uv[:, 1] - cv1) * (nv2 - nv1) / dv
+
+    uv_new = np.column_stack([U, V])
+
+    # remove duplicate consecutive points
+    cleaned = [uv_new[0]]
+    for p in uv_new[1:]:
+        if np.linalg.norm(p - cleaned[-1]) > tol:
+            cleaned.append(p)
+
+    uv_new = np.asarray(cleaned, dtype=float)
+
+    if len(uv_new) < 4:
+        raise RuntimeError("UV boundary loop collapsed after duplicate removal.")
+
+    if np.linalg.norm(uv_new[0] - uv_new[-1]) > tol:
+        uv_new = np.vstack([uv_new, uv_new[0]])
+
+    mk_wire = BRepBuilderAPI_MakeWire()
+    n_edges = 0
+
+    for q0, q1 in zip(uv_new[:-1], uv_new[1:]):
+        d = q1 - q0
+        length = float(np.linalg.norm(d))
+
+        if length <= tol:
+            continue
+
+        p0 = gp_Pnt2d(float(q0[0]), float(q0[1]))
+        direction = gp_Dir2d(float(d[0]), float(d[1]))
+        line2d = Geom2d_Line(gp_Lin2d(p0, direction))
+
+        edge = BRepBuilderAPI_MakeEdge(
+            line2d,
+            occ_surf_new,
+            0.0,
+            length
+        )
+
+        if edge.IsDone():
+            mk_wire.Add(edge.Edge())
+            n_edges += 1
+
+    if n_edges < 3:
+        raise RuntimeError(f"Failed to build enough UV trim edges: n_edges={n_edges}")
+
+    if not mk_wire.IsDone():
+        raise RuntimeError("Failed to build UV trim wire.")
+
+    mk_face = BRepBuilderAPI_MakeFace(occ_surf_new, mk_wire.Wire(), True)
+
+    if not mk_face.IsDone():
+        raise RuntimeError("Failed to build face from linked-UV FRO boundary.")
+
+    print(f"[FRO-TRIM] built linked-UV trimmed face with {n_edges} edges")
+
+    return mk_face.Face()
+
 def export_morphed_step_from_link(
     step_path,
     link_npz_path,
     morphed_fro_path,
     out_step_path,
-    grid_density=30,
+    baseline_fro_path=None,
+    use_fro_boundary_trim=True,
+    grid_density=50,
     skip_if_mean_dist_gt=None,
     # NEW safety knobs
-    max_grid_pts=3600,       # cap nu*nv (e.g., 60x60)
+    max_grid_pts=2500,       # cap nu*nv (e.g., 60x60)
     max_samples=8000,        # cap UV->XYZ training samples per surface
     k_idw=12,                # nearest neighbors for IDW
     trim_edge_samples=30,    # reduce from 60; big speedup, fewer failures
-    trim_fallback_untrimmed=True,
+    trim_fallback_untrimmed=False,
 ):
     """
     Export morphed STEP as a compound of faces, with bounded memory/time per surface.
@@ -578,6 +969,7 @@ def export_morphed_step_from_link(
 
     # --- load inputs ---
     ffm = FroFile.fromFile(morphed_fro_path)
+    ff0 = FroFile.fromFile(baseline_fro_path) if baseline_fro_path else None
     _shape, faces = _load_step_shape_and_faces(step_path)
     data = np.load(link_npz_path, allow_pickle=True)["link"].item()
 
@@ -725,12 +1117,26 @@ def export_morphed_step_from_link(
 
             # ----- trimming (best-effort) -----
             try:
-                new_face = _build_trimmed_face_from_original_uv(
-                    face,
-                    occ_surf,
-                    (u_min, u_max, v_min, v_max),
-                    n_edge_samples=int(trim_edge_samples),
-                )
+                if use_fro_boundary_trim and ff0 is not None:
+                    elems = _surface_elements_for_sid(ff0, int(sid))
+                    loop_gids = _order_boundary_loop_from_elements(elems)
+
+
+                    new_face = _make_trimmed_face_from_fro_loop(
+                        occ_surf,
+                        loop_gids,
+                        rec,
+                        uv_domain=(u_min, u_max, v_min, v_max),
+                        tol=1e-6,
+                        max_loop_points=50,
+                    )
+                else:
+                    new_face = _build_trimmed_face_from_original_uv(
+                        face,
+                        occ_surf,
+                        (u_min, u_max, v_min, v_max),
+                        n_edge_samples=int(trim_edge_samples),
+                    )
                 if not _is_valid_shape(new_face):
                     fixed_face, _ = _fix_face(new_face)
                     if _is_valid_shape(fixed_face):
@@ -738,15 +1144,13 @@ def export_morphed_step_from_link(
                     else:
                         # fallback: untrimmed (often valid), else skip
                         from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
-                        fallback = BRepBuilderAPI_MakeFace(occ_surf, 1e-6).Face()
+                        raise RuntimeError(f"FRO-trimmed face for sid={sid} is invalid after ShapeFix.")
                         if _is_valid_shape(fallback):
                             new_face = fallback
                             print(f"[CAD-EXPORT][FACE-FALLBACK] sid={sid}: used untrimmed face")
                         else:
                             print(f"[CAD-EXPORT][SKIP] sid={sid}: face invalid even after fix")
                             continue
-
-                builder.Add(comp, new_face)
                 
             except Exception as tex:
                 if trim_fallback_untrimmed:
@@ -845,24 +1249,65 @@ def export_morphed_step_from_link(
 
 # =====================
 
-surface_to_face_index = {i : i-1 for i in range(1, 129)}
+# surface_to_face_index = {i : i-1 for i in range(2)}
+# surface_to_face_index = None
 
-# Step 1: Build the link (do this once)
-#build_step_fro_link(
-#    step_path=r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Opt 09.01\corner.stp",
-#    fro_path=r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Opt 09.01\corner.fro",
-#    link_npz_path=r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Opt 09.01\orig_step_mesh_link.npz",
+# surfaces = None
+
+# # INPUT PATHS
+# step_path = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\sphere_opt\test\sphere.stp"
+# fro_path = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\sphere_opt\test\sphere.fro"
+# morphed_path = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\sphere_opt\test\sphere_1.fro"
+
+# # OUTPUT PATHS
+# npz_path = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\sphere_opt\test\surfaces\surface_link.npz"
+# out_step_path = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\sphere_opt\test\surfaces\sphere_1.stp"
+# morphed_stl = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\sphere_opt\test\surfaces\sphere_1.stl"
+# fixed_stl = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\sphere_opt\test\surfaces\sphere_1_f.stl"
+
+# diagnose_surface_bbox_overlap(
+#    step_path=step_path,
+#    fro_path=fro_path,
+#    sid=None,
+# )
+
+# build_step_fro_link(
+#    step_path=step_path,
+#    fro_path=fro_path,
+#    link_npz_path=npz_path,
 #    surface_to_face_index=surface_to_face_index,
-#)
+#    require_in_bounds=True,
+#    surfaces = surfaces
+# )
 
-# Step 2: Export morphed geometry
-#export_morphed_step_from_link(
-#    step_path=r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Opt 09.01\corner.stp",
-#    link_npz_path=r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Opt 09.01\orig_step_mesh_link.npz",
-#    morphed_fro_path=r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Opt 09.01\corner_1.fro",
-#    out_step_path=r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Opt 09.01\corner_1.step",
-#    max_grid_pts=2500,
+# export_morphed_step_from_link(
+#    step_path=step_path,
+#    link_npz_path=npz_path,
+#    morphed_fro_path=morphed_path,
+#    out_step_path=out_step_path,
+#    baseline_fro_path=fro_path,
+#    use_fro_boundary_trim=True,
+#    grid_density=30,
+#    max_grid_pts=900,
 #    max_samples=5000,
 #    k_idw=12,
 #    trim_edge_samples=20,
-#)
+#    skip_if_mean_dist_gt=None,
+# )
+
+# import time
+# t0 = time.time()
+
+# step_to_stl(
+#     out_step_path,
+#     morphed_stl,
+#     linear_deflection=2.0,
+#     angular_deflection=0.5,
+# )
+
+# print(f"STL conversion took {time.time() - t0:.1f} s")
+
+# d, rec = mesh_distance_report(
+#     reference_mesh_path=ref_mesh_path,   # or your morphed VTK/VTM surface
+#     reconstructed_stl_path=morphed_stl,
+# )

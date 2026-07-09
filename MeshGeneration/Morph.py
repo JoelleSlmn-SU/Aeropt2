@@ -284,7 +284,7 @@ def MorphMesh(mesh_in: FroFile, base_name, morph_model, viewer, output_dir,
         d_verts=d_verts,
         anchor_points=anchor_points,
         k_nn=3,
-        beta=2.0,        # < 1.0 = more local, > 1.0 = smoother
+        beta=2.2,        # < 1.0 = more local, > 1.0 = smoother
         min_clip_frac=0.01,
         max_clip_frac=0.4,
     )
@@ -315,7 +315,7 @@ def MorphMesh(mesh_in: FroFile, base_name, morph_model, viewer, output_dir,
         fallback_R_frac=fallback_R_frac,
         R_scale=R_scale,
         anchor_taper=False,
-        boundary_recover=True,
+        boundary_recover=False,
         corr_R_frac=corr_R_frac,
         corr_band_frac=corr_band_frac,
     )

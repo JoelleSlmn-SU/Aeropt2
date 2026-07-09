@@ -12,15 +12,15 @@ from vtk.util import numpy_support as ns
 
 # ---------- CONFIG ----------
 folder = [
-    "CB Opt 2"
+    "CB Orig"
 ]
 
-x_case = 5
+x_case = 1
 gen = 0
 base = Path(r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples")
 case_root = base / folder[0]
 
-CASE_FILE = str(case_root / "postprocessed" / f"n_{gen}" / str(x_case) / f"ENSIGHTcorner_{x_case}.case")
+CASE_FILE = str(case_root / "postprocessed" / f"n_{gen}" / str(x_case) / f"ENSIGHTcorner.case")
 OUT_DIR   = str(case_root / "postprocessed" / f"n_{gen}" / str(x_case) / f"x_sweep_out")
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -466,6 +466,8 @@ rv.ViewSize = IMAGE_SIZE
 rv.Background = [1, 1, 1]
 rv.InteractionMode = "3D"
 ResetCamera()
+
+P0_inf = compute_P0_inf(src_aip)
 
 # ---- AIP CONFIG ----
 AIP_CENTER = (11.3, 0.4, 0.21)
@@ -1037,7 +1039,7 @@ def plot_aip_fields(root, out_dir, cx, cy, cz, r, P0_inf=None):
             field_arr = p0_arr
             title = "Total Pressure P0 [Pa]"
             label = f"AIP Surface (x={cx:.2f}) - Total Pressure"
-            fixed_range = None
+            fixed_range = (0.9, 0.98)
         else:
             # Build recovery field: PR_AIP = P0_AIP / P0_inf
             rec = Calculator(Input=p0_src)
@@ -1049,7 +1051,7 @@ def plot_aip_fields(root, out_dir, cx, cy, cz, r, P0_inf=None):
             field_arr = "PR_AIP"
             title = "Pressure Recovery (P0/P0_inf) [-]"
             label = f"AIP Surface (x={cx:.2f}) - Pressure Recovery"
-            fixed_range = (0.9, 0.96)  # tweak if you want; or set None for auto
+            fixed_range = (0.9, 0.98)  # tweak if you want; or set None for auto
 
         # --- Compute range on AIP surface ---
         vmin, vmax = compute_range(field_src, field_arr)
@@ -1091,7 +1093,7 @@ def plot_aip_fields(root, out_dir, cx, cy, cz, r, P0_inf=None):
         px, arr, rep = render_colorfield(
             rv, u_src, u_arr,
             title="Velocity [m/s]",
-            fixed_range=(u_min, 300)
+            fixed_range=(u_min, 180)
         )
         
         txt = Text()

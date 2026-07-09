@@ -14,4 +14,5 @@ def convert_stl_to_fro(filepath):
 
 if __name__ == "__main__":
     fn = FliteFile.getFileExtOptions("stl")
-    convert_stl_to_fro(fn)
+    fp = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\sphere_opt\test\components\component_1.stl"
+    #convert_stl_to_fro(fp)

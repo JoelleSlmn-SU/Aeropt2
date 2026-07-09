@@ -76,6 +76,32 @@ def _spectral_coeffs(num_modes, control_nodes, rng=None, p=2.0, frac=0.15):
     c *= amp / (np.linalg.norm(c) + 1e-12)
     return c
 
+def smoothstep(x):
+    x = np.clip(x, 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
+
+def compute_protection_weights(control_nodes, protected_indices, radius):
+    from scipy.spatial import cKDTree
+
+    n = len(control_nodes)
+    weights = np.ones(n, dtype=float)
+    
+    if protected_indices is None:
+        protected_indices = []
+        
+    protected_indices = np.asarray(protected_indices, dtype=int)
+    if protected_indices.size == 0:
+        return weights
+
+    protected_pts = control_nodes[protected_indices]
+    tree = cKDTree(protected_pts)
+
+    d, _ = tree.query(control_nodes)
+
+    weights = smoothstep(d / max(radius, 1e-12))
+    weights[protected_indices] = 0.0
+
+    return weights
 
 def estimate_normals(points: np.ndarray, knn: int = 12) -> np.ndarray:
     from sklearn.neighbors import NearestNeighbors
@@ -367,6 +393,79 @@ def build_global_modes(control_nodes, center=None, axes=None, mode_config=None):
     G = np.stack(modes, axis=1)
     return G, names
 
+def load_modal_surface_points(output_dir):
+    import os
+    import numpy as np
+    import pyvista as pv
+
+    candidates = [
+        os.path.join(output_dir, "surfaces", "output.vtk"),
+        os.path.join(output_dir, "output.vtk"),
+    ]
+
+    for p in candidates:
+        if os.path.exists(p):
+            mesh = pv.read(p)
+            pts = np.asarray(mesh.points, float)
+            if pts.ndim == 2 and pts.shape[1] == 3 and len(pts) > 0:
+                return pts, p
+
+    return None, None
+
+def build_t_surface_modal_cache(
+    output_dir,
+    control_nodes,
+    k_modes,
+    frame_knn=12,
+    graph_method="mutual_knn",
+    delaunay_cutoff_factor=2.5,
+    cache_name="modal_basis_T_surface.npz",
+):
+    import os
+    import numpy as np
+    import pyvista as pv
+    from scipy.spatial import cKDTree
+
+    vtk_path = os.path.join(output_dir, "surfaces", "output.vtk")
+    if not os.path.exists(vtk_path):
+        raise FileNotFoundError(f"Could not find T-surface mesh: {vtk_path}")
+
+    mesh = pv.read(vtk_path)
+    points_T = np.asarray(mesh.points, float)
+
+    out = build_laplacian_basis(
+        points_T,
+        k_modes=k_modes,
+        knn=frame_knn if frame_knn is not None else 6,
+        graph_method=graph_method,
+        delaunay_cutoff_factor=delaunay_cutoff_factor,
+        debug=True,
+        debug_dir=output_dir,
+    )
+    evals_T, phi_T = out if isinstance(out, tuple) else (None, out)
+
+    tree = cKDTree(points_T)
+    dist, idx = tree.query(np.asarray(control_nodes, float), k=1)
+
+    if float(np.max(dist)) > 1e-8:
+        print(f"[WARN] CNs are not exact output.vtk nodes. max_dist={float(np.max(dist)):.3e}")
+
+    normals_T = estimate_normals(points_T, knn=12)
+
+    cache_path = os.path.join(output_dir, "Control Nodes", cache_name)
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+
+    np.savez_compressed(
+        cache_path,
+        points_T=points_T,
+        phi_T=phi_T,
+        normals_T=normals_T,
+        control_node_point_indices=idx.astype(np.int64),
+        k_modes=int(phi_T.shape[1]),
+        evals_T=evals_T if evals_T is not None else np.arange(phi_T.shape[1]),
+    )
+
+    return cache_path
 
 def getDisplacements(
     output_dir,
@@ -397,6 +496,10 @@ def getDisplacements(
     use_pca=False,
     pca_cache_path=None,
     pca_coeffs=None,
+    graph_method="mutual_knn",
+    delaunay_cutoff_factor=2.5,
+    protected_nodes=None,
+    radius=None,
 ):
     """
     Returns a (N,3) displacement array for N control nodes.
@@ -435,7 +538,7 @@ def getDisplacements(
     directly to a flattened (N*3,) displacement vector, then reshaped to (N,3).
     """
     rng = np.random.default_rng(seed)
-    match_rms = True
+    match_rms = False
 
     # ------------------------------------------------------------
     # load control nodes if needed
@@ -559,6 +662,8 @@ def getDisplacements(
             f"[DEBUG] Direct displacement norms: mean={d_norms.mean():.6f}, "
             f"max={d_norms.max():.6f}, std={d_norms.std():.6f}"
         )
+        
+        return d_ctrl
 
     # ------------------------------------------------------------
     # PCA-reduced branch
@@ -597,6 +702,8 @@ def getDisplacements(
             f"[DEBUG] PCA displacement norms: mean={d_norms.mean():.6f}, "
             f"max={d_norms.max():.6f}, std={d_norms.std():.6f}"
         )
+        
+        return d_ctrl
 
     # ------------------------------------------------------------
     # modal parameterisation
@@ -622,31 +729,45 @@ def getDisplacements(
     # ---- local Laplacian basis (only if needed)
     phi = None
     k = 0
+    basis_points = None
+    basis_normals = None
+    control_node_point_indices = None
+
     if use_local_modes:
-        basis_path = os.path.join(output_dir, cache_name)
-        need_rebuild = True
+        modal_cache_path = os.path.join(
+            output_dir, "Control Nodes", "modal_basis_T_surface.npz"
+        )
 
-        if os.path.exists(basis_path):
-            try:
-                phi, _ = load_basis(basis_path)
-                need_rebuild = (phi is None) or (phi.shape[0] != int(control_nodes.shape[0]))
-                if need_rebuild:
-                    print(
-                        f"[WARN] Cached basis rows ({None if phi is None else phi.shape[0]}) != "
-                        f"current CN count ({control_nodes.shape[0]}). Rebuilding."
-                    )
-            except Exception as e:
-                print(f"[WARN] Failed to load cached basis '{basis_path}': {e}. Rebuilding.")
-                need_rebuild = True
-
-        if need_rebuild:
-            print(f"[DEBUG] Building new basis with k_modes={k_modes}")
-            out = build_laplacian_basis(control_nodes, k_modes=k_modes, knn=6)
-            _, phi = out if isinstance(out, tuple) else (None, out)
-            save_basis(basis_path, phi, normals=None)
+        if os.path.exists(modal_cache_path):
+            cache = np.load(modal_cache_path)
+            basis_points = np.asarray(cache["points_T"], float)
+            phi = np.asarray(cache["phi_T"], float)
+            basis_normals = np.asarray(cache["normals_T"], float)
+            control_node_point_indices = np.asarray(
+                cache["control_node_point_indices"], dtype=int
+            )
+            print(f"[DEBUG] Loaded T-surface modal cache: {modal_cache_path}")
+        else:
+            print("[WARN] T-surface modal cache not found. Building it now.")
+            build_t_surface_modal_cache(
+                output_dir=output_dir,
+                control_nodes=control_nodes,
+                k_modes=k_modes,
+                frame_knn=frame_knn if frame_knn is not None else 6,
+                graph_method=graph_method,
+                delaunay_cutoff_factor=delaunay_cutoff_factor,
+            )
+            cache = np.load(modal_cache_path)
+            basis_points = np.asarray(cache["points_T"], float)
+            phi = np.asarray(cache["phi_T"], float)
+            basis_normals = np.asarray(cache["normals_T"], float)
+            control_node_point_indices = np.asarray(
+                cache["control_node_point_indices"], dtype=int
+            )
 
         N_phi, k = phi.shape
-        print(f"[DEBUG] Basis: N={N_phi} nodes, k={k} modes")
+        print(f"[DEBUG] T-surface basis: N={N_phi} nodes, k={k} modes")
+        print(f"[DEBUG] Control-node samples: N={len(control_node_point_indices)}")
 
     # if neither local nor global are enabled, return zeros
     if (not use_local_modes) and (not global_modes):
@@ -689,7 +810,9 @@ def getDisplacements(
             cl = coeffs * amp_scale
             d_global = np.zeros((N, 3), dtype=float)
 
-        d_local = expand_modal_coeffs(phi, cl, normals=normals)
+        d_basis_local = expand_modal_coeffs(phi, cl, normals=basis_normals)
+        d_local = d_basis_local[control_node_point_indices]
+
         d_ctrl = d_global + d_local
 
     # ------------------------------------------------------------
@@ -724,7 +847,8 @@ def getDisplacements(
                     local_raw = local_raw[:expected_local]
 
             local_scaled = local_raw * amp_scale
-            d_local = expand_modal_coeffs(phi, local_scaled, normals=None)
+            d_basis_local = expand_modal_coeffs(phi, local_scaled, normals=None)
+            d_local = d_basis_local[control_node_point_indices]
 
         else:  # local_frame
             if local_raw.size not in (k, 2 * k, 3 * k):
@@ -751,8 +875,16 @@ def getDisplacements(
             s1 = phi @ c1
             s2 = phi @ c2
             sn = phi @ cn
-            t1, t2, nvec = estimate_local_frame(control_nodes, knn=frame_knn)
-            d_local = (s1[:, None] * t1) + (s2[:, None] * t2) + (sn[:, None] * nvec)
+
+            t1_T, t2_T, n_T = estimate_local_frame(basis_points, knn=frame_knn)
+
+            d_basis_local = (
+                s1[:, None] * t1_T
+                + s2[:, None] * t2_T
+                + sn[:, None] * n_T
+            )
+
+            d_local = d_basis_local[control_node_point_indices]
 
         if global_modes:
             cg = cg_raw * global_scale
@@ -783,6 +915,13 @@ def getDisplacements(
             cg = coeffs * global_scale
             d_ctrl = np.sum(G * cg[None, :, None], axis=1)
 
+
+    weights = compute_protection_weights(
+        control_nodes,
+        protected_nodes,
+        radius if radius is not None else 0.0,
+    )
+    d_ctrl *= weights[:, None]
     # ------------------------------------------------------------
     # smoothing
     # ------------------------------------------------------------

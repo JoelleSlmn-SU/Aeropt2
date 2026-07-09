@@ -8,7 +8,7 @@ def load_morph_case(json_path):
     with open(json_path, "r") as f:
         data = json.load(f)
 
-    out_dir = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\\examples\CB Opt 2"
+    out_dir = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\\examples\Old\surf"
     n = 0
 
     # Path to the morphed T-surface (adjust name as needed)
@@ -126,8 +126,8 @@ def visualise_morph(
     )
 
     # --- Glyphs for CNs (black & red spheres, like mesh_gui) ---
-    r1 = 0.012 * lmin
-    r2 = 0.005 * lmin
+    r1 = 1.2
+    r2 = 0.85 * lmin
 
     sph = pv.Sphere(radius=r1)
     sph2 = pv.Sphere(radius=r2)
@@ -159,7 +159,7 @@ def visualise_morph(
     # Attach displacement magnitude as a cell scalar, so we can show a color bar
     segs.cell_data["disp_mag"] = mags  # one value per segment
 
-    '''act_segs = plotter.add_mesh(
+    act_segs = plotter.add_mesh(
         segs,
         scalars="disp_mag",
         cmap="viridis",
@@ -172,7 +172,7 @@ def visualise_morph(
             fmt="%.2e",
         ),
         label="Displacement vectors",
-    )'''
+    )
 
     # Axes & legend & info text
     plotter.add_axes()
@@ -190,11 +190,11 @@ def visualise_morph(
         (0.537, -0.733, 0.417),     # view-up vector
     ]
     plotter.camera_position = [
-        (1283.1, 8264.98, 18682.9),
-        (5785.03,  1245.4, 1273.31),
-        (0.3489, -0.834, 0.4266),
+        (339.252,-352.713,255.04),
+        (3.886,2.984,10.963),
+        (0.784,0.57,-0.246),
     ]
-    plotter.camera.zoom(7)
+    #plotter.camera.zoom(7)
 
     if screenshot_path:
         os.makedirs(os.path.dirname(screenshot_path), exist_ok=True)
@@ -205,8 +205,8 @@ def visualise_morph(
 
 # ----------------- Example driver for many morphs ----------------- #
 if __name__ == "__main__":
-    out_path = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Opt 2\surfaces\n_0"
-    for i in range(0,1):
+    out_path = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\Old\surf\surfaces\n_0"
+    for i in range(1,5):
         fpath = f"morph_config_n_{i+1}.json"
         json_path = os.path.join(out_path, fpath)
 

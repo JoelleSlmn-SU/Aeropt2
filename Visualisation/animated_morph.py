@@ -59,9 +59,9 @@ def set_camera_from_paraview(pl: pv.Plotter):
     pos   = (7238.4, 2356.68, 4036.5)
     focal = (6160.7,  964.62, 26.20)
     up    = (-0.0645, -0.937, 0.343)
-
+    
     pl.camera_position = (pos, focal, up)
-    pl.camera.zoom(9)
+    #pl.camera.zoom(9)
     
     try:
         pl.camera.view_angle = 30
@@ -612,14 +612,14 @@ if __name__ == "__main__":
     from pathlib import Path
     
     folder = [
-        "param4"
+        "CB Opt"
     ]
 
-    #x_case = 7
+    #x_case = 1
     gen = "0"
     filename = "corner"
     
-    for x_case in range(1,11):
+    for x_case in range(1,6):
         base = Path(r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples")
         case_root = base / folder[0]
 
@@ -648,7 +648,7 @@ if __name__ == "__main__":
 
         # 2) Interactive mesh
         export = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Morph\surfaces\n_0"
-        surfaces = get_surfaces_from_morph_config(cfg_json, mode="TU")
+        surfaces = get_surfaces_from_morph_config(cfg_json, mode="T")
         interactive_fro_morph_surface(orig_fro, morp_fro, surface_id=surfaces, deform_scale=2.0, show_edges=False)
         #export_morph_series_multiblock(orig_fro, morp_fro, surface_ids=surfaces, out_dir=export, base_name="corner_morph", n_frames=90, deform_scale=1.0)
     pass
