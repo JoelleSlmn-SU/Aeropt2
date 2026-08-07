@@ -612,14 +612,14 @@ if __name__ == "__main__":
     from pathlib import Path
     
     folder = [
-        "CB Opt"
+        "corner_optimisation_2"
     ]
 
     #x_case = 1
     gen = "0"
     filename = "corner"
     
-    for x_case in range(1,6):
+    for x_case in range(1,16):
         base = Path(r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples")
         case_root = base / folder[0]
 
@@ -639,7 +639,7 @@ if __name__ == "__main__":
             save_mp4=False, save_gif=True,
         )
         
-        '''animate_split_screen_fro_surface_both(○
+        '''animate_split_screen_fro_surface_both(
             orig_fro, morp_fro, surface_id=surfaces,
             out_path=out_2,
             n_frames=90, fps=25, deform_scale=1.5,

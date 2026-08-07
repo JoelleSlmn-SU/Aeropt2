@@ -121,9 +121,14 @@ class ClusterPipelineManager:
         self.log_file = os.path.join(log_dir, f"pipeline_n{gen}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
     
     def _log(self, msg: str):
-        """Log to both stdout and file"""
+        """Log to both stdout and file."""
         print(msg, flush=True)
-        with open(self.log_file, "a") as f:
+        with open(
+            self.log_file,
+            "a",
+            encoding="utf-8",
+            errors="replace",
+        ) as f:
             f.write(f"{datetime.now().isoformat()} - {msg}\n")
             
     def _state_path(self) -> str:
@@ -973,7 +978,7 @@ class ClusterPipelineManager:
 
         # UNIT CONVERSION (mm -> m or whatever your converter does) 
         if (self.units or "").lower() == "mm":
-            self._log("[PIPELINE] CAD units = mm → adding PLT conversion to volume batchfile")
+            self._log("[PIPELINE] CAD units = mm > adding PLT conversion to volume batchfile")
 
             bf.lines.append("")
             bf.lines.append("# ---- UNIT CONVERSION: run converter if PLT exists ----")

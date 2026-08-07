@@ -15,7 +15,7 @@ THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # .../Scripts/MeshFailureClassifier/sweep
 # go up 2 levels -> .../Scripts
-SCRIPTS_DIR = os.path.abspath(os.path.join(THIS_DIR, "..", ".."))
+SCRIPTS_DIR = os.path.abspath(os.path.join(THIS_DIR, ".."))
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 

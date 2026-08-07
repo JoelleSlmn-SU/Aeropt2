@@ -220,7 +220,7 @@ def plot_convergence_history(
     # ------------------------------------------------------------
     # Plot
     # ------------------------------------------------------------
-    count_limit = 20
+    count_limit = 0
     if count_limit is None:
         count_limit = max(xs)
 
@@ -285,11 +285,11 @@ def plot_convergence_history(
         "best_overall_idx": best_overall_idx,
     }
 
-mcsv_file = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\sphere_opt\bo_data.mcsv"
-out_dir = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\sphere_opt\conv_plot.png"
+mcsv_file = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation\bo_data.mcsv"
+out_dir = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation\conv_plot.png"
 
-training_data = 5          # number of initial LHS samples
-objective = "min"          # "max" for pressure recovery♀
+training_data = 3          # number of initial LHS samples
+objective = "MIN"          # "max" for pressure recovery♀
 variable_name = "CD"
 
 # ------------------------------------------------------------------

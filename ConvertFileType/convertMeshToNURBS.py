@@ -339,17 +339,17 @@ def stl_to_low_patch_nurbs_step(stl_path, step_path):
     )
  
 if __name__ == "__main__":
-    # og_path = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation\test"
-    # filename = "corner"
-    # morphed_no = "2"
-    # stl_file = os.path.join(og_path, f"{filename}_{morphed_no}.stl")
-    # fro_path = os.path.join(og_path, f"{filename}_{morphed_no}.fro")
+    og_path = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation\test"
+    filename = "corner"
+    morphed_no = "1"
+    stl_file = os.path.join(og_path, f"{filename}_{morphed_no}.stl")
+    fro_path = os.path.join(og_path, f"{filename}_{morphed_no}.fro")
 
-    # out_dir = os.path.join(og_path, "components")
+    out_dir = os.path.join(og_path, "components")
 
-    # convert_fro_to_stl(fro_path, stl_file)
+    convert_fro_to_stl(fro_path, stl_file)
 
-    # comp_paths = save_components_as_stl(stl_file, out_dir)
+    comp_paths = save_components_as_stl(stl_file, out_dir)
 
     # # patch only component 1 first, likely the sphere
     # for i in range(len(comp_paths)):
@@ -367,4 +367,3 @@ if __name__ == "__main__":
         # )
         
         # mesh_to_low_patch_nurbs_step(path, out_step_path=f"component_{i}_mesh_nurbs.stp", target_quads=1000, detect_hard_edges=False, save_debug_stages=True)
-    r = 0

@@ -1127,6 +1127,30 @@ class MainWindow(QMainWindow):
             "TSurfaces": getattr(mv, "TSurfaces", []),
             "USurfaces": getattr(mv, "USurfaces", []),
             "CSurfaces": getattr(mv, "CSurfaces", []),
+            
+            # preliminary response-surface / regional screening metadata
+            "prelim_enabled": bool(getattr(mv, "prelim_enabled", False)),
+            "prelim_regions": int(getattr(mv, "prelim_regions", 1) or 1),
+            "prelim_final_control_nodes": int(getattr(mv, "prelim_final_control_nodes", 0) or 0),
+            "prelim_keep_fraction": float(getattr(mv, "prelim_keep_fraction", 0.67) or 0.67),
+            "prelim_doe_amplitude": float(getattr(mv, "prelim_doe_amplitude", 1.0) or 1.0),
+
+            "point_region_ids": (
+                getattr(mv, "point_region_ids", None).tolist()
+                if getattr(mv, "point_region_ids", None) is not None else None
+            ),
+            "control_node_region_ids": (
+                getattr(mv, "control_node_region_ids", None).tolist()
+                if getattr(mv, "control_node_region_ids", None) is not None else None
+            ),
+            "region_centres": (
+                getattr(mv, "region_centres", None).tolist()
+                if getattr(mv, "region_centres", None) is not None else None
+            ),
+            "control_node_point_indices": (
+                getattr(mv, "control_node_point_indices", None).tolist()
+                if getattr(mv, "control_node_point_indices", None) is not None else None
+            ),
 
             "k_modes": getattr(mv, "k_modes", 0),
             "spectral_p": getattr(mv, "spectral_p", None),
@@ -1284,19 +1308,37 @@ class MainWindow(QMainWindow):
             else:
                 self.logger.log(f"[OPT][HPC][WARN] No local {rel} found in {search_dirs}")
         
-        rel = f"surfaces/output.vtk"
-        src = find_first(rel)
-        if src:
-            files_to_upload[rel] = src
+        output_vtk = find_first(os.path.join("surfaces", "output.vtk"))
+        if output_vtk:
+            files_to_upload["output.vtk"] = {
+                "src": output_vtk,
+                "remote_dir": posixpath.join(
+                    self.remote_output_dir,
+                    "surfaces"
+                ),
+            }
         else:
-            self.logger.log(f"[OPT][HPC][WARN] No local {rel} found in {search_dirs}")
-        
-        rel = f"Control Nodes/modal_basis_T_surface.npz"
-        src = find_first(rel)
-        if src:
-            files_to_upload[rel] = src
+            self.logger.log(
+                "[OPT][HPC][WARN] Could not find surfaces/output.vtk locally."
+            )
+
+        # modal basis -> remote orig/
+        modal_basis = find_first(
+            os.path.join(
+                "Control Nodes",
+                "modal_basis_T_surface.npz"
+            )
+        )
+        if modal_basis:
+            files_to_upload["modal_basis_T_surface.npz"] = {
+                "src": modal_basis,
+                "remote_dir": remote_orig,
+            }
         else:
-            self.logger.log(f"[OPT][HPC][WARN] No local {rel} found in {search_dirs}")
+            self.logger.log(
+                "[OPT][HPC][WARN] Could not find "
+                "Control Nodes/modal_basis_T_surface.npz locally."
+            )
         
         # Generic "control" files (optional, very loose match)
         for pattern in (f"{base}*control*", "control*", f"Mesh3D_v50.ctl"):
@@ -1453,6 +1495,108 @@ class MainWindow(QMainWindow):
         # Not in HPC mode → just return empty to indicate "no remote orig"
         return ""
 
+    def run_prelim_response_surface(
+        self,
+        remote_run,
+        remote_basis_path,
+        bo_json_path,
+        obj_json_path
+    ):
+        import os
+        import posixpath
+        import tempfile
+
+        prelim_run = posixpath.join(remote_run, "prelim")
+        user = self.ssh_creds["username"]
+
+        py = f"/home/{user}/.conda/envs/aeropt-hpc/bin/python"
+        script = (
+            f"/home/{user}/aeropt/Scripts/Remote/"
+            f"prelimResponseSurface.py"
+        )
+
+        # Create remote preliminary-study directory and WAIT for completion
+        mkdir_cmd = f"bash -lc 'mkdir -p \"{prelim_run}\"'"
+        _stdin, stdout, stderr = self.ssh_client.exec_command(mkdir_cmd)
+
+        exit_code = stdout.channel.recv_exit_status()
+        err_text = stderr.read().decode(errors="ignore").strip()
+
+        if exit_code != 0:
+            self.logger.log(
+                f"[PRELIM][ERROR] Failed to create remote directory "
+                f"'{prelim_run}': {err_text or f'exit code {exit_code}'}"
+            )
+            return None
+
+        self.logger.log(
+            f"[PRELIM] Remote directory ready: {prelim_run}"
+        )
+
+        batch = "\n".join([
+            "#!/bin/bash -l",
+            "#SBATCH --job-name=prelim_rs",
+            "#SBATCH --output=prelim_rs.%J.out",
+            "#SBATCH --error=prelim_rs.%J.err",
+            "#SBATCH --time=3-00:00",
+            "#SBATCH --nodes=1",
+            "#SBATCH --ntasks=1",
+            "source ~/.bashrc",
+            "set -euo pipefail",
+            f'cd "{prelim_run}"',
+            (
+                f'{py} "{script}" '
+                f'"{prelim_run}" '
+                f'"{remote_basis_path}" '
+                f'"{bo_json_path}" '
+                f'"{obj_json_path}"'
+            ),
+        ])
+
+        local_tmp = tempfile.mkdtemp()
+        local_batch = os.path.join(
+            local_tmp,
+            "batchfile_prelim_rs"
+        )
+
+        with open(local_batch, "w", newline="\n") as f:
+            f.write(batch + "\n")
+
+        remote_batch = posixpath.join(
+            prelim_run,
+            "batchfile_prelim_rs"
+        )
+
+        sftp = self.ssh_client.open_sftp()
+        try:
+            sftp.put(local_batch, remote_batch)
+        finally:
+            sftp.close()
+
+        self.logger.log(
+            f"[PRELIM] Uploaded batchfile: {remote_batch}"
+        )
+
+        _in, _out, _err = self.ssh_client.exec_command(
+            f'bash -lc \'cd "{prelim_run}" && '
+            f'sbatch batchfile_prelim_rs\''
+        )
+
+        out = _out.read().decode().strip()
+        err = _err.read().decode().strip()
+
+        if err:
+            self.logger.log(
+                f"[PRELIM][WARN] sbatch stderr: {err}"
+            )
+
+        self.logger.log(f"[PRELIM] Submitted: {out}")
+
+        if "Submitted batch job" in out:
+            return out.split()[-1]
+
+        return None
+
     def run_optimisation(self):
         if not getattr(self, "optimisation_settings_saved", False):
             self.logger.log("[OPT] Please save optimisation settings first.")
@@ -1500,6 +1644,9 @@ class MainWindow(QMainWindow):
         local_tmp = tempfile.mkdtemp()
         bo_json = os.path.join(local_tmp, "bo_settings.json")
         obj_json = os.path.join(local_tmp, "objective.json")
+        
+        remote_bo_json = posixpath.join(remote_run, "bo_settings.json")
+        remote_obj_json = posixpath.join(remote_run, "objective.json")
 
         # turn your in-memory settings → json-safe (map class names)
         s = dict(self.bayes_settings)
@@ -1552,9 +1699,27 @@ class MainWindow(QMainWindow):
             sftp.put(local_batch, posixpath.join(remote_run, "batchfile_opt_orchestrator"))
         finally:
             sftp.close()
+            
+        prelim_enabled = bool(getattr(self.mesh_viewer, "prelim_enabled", False))
+
+        dependency = ""
+        if prelim_enabled:
+            prelim_jid = self.run_prelim_response_surface(
+                remote_run=remote_run,
+                remote_basis_path=remote_basis_path,
+                bo_json_path=remote_bo_json,
+                obj_json_path=remote_obj_json,
+            )
+
+            if prelim_jid:
+                dependency = f"--dependency=afterok:{prelim_jid}"
+            else:
+                self.logger.log("[OPT][ERROR] Prelim submission failed; optimisation not submitted.")
+                return
 
         _in,_out,_err = self.ssh_client.exec_command(
-            f"bash -lc 'cd \"{remote_run}\"; sbatch batchfile_opt_orchestrator'"
+            f"bash -lc 'cd \"{remote_run}\"; "
+            f"sbatch {dependency} batchfile_opt_orchestrator'"
         )
         out = _out.read().decode().strip()
         jid = out.split()[-1] if "Submitted batch job" in out else "?"

@@ -112,8 +112,8 @@ def pdf_to_gif(
 
 
 
-pdf_path = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Opt\postprocessed\n_0\t\x_sweep_out\eta_sweep.pdf"
-gif_path = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\CB Opt\postprocessed\n_0\t\x_sweep_out\n0_t_eta_sweep_out.gif"
+pdf_path = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation\postprocessed\n_0\2\x_sweep_out\eta_sweep.pdf"
+gif_path = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation\postprocessed\n_0\2\x_sweep_out\n0_2_eta_sweep_out.gif"
 out = pdf_to_gif(
     pdf_path=pdf_path,
     gif_path=gif_path

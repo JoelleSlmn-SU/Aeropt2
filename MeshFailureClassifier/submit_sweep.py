@@ -23,6 +23,7 @@ import glob
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+from pathlib import Path
 
 import numpy as np
 
@@ -32,7 +33,7 @@ THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # .../Scripts/MeshFailureClassifier/sweep
 # go up 2 levels -> .../Scripts
-SCRIPTS_DIR = os.path.abspath(os.path.join(THIS_DIR, "..", ".."))
+SCRIPTS_DIR = os.path.abspath(os.path.join(THIS_DIR, ".."))
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
@@ -61,6 +62,61 @@ def _ensure_dir(p: str) -> None:
 def _read_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _write_json_atomic(path: str, data: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def _case_state_path(run_dir: str, n: int) -> str:
+    return os.path.join(run_dir, "state", f"case_{int(n)}.json")
+
+
+def _load_case_state(run_dir: str, n: int) -> Dict[str, Any]:
+    path = _case_state_path(run_dir, n)
+    if not os.path.exists(path):
+        return {}
+    try:
+        return _read_json(path)
+    except Exception:
+        return {}
+
+
+def _save_case_state(run_dir: str, n: int, **updates: Any) -> Dict[str, Any]:
+    state = _load_case_state(run_dir, n)
+    state.update(updates)
+    state["case_id"] = int(n)
+    state["updated"] = time.time()
+    _write_json_atomic(_case_state_path(run_dir, n), state)
+    return state
+
+
+def _case_is_terminal(run_dir: str, n: int) -> bool:
+    state = _load_case_state(run_dir, n)
+    return state.get("status") in {"passed", "failed", "recorded"}
+
+
+def _load_recorded_case_ids(dataset_path: str) -> set[int]:
+    recorded: set[int] = set()
+    if not os.path.exists(dataset_path):
+        return recorded
+
+    with open(dataset_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+                if row.get("case_id") is not None:
+                    recorded.add(int(row["case_id"]))
+            except Exception:
+                continue
+    return recorded
 
 
 def _append_jsonl(path: str, row: Dict[str, Any]) -> None:
@@ -116,24 +172,41 @@ def _infer_base_name_from_orig(input_dir: str) -> str:
     return "model"
 
 
-def _default_success_check(remote_output: str, n: int):
+def _default_success_check(remote_output: str, n: int, gen: int = 0):
     """
-    Heuristic success criterion until you specify the definitive artifact.
-    Marks success if volumes/n_<n> exists and contains any file with plausible mesh extensions.
-    """
-    vol_dir = os.path.join(remote_output, "volumes", f"n_{n}")
-    if not os.path.isdir(vol_dir):
-        return 0, "no_volume_dir"
+    Return:
+      (1, reason) for a successful volume mesh,
+      (0, reason) for a completed failed attempt,
+      (None, reason) if the attempt is not yet classifiable.
 
-    exts = (".msh", ".cgns", ".vtk", ".vtm", ".plt", ".grid", ".p3d", ".cas", ".h5", ".dat")
-    files = []
-    for root, _, fnames in os.walk(vol_dir):
-        for fn in fnames:
-            if fn.lower().endswith(exts):
-                files.append(os.path.join(root, fn))
-    if files:
-        return 1, f"found:{os.path.basename(files[0])}"
-    return 0, "no_mesh_artifact"
+    Both pass and fail are terminal outcomes for classifier-data generation.
+    """
+    vol_dir = os.path.join(remote_output, "volumes", f"n_{int(gen)}")
+    if not os.path.isdir(vol_dir):
+        return None, "missing_volume_directory"
+
+    for pattern in (
+        os.path.join(vol_dir, f"*_{int(n)}.plt"),
+        os.path.join(vol_dir, f"*_{int(n)}.msh"),
+        os.path.join(vol_dir, f"*_{int(n)}.cgns"),
+        os.path.join(vol_dir, f"*_{int(n)}.vtk"),
+        os.path.join(vol_dir, f"*_{int(n)}.vtm"),
+    ):
+        for path in glob.glob(pattern):
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                return 1, f"found:{os.path.basename(path)}"
+
+    logs = glob.glob(os.path.join(vol_dir, f"volume_output_{int(n)}*"))
+    for log_path in logs:
+        if not os.path.isfile(log_path):
+            continue
+        txt = Path(log_path).read_text(encoding="utf-8", errors="ignore")
+        if "Error Stop" in txt:
+            return 0, "error_stop_found"
+        if os.path.getsize(log_path) > 0:
+            return 0, "volume_log_present_without_mesh_artifact"
+
+    return None, "volume_attempt_not_complete"
 
 
 def _try_compute_features(run_dir: str, remote_output: str, input_dir: str, base_name: str, n: int) -> Dict[str, Any]:
@@ -150,7 +223,7 @@ def _try_compute_features(run_dir: str, remote_output: str, input_dir: str, base
         return {}
 
     orig_fro = os.path.join(input_dir, f"{base_name}.fro")
-    morphed_fro = os.path.join(remote_output, "surfaces", f"n_{n}", f"{base_name}.fro")
+    morphed_fro = os.path.join(remote_output, "surfaces", "n_0", f"{base_name}_{n}.fro")
     return compute_features(orig_fro, morphed_fro, run_dir=run_dir, case_id=n)
 
 
@@ -232,8 +305,11 @@ def main():
 
     # Prepare outputs
     configs_path = os.path.join(run_dir, "configs.jsonl")
-    dataset_path = settings.dataset_path
+    dataset_path = os.path.expandvars(settings.dataset_path)
     _ensure_dir(os.path.dirname(dataset_path) or run_dir)
+    _ensure_dir(os.path.join(run_dir, "state"))
+    recorded_case_ids = _load_recorded_case_ids(dataset_path)
+    _log(f"[SWEEP] dataset already contains {len(recorded_case_ids)} case IDs", log_path)
 
     # deterministic RNG if seed provided
     rng = np.random.default_rng(settings.seed if settings.seed is not None else None)
@@ -264,10 +340,23 @@ def main():
     # Submit in waves
     idx = 0
     while idx < len(configs):
-        batch = configs[idx: idx + settings.batch_size]
+        raw_batch = configs[idx: idx + settings.batch_size]
+        batch = []
+        for cfg in raw_batch:
+            n = int(cfg["case_id"])
+            if n in recorded_case_ids:
+                _save_case_state(run_dir, n, status="recorded")
+                _log(f"[SWEEP][RESUME] n={n}: already in dataset; skipping", log_path)
+                continue
+            batch.append(cfg)
+
+        if not batch:
+            idx += settings.batch_size
+            continue
+
         n0 = batch[0]["case_id"]
         n1 = batch[-1]["case_id"]
-        _log(f"[SWEEP] Submitting batch cases {n0}..{n1}", log_path)
+        _log(f"[SWEEP] Processing batch cases {n0}..{n1}", log_path)
 
         vol_job_ids: List[str] = []
         submitted_cases: List[int] = []
@@ -287,15 +376,53 @@ def main():
                 "cad_units": settings.cad_units,
             }
 
+            if _case_is_terminal(run_dir, n):
+                submitted_cases.append(n)
+                _log(f"[SWEEP][RESUME] n={n}: terminal state found; no resubmission", log_path)
+                continue
+
+            # Backfill state from artifacts/logs created by an earlier run.
+            # This is essential when restarting a run that predates state files.
+            prior_label, prior_reason = _default_success_check(
+                settings.remote_output,
+                n,
+                gen=0,
+            )
+            if prior_label is not None:
+                _save_case_state(
+                    run_dir,
+                    n,
+                    status=("passed" if int(prior_label) == 1 else "failed"),
+                    label=int(prior_label),
+                    reason=prior_reason,
+                    recovered_from_existing_outputs=True,
+                )
+                submitted_cases.append(n)
+                _log(
+                    f"[SWEEP][RESUME] n={n}: recovered existing terminal result "
+                    f"label={prior_label} ({prior_reason}); no resubmission",
+                    log_path,
+                )
+                continue
+
             pipe = ClusterPipelineManager(config_dict=config_dict, gen=0, n=n)
 
             try:
+                _save_case_state(run_dir, n, status="submitting")
                 morph_id = pipe.morph(n=n)
                 vol_id = pipe.volume(runafter=morph_id)
-                vol_job_ids.append(str(vol_id))
+                if vol_id:
+                    vol_job_ids.append(str(vol_id))
                 submitted_cases.append(n)
+                _save_case_state(
+                    run_dir, n,
+                    status="submitted",
+                    morph_job=morph_id,
+                    volume_job=vol_id,
+                )
                 _log(f"[SWEEP] n={n}: morph={morph_id} volume={vol_id}", log_path)
             except Exception as e:
+                _save_case_state(run_dir, n, status="submission_error", error=repr(e))
                 _log(f"[SWEEP][ERROR] n={n}: submit failed: {e}", log_path)
 
         # Wait for the volumes in this batch to complete
@@ -303,7 +430,22 @@ def main():
 
         # Post-process this batch: compute label + features, append dataset rows
         for n in submitted_cases:
-            label, reason = _default_success_check(settings.remote_output, n)
+            if n in recorded_case_ids:
+                continue
+
+            label, reason = _default_success_check(settings.remote_output, n, gen=0)
+            if label is None:
+                _save_case_state(run_dir, n, status="incomplete", reason=reason)
+                _log(f"[SWEEP][WARN] n={n}: {reason}; leaving for future restart", log_path)
+                continue
+
+            _save_case_state(
+                run_dir,
+                n,
+                status=("passed" if int(label) == 1 else "failed"),
+                label=int(label),
+                reason=reason,
+            )
 
             feats = _try_compute_features(
                 run_dir=run_dir,
@@ -326,12 +468,21 @@ def main():
                 "features": feats,
                 "paths": {
                     "orig_fro": os.path.join(settings.input_dir, f"{base_name}.fro"),
-                    "morphed_fro": os.path.join(settings.remote_output, "surfaces", f"n_{n}", f"{base_name}.fro"),
-                    "volume_dir": os.path.join(settings.remote_output, "volumes", f"n_{n}"),
+                    "morphed_fro": os.path.join(settings.remote_output, "surfaces", "n_0", f"{base_name}_{n}.fro"),
+                    "volume_dir": os.path.join(settings.remote_output, "volumes", "n_0"),
                 },
                 "timestamp": time.time(),
             }
             _append_jsonl(dataset_path, row)
+            recorded_case_ids.add(int(n))
+            _save_case_state(
+                run_dir,
+                n,
+                status="recorded",
+                label=int(label),
+                reason=reason,
+                dataset_path=dataset_path,
+            )
             _log(f"[SWEEP] dataset row written: n={n} label={label} ({reason}) feats={len(feats)}", log_path)
 
         idx += settings.batch_size

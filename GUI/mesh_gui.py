@@ -16,7 +16,7 @@ from mpl_toolkits.mplot3d import Axes3D  # Needed for 3D plots
 
 for dir in ["FileRW", "ShapeParameterization", "MeshGeneration", "ConvertFileType", "Remote", "Local", "GUI"]:
     sys.path.append(os.path.dirname(dir))
-from ShapeParameterization.surfaceFitting import selectControlNodes
+from ShapeParameterization.surfaceFitting import selectControlNodes, selectRegionControlNodes
 from MeshGeneration.meshFile import load_mesh
 from ShapeParameterization.controlNodeDisp import _surface_normals, _map_normals_to_control
 from Local.runSimLocal import *
@@ -994,13 +994,10 @@ class MeshViewer(QWidget):
             
     def _clear_param_widgets(self):
         for attr in [
-            "back_btn", "save_btn", "edit_global_modes_btn",
-            "global_modes_cb", "global_only_cb", "use_local_modes_cb",
-            "k_modes_spin", "decay_p_spin", "coeff_frac_spin", "seed_spin",
-            "normal_project_cb", "vector_mode_combo", "frame_knn_spin",
-            "rigid_translation_cb", "amp_alpha_spin",
-            "use_pca_cb", "pca_train_spin", "pca_energy_spin", "pca_k_red_spin",
-            "direct_mode_combo", "direct_amp_alpha_spin"
+            "back_btn", "save_btn", "modal_explorer_btn",
+            "advanced_modal_btn", "pca_settings_btn", "global_modes_settings_btn", "protection_settings_btn",
+            "direct_mode_combo", "direct_amp_alpha_spin", "direct_rigid_translation_cb",
+            "form_container"
         ]:
             try:
                 w = getattr(self, attr, None)
@@ -1041,6 +1038,58 @@ class MeshViewer(QWidget):
         
         self.plotter.close()
         
+        self.point_region_ids = np.zeros(len(self.points), dtype=int)
+        self.control_node_region_ids = np.zeros(len(self.control_nodes), dtype=int)
+        self.region_centres = np.asarray([np.mean(self.points, axis=0)], float)
+        
+        self.plot_T_surfaces()
+        
+    def prelim_select_control_nodes(self, output_path, num_regions):
+        """
+        Preliminary response-surface setup:
+        split T patch into R regions and select one representative control node per region.
+        """
+        result = selectRegionControlNodes(
+            output_path,
+            self.output_dir,
+            int(num_regions),
+        )
+
+        self.points = np.asarray(result[0], float)
+        self.control_nodes = np.asarray(result[1], float)
+
+        self.point_region_ids = np.asarray(result[2], dtype=int)
+        self.control_node_region_ids = np.asarray(result[3], dtype=int)
+        self.region_centres = np.asarray(result[4], float)
+        self.control_node_point_indices = np.asarray(result[5], dtype=int)
+
+        surf_normals = _surface_normals(self.points, knn=16)
+        self.control_normals = _map_normals_to_control(
+            self.control_nodes,
+            self.points,
+            surf_normals,
+            k=12
+        )
+
+        try:
+            pts = np.asarray(self.points, float)
+            d = pts.max(axis=0) - pts.min(axis=0)
+            self.t_patch_scale = float(np.linalg.norm(d))
+            self.log(f"[PRELIM] T-patch scale = {self.t_patch_scale:.6g}")
+        except Exception as e:
+            self.t_patch_scale = None
+            self.log(f"[WARN] Failed to compute T-patch scale: {e}")
+
+        self.log(
+            f"[PRELIM] Split T patch into {int(num_regions)} regions "
+            f"and selected {len(self.control_nodes)} representative control nodes."
+        )
+
+        try:
+            self.plotter.close()
+        except Exception:
+            pass
+
         self.plot_T_surfaces()
 
     # --- finish selection ---
@@ -1126,6 +1175,20 @@ class MeshViewer(QWidget):
         self.loaded_control_nodes_path = choice["control_nodes_path"]
         self.loaded_control_normals_path = choice["control_normals_path"]
 
+        # preliminary response-surface screening settings
+        self.prelim_enabled = bool(choice.get("prelim_enabled", False))
+        self.prelim_regions = int(choice.get("prelim_regions", 0) or 0)
+        self.prelim_final_control_nodes = int(choice.get("prelim_final_control_nodes", num_input) or num_input)
+        self.prelim_keep_fraction = float(choice.get("prelim_keep_fraction", 0.67) or 0.67)
+        self.prelim_doe_amplitude = float(choice.get("prelim_doe_amplitude", 1.0) or 1.0)
+
+        if self.prelim_enabled:
+            self.log(
+                f"[PRELIM] Enabled response-surface screening: "
+                f"R={self.prelim_regions}, final_CN={self.prelim_final_control_nodes}, "
+                f"keep={self.prelim_keep_fraction:.2f}, amp={self.prelim_doe_amplitude:.3g}"
+            )
+
         # --- Build preview PolyData from T surface NAMES ---
         t_mesh = None
         for nm in getattr(self, "T_names", []):
@@ -1140,6 +1203,7 @@ class MeshViewer(QWidget):
 
         # picker-friendly mesh
         t_mesh = t_mesh.extract_surface().triangulate().clean()
+        self.t_mesh_preview = t_mesh.copy()
 
         # save preview mesh for downstream / auto selection path
         output_path = os.path.join(self.output_dir, "surfaces", "output.vtk")
@@ -1150,7 +1214,10 @@ class MeshViewer(QWidget):
         self.points = np.asarray(t_mesh.points, float)
 
         if mode == "auto":
-            self.auto_select_control_nodes(output_path, num_input)
+            if getattr(self, "prelim_enabled", False):
+                self.prelim_select_control_nodes(output_path, self.prelim_regions)
+            else:
+                self.auto_select_control_nodes(output_path, num_input)
         elif mode == "manual":
             self.manual_select_control_nodes(t_mesh, num_input)
         elif mode == "load":
@@ -1224,6 +1291,39 @@ class MeshViewer(QWidget):
             self.protected_control_nodes = rows
             self.log(f"[PROTECT] Protected CN indices: {rows}")
 
+
+    def open_advanced_modal_settings_dialog(self):
+        dlg = ModalAdvancedSettingsDialog(self)
+        if dlg.exec_() == QDialog.Accepted:
+            vals = dlg.values()
+            for k, v in vals.items():
+                setattr(self, k, v)
+            self.log("[MODAL] Advanced modal settings updated.")
+
+    def open_pca_settings_dialog(self):
+        dlg = PCASettingsDialog(self)
+        if dlg.exec_() == QDialog.Accepted:
+            vals = dlg.values()
+            for k, v in vals.items():
+                setattr(self, k, v)
+            self.log("[PCA] PCA settings updated.")
+
+    def open_global_modes_settings_dialog(self):
+        dlg = GlobalModeSettingsDialog(self)
+        if dlg.exec_() == QDialog.Accepted:
+            vals = dlg.values()
+            for k, v in vals.items():
+                setattr(self, k, v)
+            self.log("[GLOBAL] Global-mode settings updated.")
+
+    def open_protection_settings_dialog(self):
+        dlg = ProtectionSettingsDialog(self)
+        if dlg.exec_() == QDialog.Accepted:
+            vals = dlg.values()
+            for k, v in vals.items():
+                setattr(self, k, v)
+            self.log("[PROTECT] Protection settings updated.")
+
     def plot_T_surfaces(self):
         try:
             self.plotter.close()
@@ -1237,16 +1337,68 @@ class MeshViewer(QWidget):
 
         # ----------------------------
         # base cloud / T patch preview
+        # If preliminary regions exist, colour the T patch and CNs by region.
+        # Otherwise, fall back to the normal single-colour preview.
         # ----------------------------
-        polydata = pv.PolyData(self.points)
-        self.plotter.add_mesh(polydata, color="#52b7ba", show_edges=True, opacity=0.3)
+        pts = np.asarray(self.points, float)
+        point_region_ids = getattr(self, "point_region_ids", None)
 
-        # plot control nodes
+        t_poly = getattr(self, "t_mesh_preview", None)
+        if t_poly is None:
+            t_poly = pv.PolyData(pts)
+        else:
+            t_poly = t_poly.copy()
+
+        if point_region_ids is not None and len(point_region_ids) == t_poly.n_points:
+            region_ids = np.asarray(point_region_ids, dtype=int)
+            t_poly.point_data["Region"] = region_ids
+
+            n_regions = int(region_ids.max()) + 1
+            ticks = list(range(n_regions))
+
+            self.plotter.add_mesh(
+                t_poly,
+                scalars="Region",
+                cmap="tab20",
+                show_edges=True,
+                opacity=1,
+                clim=[-0.5, n_regions - 0.5],
+                scalar_bar_args={
+                    "title": "Region",
+                    "n_labels": n_regions,
+                    "fmt": "%.0f",
+                },
+            )
+        else:
+            self.plotter.add_mesh(
+                t_poly,
+                color="#52b7ba",
+                show_edges=True,
+                opacity=0.35,
+            )
+
+        # plot control nodes, coloured by region when available
         cn = pv.PolyData()
         cn.points = self.control_nodes
-        verts = np.hstack([[1, i] for i in range(len(self.control_nodes))])
-        cn.verts = verts
-        self.plotter.add_mesh(cn, color="black", point_size=12.0)
+        n_cn = len(self.control_nodes)
+        cn.verts = np.column_stack([
+            np.ones(n_cn, dtype=np.int64),
+            np.arange(n_cn, dtype=np.int64)
+        ]).ravel()
+
+        cn_region_ids = getattr(self, "control_node_region_ids", None)
+        if cn_region_ids is not None and len(cn_region_ids) == len(self.control_nodes):
+            cn["Region"] = np.asarray(cn_region_ids, dtype=int)
+            self.plotter.add_mesh(
+                cn,
+                scalars="Region",
+                cmap="tab20",
+                point_size=14.0,
+                render_points_as_spheres=True,
+                show_scalar_bar=False,
+            )
+        else:
+            self.plotter.add_mesh(cn, color="black", point_size=12.0)
 
         # axes
         try:
@@ -1257,11 +1409,13 @@ class MeshViewer(QWidget):
         try:
             self.plotter.show_bounds(
                 grid="back",
-                location="outer",
+                n_xlabels=2,
+                n_ylabels=2,
+                n_zlabels=2,
                 all_edges=True,
-                xtitle="X",
-                ytitle="Y",
-                ztitle="Z",
+                xtitle="x",
+                ytitle="y",
+                ztitle="z",
             )
         except Exception:
             pass
@@ -1294,12 +1448,8 @@ class MeshViewer(QWidget):
         )
         self.form.addRow("Parameterisation:", method_label)
 
-        # ============================
-        # DIRECT PARAMETERISATION UI
-        # ============================
+        # Keep this panel intentionally compact so the T-surface plot remains visible.
         if self.parameterisation_method == "direct":
-
-            # subtype
             self.direct_mode_combo = QComboBox()
             self.direct_mode_combo.addItems([
                 "Cartesian (x,y,z)",
@@ -1309,7 +1459,6 @@ class MeshViewer(QWidget):
             self.direct_mode_combo.setCurrentIndex(0 if prev_direct_mode == "xyz" else 1)
             self.form.addRow("Direct displacement type:", self.direct_mode_combo)
 
-            # amplitude scale
             self.direct_amp_alpha_spin = QDoubleSpinBox()
             self.direct_amp_alpha_spin.setRange(1e-6, 10.0)
             self.direct_amp_alpha_spin.setDecimals(6)
@@ -1317,28 +1466,13 @@ class MeshViewer(QWidget):
             self.direct_amp_alpha_spin.setValue(float(getattr(self, "amp_alpha", 0.01)))
             self.form.addRow("Amplitude scale:", self.direct_amp_alpha_spin)
 
-            # rigid translation
-            self.rigid_translation_cb = QCheckBox("Enable rigid boundary translation")
-            self.rigid_translation_cb.setChecked(getattr(self, "rigid_boundary_translation", False))
-            self.form.addRow(self.rigid_translation_cb)
+            self.direct_rigid_translation_cb = QCheckBox("Enable rigid boundary translation")
+            self.direct_rigid_translation_cb.setChecked(getattr(self, "rigid_boundary_translation", False))
+            self.form.addRow(self.direct_rigid_translation_cb)
 
-            # optional future extension note
-            direct_note = QLabel(
-                "Direct mode uses per-control-node displacement variables.\n"
-                "Modal/global/PCA settings are hidden for this parameterisation."
-            )
-            direct_note.setWordWrap(True)
-            self.form.addRow(direct_note)
-
-        # ============================
-        # MODAL PARAMETERISATION UI
-        # ============================
         else:
-            from PyQt5.QtWidgets import QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox
-
             n_cn = len(self.control_nodes)
 
-            # number of modes
             self.k_modes_spin = QSpinBox()
             if n_cn == 1:
                 self.k_modes_spin.setRange(1, n_cn)
@@ -1348,29 +1482,6 @@ class MeshViewer(QWidget):
                 self.k_modes_spin.setValue(min(getattr(self, "k_modes", 6), max(1, n_cn - 1)))
             self.form.addRow("Number of modes (k):", self.k_modes_spin)
 
-            # spectral decay
-            self.decay_p_spin = QDoubleSpinBox()
-            self.decay_p_spin.setRange(0.1, 6.0)
-            self.decay_p_spin.setDecimals(2)
-            self.decay_p_spin.setSingleStep(0.1)
-            self.decay_p_spin.setValue(getattr(self, "spectral_p", 2.0))
-            self.form.addRow("Spectral decay p:", self.decay_p_spin)
-
-            # coefficient amplitude fraction
-            self.coeff_frac_spin = QDoubleSpinBox()
-            self.coeff_frac_spin.setRange(0.01, 1.0)
-            self.coeff_frac_spin.setDecimals(3)
-            self.coeff_frac_spin.setSingleStep(0.01)
-            self.coeff_frac_spin.setValue(getattr(self, "coeff_frac", 0.15))
-            self.form.addRow("Coeff amplitude (frac):", self.coeff_frac_spin)
-
-            # seed
-            self.seed_spin = QSpinBox()
-            self.seed_spin.setRange(0, 10**9)
-            self.seed_spin.setValue(getattr(self, "seed", 0))
-            self.form.addRow("Random seed:", self.seed_spin)
-
-            # amp alpha
             self.amp_alpha_spin = QDoubleSpinBox()
             self.amp_alpha_spin.setRange(1e-6, 10.0)
             self.amp_alpha_spin.setDecimals(6)
@@ -1378,109 +1489,30 @@ class MeshViewer(QWidget):
             self.amp_alpha_spin.setValue(float(getattr(self, "amp_alpha", 0.01)))
             self.form.addRow("Amplitude scale:", self.amp_alpha_spin)
 
-            # normal projection
             self.normal_project_cb = QCheckBox("Project local modes along normals")
             self.normal_project_cb.setChecked(getattr(self, "normal_project", True))
             self.form.addRow(self.normal_project_cb)
 
-            # vector mode for non-normal case
-            self.vector_mode_combo = QComboBox()
-            self.vector_mode_combo.addItems([
-                "Local frame (t1,t2,n)",
-                "Cartesian (x,y,z)",
-            ])
-            prev_vm = getattr(self, "vector_mode", "local_frame")
-            self.vector_mode_combo.setCurrentIndex(0 if prev_vm == "local_frame" else 1)
-            self.form.addRow("Vector mode (if normals off):", self.vector_mode_combo)
-
-            # local frame knn
-            self.frame_knn_spin = QSpinBox()
-            self.frame_knn_spin.setRange(3, 200)
-            self.frame_knn_spin.setValue(int(getattr(self, "frame_knn", 16)))
-            self.form.addRow("Local-frame kNN:", self.frame_knn_spin)
-            
-            self.use_protection_cb = QCheckBox("Use protected control-node weighting")
-            self.use_protection_cb.setChecked(getattr(self, "use_protection", False))
-            self.form.addRow(self.use_protection_cb)
-
-            self.protection_radius_spin = QDoubleSpinBox()
-            self.protection_radius_spin.setRange(1e-9, 1e9)
-            self.protection_radius_spin.setDecimals(6)
-            self.protection_radius_spin.setSingleStep(1.0)
-            default_radius = getattr(self, "protection_radius", None)
-            if default_radius is None:
-                t_scale = getattr(self, "t_patch_scale", None)
-                if t_scale is None:
-                    t_scale = 1.0
-                default_radius = 0.05 * float(t_scale)
-
-            default_radius = float(default_radius)
-            self.protection_radius_spin.setValue(default_radius)
-            self.form.addRow("Protection radius:", self.protection_radius_spin)
-
-            self.select_protected_btn = QPushButton("Select protected control nodes")
-            self.select_protected_btn.clicked.connect(self.open_protected_nodes_dialog)
-            self.form.addRow(self.select_protected_btn)
-
-            # local/global toggles
-            self.use_local_modes_cb = QCheckBox("Use Laplacian local modes")
-            self.use_local_modes_cb.setChecked(getattr(self, "use_local_modes", True))
-            self.form.addRow(self.use_local_modes_cb)
-
-            self.global_modes_cb = QCheckBox("Use global aerodynamic modes")
-            self.global_modes_cb.setChecked(getattr(self, "global_modes_selected", False))
-            self.global_modes_cb.toggled.connect(self._on_global_modes_toggled)
-            self.form.addRow(self.global_modes_cb)
-
-            self.global_only_cb = QCheckBox("Global modes only")
-            self.global_only_cb.setChecked(getattr(self, "global_only", False))
-            self.form.addRow(self.global_only_cb)
-
-            self.edit_global_modes_btn = QPushButton("Edit global modes")
-            self.edit_global_modes_btn.clicked.connect(self.edit_global_modes)
-            self.form.addRow(self.edit_global_modes_btn)
-
-            # PCA
-            self.use_pca_cb = QCheckBox("Use PCA-reduced basis")
-            self.use_pca_cb.setChecked(getattr(self, "use_pca", False))
-            self.form.addRow(self.use_pca_cb)
-
-            self.pca_train_spin = QSpinBox()
-            self.pca_train_spin.setRange(10, 100000)
-            self.pca_train_spin.setValue(int(getattr(self, "pca_train_M", 300)))
-            self.form.addRow("PCA training samples:", self.pca_train_spin)
-
-            self.pca_energy_spin = QDoubleSpinBox()
-            self.pca_energy_spin.setRange(0.5, 0.9999)
-            self.pca_energy_spin.setDecimals(4)
-            self.pca_energy_spin.setSingleStep(0.01)
-            self.pca_energy_spin.setValue(float(getattr(self, "pca_energy", 0.99)))
-            self.form.addRow("PCA energy target:", self.pca_energy_spin)
-
-            self.pca_k_red_spin = QSpinBox()
-            self.pca_k_red_spin.setRange(0, 100000)
-            self.pca_k_red_spin.setValue(int(getattr(self, "pca_k_red", 0) or 0))
-            self.form.addRow("PCA fixed reduced k (0=auto):", self.pca_k_red_spin)
-
-            # rigid translation
             self.rigid_translation_cb = QCheckBox("Enable rigid boundary translation")
             self.rigid_translation_cb.setChecked(getattr(self, "rigid_boundary_translation", False))
             self.form.addRow(self.rigid_translation_cb)
 
-            # enable/disable vector widgets based on normal projection
-            def _sync_modal_widgets():
-                normals_on = self.normal_project_cb.isChecked()
-                self.vector_mode_combo.setEnabled(not normals_on)
-                self.frame_knn_spin.setEnabled(not normals_on)
+            buttons_row = QHBoxLayout()
+            self.advanced_modal_btn = QPushButton("Advanced modal settings")
+            self.advanced_modal_btn.clicked.connect(self.open_advanced_modal_settings_dialog)
+            self.pca_settings_btn = QPushButton("PCA settings")
+            self.pca_settings_btn.clicked.connect(self.open_pca_settings_dialog)
+            self.global_modes_settings_btn = QPushButton("Global modes")
+            self.global_modes_settings_btn.clicked.connect(self.open_global_modes_settings_dialog)
+            self.protection_settings_btn = QPushButton("Protection")
+            self.protection_settings_btn.clicked.connect(self.open_protection_settings_dialog)
 
-                global_only = self.global_only_cb.isChecked()
-                self.use_local_modes_cb.setEnabled(not global_only)
-                if global_only:
-                    self.use_local_modes_cb.setChecked(False)
+            for btn in [self.advanced_modal_btn, self.pca_settings_btn, self.global_modes_settings_btn, self.protection_settings_btn]:
+                buttons_row.addWidget(btn)
 
-            self.normal_project_cb.toggled.connect(_sync_modal_widgets)
-            self.global_only_cb.toggled.connect(_sync_modal_widgets)
-            _sync_modal_widgets()
+            buttons_widget = QWidget()
+            buttons_widget.setLayout(buttons_row)
+            self.form.addRow("More settings:", buttons_widget)
 
         # ----------------------------
         # save button
@@ -1602,7 +1634,7 @@ class MeshViewer(QWidget):
             )
 
             self.amp_alpha = float(self.direct_amp_alpha_spin.value())
-            self.rigid_boundary_translation = bool(self.rigid_translation_cb.isChecked())
+            self.rigid_boundary_translation = bool(self.direct_rigid_translation_cb.isChecked())
 
             # disable modal-only settings
             self.k_modes = 0
@@ -1631,34 +1663,31 @@ class MeshViewer(QWidget):
             self.direct_parameterisation_subtype = None
 
             self.k_modes = int(self.k_modes_spin.value())
-            self.spectral_p = float(self.decay_p_spin.value())
-            self.coeff_frac = float(self.coeff_frac_spin.value())
-            self.seed = int(self.seed_spin.value())
             self.amp_alpha = float(self.amp_alpha_spin.value())
-
             self.normal_project = bool(self.normal_project_cb.isChecked())
-            self.vector_mode = "local_frame" if self.vector_mode_combo.currentIndex() == 0 else "xyz"
-            self.frame_knn = int(self.frame_knn_spin.value())
-
-            self.use_local_modes = bool(self.use_local_modes_cb.isChecked())
-            self.global_modes_selected = bool(self.global_modes_cb.isChecked())
-            self.global_only = bool(self.global_only_cb.isChecked())
             self.rigid_boundary_translation = bool(self.rigid_translation_cb.isChecked())
 
-            # if global-only is checked, force local modes off
+            # Settings now controlled by pop-up dialogs; preserve stored/default values here.
+            self.spectral_p = float(getattr(self, "spectral_p", 2.0))
+            self.coeff_frac = float(getattr(self, "coeff_frac", 0.15))
+            self.seed = int(getattr(self, "seed", 0))
+            self.vector_mode = str(getattr(self, "vector_mode", "local_frame"))
+            self.frame_knn = int(getattr(self, "frame_knn", 16))
+            self.use_local_modes = bool(getattr(self, "use_local_modes", True))
+            self.global_modes_selected = bool(getattr(self, "global_modes_selected", False))
+            self.global_only = bool(getattr(self, "global_only", False))
             if self.global_only:
                 self.use_local_modes = False
 
-            self.use_pca = bool(self.use_pca_cb.isChecked())
-            self.pca_train_M = int(self.pca_train_spin.value())
-            self.pca_energy = float(self.pca_energy_spin.value())
-            k_tmp = int(self.pca_k_red_spin.value())
-            self.pca_k_red = None if k_tmp <= 0 else k_tmp
+            self.use_pca = bool(getattr(self, "use_pca", False))
+            self.pca_train_M = int(getattr(self, "pca_train_M", 300))
+            self.pca_energy = float(getattr(self, "pca_energy", 0.99))
+            self.pca_k_red = getattr(self, "pca_k_red", None)
             self.pca_k_final = getattr(self, "pca_k_final", None)
             self.pca_cache_path = getattr(self, "pca_cache_path", None)
-            
-            self.use_protection = bool(self.use_protection_cb.isChecked())
-            self.protection_radius = float(self.protection_radius_spin.value())
+
+            self.use_protection = bool(getattr(self, "use_protection", False))
+            self.protection_radius = getattr(self, "protection_radius", None)
             self.protected_control_nodes = getattr(self, "protected_control_nodes", [])
 
         # --------------------------------------------------
@@ -1707,6 +1736,17 @@ class MeshViewer(QWidget):
                 "use_protection": self.use_protection,
                 "protected_control_nodes": self.protected_control_nodes,
                 "protection_radius": self.protection_radius,
+                "point_region_ids": (getattr(self, "point_region_ids", None).tolist()
+                                     if getattr(self, "point_region_ids", None) is not None else None),
+                "control_node_region_ids": (getattr(self, "control_node_region_ids", None).tolist()
+                                            if getattr(self, "control_node_region_ids", None) is not None else None),
+                "region_centres": (getattr(self, "region_centres", None).tolist()
+                                   if getattr(self, "region_centres", None) is not None else None),
+                "prelim_enabled": bool(getattr(self, "prelim_enabled", False)),
+                "prelim_regions": int(getattr(self, "prelim_regions", 0) or 0),
+                "prelim_final_control_nodes": int(getattr(self, "prelim_final_control_nodes", 0) or 0),
+                "prelim_keep_fraction": float(getattr(self, "prelim_keep_fraction", 0.67) or 0.67),
+                "prelim_doe_amplitude": float(getattr(self, "prelim_doe_amplitude", 1.0) or 1.0),
             }
 
             meta_path = os.path.join(cn_dir, "control_nodes_meta.json")
@@ -2093,7 +2133,7 @@ class ControlNodeSelectionDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Control Node Selection")
-        self.resize(560, 280)
+        self.resize(620, 430)
 
         layout = QVBoxLayout(self)
 
@@ -2124,6 +2164,54 @@ class ControlNodeSelectionDialog(QDialog):
         row_n.addWidget(self.n_spin)
         row_n.addStretch(1)
         layout.addLayout(row_n)
+
+        # ----------------------------
+        # preliminary regional sensitivity / response-surface study
+        # ----------------------------
+        self.prelim_rs_cb = QCheckBox("Preliminary response-surface sensitivity study")
+        self.prelim_rs_cb.setChecked(False)
+        self.prelim_rs_cb.toggled.connect(self._sync_prelim)
+        layout.addWidget(self.prelim_rs_cb)
+
+        row_prelim_r = QHBoxLayout()
+        row_prelim_r.addWidget(QLabel("Number of preliminary regions (R):"))
+        self.prelim_regions_spin = QSpinBox()
+        self.prelim_regions_spin.setRange(1, 500)
+        self.prelim_regions_spin.setValue(1)
+        row_prelim_r.addWidget(self.prelim_regions_spin)
+        row_prelim_r.addStretch(1)
+        layout.addLayout(row_prelim_r)
+
+        row_prelim_final = QHBoxLayout()
+        row_prelim_final.addWidget(QLabel("Final control nodes after screening:"))
+        self.prelim_final_nodes_spin = QSpinBox()
+        self.prelim_final_nodes_spin.setRange(1, 5000)
+        self.prelim_final_nodes_spin.setValue(30)
+        row_prelim_final.addWidget(self.prelim_final_nodes_spin)
+        row_prelim_final.addStretch(1)
+        layout.addLayout(row_prelim_final)
+
+        row_prelim_keep = QHBoxLayout()
+        row_prelim_keep.addWidget(QLabel("Keep fraction of regions:"))
+        self.prelim_keep_spin = QDoubleSpinBox()
+        self.prelim_keep_spin.setRange(0.05, 1.0)
+        self.prelim_keep_spin.setDecimals(2)
+        self.prelim_keep_spin.setSingleStep(0.05)
+        self.prelim_keep_spin.setValue(0.67)
+        row_prelim_keep.addWidget(self.prelim_keep_spin)
+        row_prelim_keep.addStretch(1)
+        layout.addLayout(row_prelim_keep)
+
+        row_prelim_amp = QHBoxLayout()
+        row_prelim_amp.addWidget(QLabel("Prelim perturbation amplitude:"))
+        self.prelim_amp_spin = QDoubleSpinBox()
+        self.prelim_amp_spin.setRange(1e-6, 10.0)
+        self.prelim_amp_spin.setDecimals(6)
+        self.prelim_amp_spin.setSingleStep(0.001)
+        self.prelim_amp_spin.setValue(1.0)
+        row_prelim_amp.addWidget(self.prelim_amp_spin)
+        row_prelim_amp.addStretch(1)
+        layout.addLayout(row_prelim_amp)
 
         # ----------------------------
         # load saved files
@@ -2169,6 +2257,19 @@ class ControlNodeSelectionDialog(QDialog):
 
         self._update_enabled_state()
 
+    def _sync_prelim(self, checked):
+        if checked:
+            self.mode_auto.setChecked(True)
+            self.mode_manual.setChecked(False)
+            self.mode_load.setChecked(False)
+
+            if self.prelim_regions_spin.value() < 2:
+                self.prelim_regions_spin.setValue(12)
+        else:
+            self.prelim_regions_spin.setValue(1)
+
+        self._update_enabled_state()
+
     def _sync(self, which):
         if which == "auto" and self.mode_auto.isChecked():
             self.mode_manual.setChecked(False)
@@ -2187,11 +2288,22 @@ class ControlNodeSelectionDialog(QDialog):
 
     def _update_enabled_state(self):
         load_mode = self.mode_load.isChecked()
-        self.n_spin.setEnabled(not load_mode)
-        self.cn_path_edit.setEnabled(load_mode)
-        self.cn_browse_btn.setEnabled(load_mode)
-        self.normals_path_edit.setEnabled(load_mode)
-        self.normals_browse_btn.setEnabled(load_mode)
+        prelim_on = self.prelim_rs_cb.isChecked()
+
+        self.n_spin.setEnabled((not load_mode) and (not prelim_on))
+
+        self.mode_manual.setEnabled(not prelim_on)
+        self.mode_load.setEnabled(not prelim_on)
+
+        self.cn_path_edit.setEnabled(load_mode and not prelim_on)
+        self.cn_browse_btn.setEnabled(load_mode and not prelim_on)
+        self.normals_path_edit.setEnabled(load_mode and not prelim_on)
+        self.normals_browse_btn.setEnabled(load_mode and not prelim_on)
+
+        self.prelim_regions_spin.setEnabled(prelim_on)
+        self.prelim_final_nodes_spin.setEnabled(prelim_on)
+        self.prelim_keep_spin.setEnabled(prelim_on)
+        self.prelim_amp_spin.setEnabled(prelim_on)
 
     def _browse_cn_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2228,12 +2340,214 @@ class ControlNodeSelectionDialog(QDialog):
             else "modal"
         )
 
+        prelim_enabled = bool(self.prelim_rs_cb.isChecked())
+
         return {
             "selection_mode": selection_mode,
             "num_nodes": int(self.n_spin.value()),
             "control_nodes_path": self.cn_path_edit.text().strip() or None,
             "control_normals_path": self.normals_path_edit.text().strip() or None,
             "parameterisation_method": parameterisation_method,
+            "prelim_enabled": prelim_enabled,
+            "prelim_regions": int(self.prelim_regions_spin.value()),
+            "prelim_final_control_nodes": int(self.prelim_final_nodes_spin.value()),
+            "prelim_keep_fraction": float(self.prelim_keep_spin.value()),
+            "prelim_doe_amplitude": float(self.prelim_amp_spin.value()),
+        }
+
+
+
+class ModalAdvancedSettingsDialog(QDialog):
+    def __init__(self, viewer):
+        super().__init__(viewer)
+        self.viewer = viewer
+        self.setWindowTitle("Advanced modal settings")
+        self.resize(420, 260)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.decay_p_spin = QDoubleSpinBox()
+        self.decay_p_spin.setRange(0.1, 6.0)
+        self.decay_p_spin.setDecimals(2)
+        self.decay_p_spin.setSingleStep(0.1)
+        self.decay_p_spin.setValue(float(getattr(viewer, "spectral_p", 2.0)))
+        form.addRow("Spectral decay p:", self.decay_p_spin)
+
+        self.coeff_frac_spin = QDoubleSpinBox()
+        self.coeff_frac_spin.setRange(0.01, 1.0)
+        self.coeff_frac_spin.setDecimals(3)
+        self.coeff_frac_spin.setSingleStep(0.01)
+        self.coeff_frac_spin.setValue(float(getattr(viewer, "coeff_frac", 0.15)))
+        form.addRow("Coeff amplitude fraction:", self.coeff_frac_spin)
+
+        self.seed_spin = QSpinBox()
+        self.seed_spin.setRange(0, 10**9)
+        self.seed_spin.setValue(int(getattr(viewer, "seed", 0)))
+        form.addRow("Random seed:", self.seed_spin)
+
+        self.vector_mode_combo = QComboBox()
+        self.vector_mode_combo.addItems(["Local frame (t1,t2,n)", "Cartesian (x,y,z)"])
+        self.vector_mode_combo.setCurrentIndex(0 if getattr(viewer, "vector_mode", "local_frame") == "local_frame" else 1)
+        form.addRow("Vector mode if normals off:", self.vector_mode_combo)
+
+        self.frame_knn_spin = QSpinBox()
+        self.frame_knn_spin.setRange(3, 200)
+        self.frame_knn_spin.setValue(int(getattr(viewer, "frame_knn", 16)))
+        form.addRow("Local-frame kNN:", self.frame_knn_spin)
+
+        self.use_local_modes_cb = QCheckBox("Use Laplacian local modes")
+        self.use_local_modes_cb.setChecked(bool(getattr(viewer, "use_local_modes", True)))
+        form.addRow(self.use_local_modes_cb)
+
+        layout.addLayout(form)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def values(self):
+        return {
+            "spectral_p": float(self.decay_p_spin.value()),
+            "coeff_frac": float(self.coeff_frac_spin.value()),
+            "seed": int(self.seed_spin.value()),
+            "vector_mode": "local_frame" if self.vector_mode_combo.currentIndex() == 0 else "xyz",
+            "frame_knn": int(self.frame_knn_spin.value()),
+            "use_local_modes": bool(self.use_local_modes_cb.isChecked()),
+        }
+
+
+class PCASettingsDialog(QDialog):
+    def __init__(self, viewer):
+        super().__init__(viewer)
+        self.viewer = viewer
+        self.setWindowTitle("PCA settings")
+        self.resize(420, 230)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.use_pca_cb = QCheckBox("Use PCA-reduced basis")
+        self.use_pca_cb.setChecked(bool(getattr(viewer, "use_pca", False)))
+        form.addRow(self.use_pca_cb)
+
+        self.pca_train_spin = QSpinBox()
+        self.pca_train_spin.setRange(10, 100000)
+        self.pca_train_spin.setValue(int(getattr(viewer, "pca_train_M", 300)))
+        form.addRow("PCA training samples:", self.pca_train_spin)
+
+        self.pca_energy_spin = QDoubleSpinBox()
+        self.pca_energy_spin.setRange(0.5, 0.9999)
+        self.pca_energy_spin.setDecimals(4)
+        self.pca_energy_spin.setSingleStep(0.01)
+        self.pca_energy_spin.setValue(float(getattr(viewer, "pca_energy", 0.99)))
+        form.addRow("PCA energy target:", self.pca_energy_spin)
+
+        self.pca_k_red_spin = QSpinBox()
+        self.pca_k_red_spin.setRange(0, 100000)
+        self.pca_k_red_spin.setValue(int(getattr(viewer, "pca_k_red", 0) or 0))
+        form.addRow("Fixed reduced k (0=auto):", self.pca_k_red_spin)
+
+        layout.addLayout(form)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def values(self):
+        k_tmp = int(self.pca_k_red_spin.value())
+        return {
+            "use_pca": bool(self.use_pca_cb.isChecked()),
+            "pca_train_M": int(self.pca_train_spin.value()),
+            "pca_energy": float(self.pca_energy_spin.value()),
+            "pca_k_red": None if k_tmp <= 0 else k_tmp,
+        }
+
+
+class GlobalModeSettingsDialog(QDialog):
+    def __init__(self, viewer):
+        super().__init__(viewer)
+        self.viewer = viewer
+        self.setWindowTitle("Global mode settings")
+        self.resize(360, 180)
+        layout = QVBoxLayout(self)
+
+        self.global_modes_cb = QCheckBox("Use global aerodynamic modes")
+        self.global_modes_cb.setChecked(bool(getattr(viewer, "global_modes_selected", False)))
+        layout.addWidget(self.global_modes_cb)
+
+        self.global_only_cb = QCheckBox("Global modes only")
+        self.global_only_cb.setChecked(bool(getattr(viewer, "global_only", False)))
+        layout.addWidget(self.global_only_cb)
+
+        edit_btn = QPushButton("Edit global mode list")
+        edit_btn.clicked.connect(self._edit_modes)
+        layout.addWidget(edit_btn)
+
+        self.mode_count_label = QLabel()
+        layout.addWidget(self.mode_count_label)
+        self._refresh_label()
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _edit_modes(self):
+        existing = getattr(self.viewer, "global_mode_config", [])
+        dlg = GlobalModesDialog(existing=existing, parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            self.viewer.global_mode_config = dlg.get_selected_modes()
+            self._refresh_label()
+
+    def _refresh_label(self):
+        n = len(getattr(self.viewer, "global_mode_config", []) or [])
+        self.mode_count_label.setText(f"Configured global modes: {n}")
+
+    def values(self):
+        return {
+            "global_modes_selected": bool(self.global_modes_cb.isChecked()),
+            "global_only": bool(self.global_only_cb.isChecked()),
+            "global_mode_config": getattr(self.viewer, "global_mode_config", []),
+        }
+
+
+class ProtectionSettingsDialog(QDialog):
+    def __init__(self, viewer):
+        super().__init__(viewer)
+        self.viewer = viewer
+        self.setWindowTitle("Protected-node settings")
+        self.resize(420, 200)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.use_protection_cb = QCheckBox("Use protected control-node weighting")
+        self.use_protection_cb.setChecked(bool(getattr(viewer, "use_protection", False)))
+        form.addRow(self.use_protection_cb)
+
+        self.protection_radius_spin = QDoubleSpinBox()
+        self.protection_radius_spin.setRange(1e-9, 1e9)
+        self.protection_radius_spin.setDecimals(6)
+        self.protection_radius_spin.setSingleStep(1.0)
+        default_radius = getattr(viewer, "protection_radius", None)
+        if default_radius is None:
+            default_radius = 0.05 * float(getattr(viewer, "t_patch_scale", 1.0) or 1.0)
+        self.protection_radius_spin.setValue(float(default_radius))
+        form.addRow("Protection radius:", self.protection_radius_spin)
+        layout.addLayout(form)
+
+        select_btn = QPushButton("Select protected control nodes")
+        select_btn.clicked.connect(viewer.open_protected_nodes_dialog)
+        layout.addWidget(select_btn)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def values(self):
+        return {
+            "use_protection": bool(self.use_protection_cb.isChecked()),
+            "protection_radius": float(self.protection_radius_spin.value()),
+            "protected_control_nodes": getattr(self.viewer, "protected_control_nodes", []),
         }
 
 

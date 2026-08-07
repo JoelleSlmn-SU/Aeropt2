@@ -297,3 +297,193 @@ def selectControlNodes(path, output_dir, num_control_nodes=20):
     return points, controlNodes
 
 
+def farthest_point_sampling_indices(points, n, start_idx=None, seed=0):
+    """
+    Farthest-point sampling that returns point indices instead of coordinates.
+
+    Parameters
+    ----------
+    points : array-like, shape (N, 3)
+        Candidate point cloud.
+    n : int
+        Number of points to sample.
+    start_idx : int or None
+        Optional starting point index. If None, a deterministic random start is used.
+    seed : int
+        Seed used only when start_idx is None.
+    """
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError(f"points must have shape (N, 3). Got {pts.shape}")
+
+    N = int(len(pts))
+    if N == 0:
+        raise ValueError("Cannot sample from an empty point cloud.")
+
+    n = int(max(1, min(n, N)))
+
+    if start_idx is None:
+        rng = np.random.default_rng(seed)
+        start_idx = int(rng.integers(0, N))
+    else:
+        start_idx = int(np.clip(start_idx, 0, N - 1))
+
+    sampled = [start_idx]
+    distances = np.full(N, np.inf, dtype=float)
+
+    for _ in range(1, n):
+        last_point = pts[sampled[-1]]
+        dist = np.linalg.norm(pts - last_point, axis=1)
+        distances = np.minimum(distances, distances * 0 + dist)
+        next_idx = int(np.argmax(distances))
+        sampled.append(next_idx)
+
+    return np.asarray(sampled, dtype=int)
+
+
+def _surface_uv_coordinates(points):
+    """
+    Project a 3D surface point cloud to a stable 2D PCA coordinate system.
+    Used only for region splitting/visual grouping, not for morphing.
+    """
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError(f"points must have shape (N, 3). Got {pts.shape}")
+
+    if len(pts) < 3:
+        return np.zeros((len(pts), 2), dtype=float), None
+
+    pca = PCA(n_components=2)
+    uv = pca.fit_transform(pts - pts.mean(axis=0, keepdims=True))
+    return uv, pca
+
+
+def split_surface_regions(points, n_regions=1, seed=0):
+    """
+    Split T-surface points into approximately spatial regions.
+
+    The split is performed in a 2D PCA projection of the T-surface point cloud,
+    then each 3D point is assigned a region id. For n_regions=1, all points are
+    assigned to region 0.
+
+    Returns
+    -------
+    point_region_ids : ndarray, shape (N,)
+        Region id for every T-surface point.
+    region_centres : ndarray, shape (R, 3)
+        Representative 3D centre of each region, snapped to the nearest mesh node.
+    centre_point_indices : ndarray, shape (R,)
+        Point index of each representative centre in the original point cloud.
+    """
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError(f"points must have shape (N, 3). Got {pts.shape}")
+
+    N = int(len(pts))
+    if N == 0:
+        raise ValueError("Cannot split an empty point cloud into regions.")
+
+    R = int(max(1, min(n_regions, N)))
+
+    if R == 1:
+        point_region_ids = np.zeros(N, dtype=int)
+        centre_point_indices = np.asarray([int(np.argmin(np.linalg.norm(pts - pts.mean(axis=0), axis=1)))], dtype=int)
+        region_centres = pts[centre_point_indices]
+        return point_region_ids, region_centres, centre_point_indices
+
+    uv, _ = _surface_uv_coordinates(pts)
+
+    # Prefer sklearn KMeans if available. It is deterministic with random_state.
+    try:
+        from sklearn.cluster import KMeans
+        km = KMeans(n_clusters=R, random_state=int(seed), n_init=10)
+        point_region_ids = km.fit_predict(uv).astype(int)
+        centres_uv = km.cluster_centers_
+    except Exception:
+        # Fallback: farthest-point centres in UV + nearest-centre assignment.
+        centre_uv_idx = farthest_point_sampling_indices(
+            np.column_stack([uv, np.zeros(len(uv))]), R, seed=seed
+        )
+        centres_uv = uv[centre_uv_idx]
+        d = np.linalg.norm(uv[:, None, :] - centres_uv[None, :, :], axis=2)
+        point_region_ids = np.argmin(d, axis=1).astype(int)
+
+    # Snap each region centre to the nearest original mesh point.
+    tree = cKDTree(pts)
+    centre_point_indices = []
+    region_centres = []
+    for rid in range(R):
+        mask = point_region_ids == rid
+        if np.any(mask):
+            target = pts[mask].mean(axis=0)
+        else:
+            # Very rare, but handle empty clusters robustly.
+            target_uv = centres_uv[rid]
+            i_uv = int(np.argmin(np.linalg.norm(uv - target_uv, axis=1)))
+            target = pts[i_uv]
+
+        _, idx = tree.query(target, k=1)
+        centre_point_indices.append(int(idx))
+        region_centres.append(pts[int(idx)])
+
+    return (
+        point_region_ids.astype(int),
+        np.asarray(region_centres, dtype=float),
+        np.asarray(centre_point_indices, dtype=int),
+    )
+
+
+def selectRegionControlNodes(path, output_dir=None, n_regions=1, seed=0):
+    """
+    Select one representative control node per preliminary surface region.
+
+    This is intended for the preliminary response-surface screening stage:
+      - R regions are created on the T surface.
+      - one centre control node is selected per region.
+      - all T-surface points and selected control nodes receive region ids for plotting.
+
+    Returns
+    -------
+    points : ndarray, shape (N, 3)
+        T-surface points.
+    control_nodes : ndarray, shape (R, 3)
+        One representative centre node per region.
+    point_region_ids : ndarray, shape (N,)
+        Region id for every T-surface point.
+    control_node_region_ids : ndarray, shape (R,)
+        Region id for every selected control node.
+    region_centres : ndarray, shape (R, 3)
+        Same as control_nodes for this preliminary stage.
+    control_node_point_indices : ndarray, shape (R,)
+        Index of each selected CN in points.
+    """
+    mesh = pv.read(path)
+    mesh = mesh.clean(tolerance=1e-8)
+    points = np.asarray(mesh.points, dtype=float)
+
+    point_region_ids, region_centres, centre_point_indices = split_surface_regions(
+        points,
+        n_regions=int(n_regions),
+        seed=int(seed),
+    )
+
+    control_nodes = np.asarray(region_centres, dtype=float)
+    control_node_region_ids = np.arange(len(control_nodes), dtype=int)
+
+    if output_dir:
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            np.save(os.path.join(output_dir, "prelim_region_point_ids.npy"), point_region_ids)
+            np.save(os.path.join(output_dir, "prelim_region_centres.npy"), region_centres)
+            np.save(os.path.join(output_dir, "prelim_region_centre_indices.npy"), centre_point_indices)
+        except Exception:
+            pass
+
+    return (
+        points,
+        control_nodes,
+        point_region_ids,
+        control_node_region_ids,
+        region_centres,
+        centre_point_indices,
+    )
