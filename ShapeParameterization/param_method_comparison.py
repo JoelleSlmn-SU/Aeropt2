@@ -29,10 +29,10 @@ OUT_DIR = os.path.join(MAIN_DIR, f"analysis_results_{CASE}")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 METHODS = [
-    MethodConfig(name="xyz",        folder="param1", dof=6),
-    MethodConfig(name="dn",         folder="param2", dof=18),
+    MethodConfig(name="xyz",        folder="param1", dof=18),
+    MethodConfig(name="normal",         folder="param2", dof=18),
     MethodConfig(name="lap",        folder="param3", dof=18),
-    MethodConfig(name="lap_global", folder="param4", dof=18),
+    MethodConfig(name="hybrid", folder="param4", dof=18),
 ]
 
 # Toggle this on to additionally compare morph smoothness / robustness

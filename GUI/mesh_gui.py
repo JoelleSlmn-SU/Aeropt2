@@ -1181,6 +1181,8 @@ class MeshViewer(QWidget):
         self.prelim_final_control_nodes = int(choice.get("prelim_final_control_nodes", num_input) or num_input)
         self.prelim_keep_fraction = float(choice.get("prelim_keep_fraction", 0.67) or 0.67)
         self.prelim_doe_amplitude = float(choice.get("prelim_doe_amplitude", 1.0) or 1.0)
+        self.prelim_morris_trajectories = int(choice.get("prelim_morris_trajectories", 6) or 6)
+        self.prelim_morris_levels = int(choice.get("prelim_morris_levels", 4) or 4)
 
         if self.prelim_enabled:
             self.log(
@@ -1747,6 +1749,8 @@ class MeshViewer(QWidget):
                 "prelim_final_control_nodes": int(getattr(self, "prelim_final_control_nodes", 0) or 0),
                 "prelim_keep_fraction": float(getattr(self, "prelim_keep_fraction", 0.67) or 0.67),
                 "prelim_doe_amplitude": float(getattr(self, "prelim_doe_amplitude", 1.0) or 1.0),
+                "prelim_morris_trajectories": int(getattr(self, "prelim_morris_trajectories", 6) or 6),
+                "prelim_morris_levels": int(getattr(self, "prelim_morris_levels", 4) or 4),
             }
 
             meta_path = os.path.join(cn_dir, "control_nodes_meta.json")
@@ -2213,6 +2217,25 @@ class ControlNodeSelectionDialog(QDialog):
         row_prelim_amp.addStretch(1)
         layout.addLayout(row_prelim_amp)
 
+        row_morris_r = QHBoxLayout()
+        row_morris_r.addWidget(QLabel("Morris trajectories:"))
+        self.prelim_morris_trajectories_spin = QSpinBox()
+        self.prelim_morris_trajectories_spin.setRange(2, 100)
+        self.prelim_morris_trajectories_spin.setValue(6)
+        row_morris_r.addWidget(self.prelim_morris_trajectories_spin)
+        row_morris_r.addStretch(1)
+        layout.addLayout(row_morris_r)
+
+        row_morris_p = QHBoxLayout()
+        row_morris_p.addWidget(QLabel("Morris grid levels (even):"))
+        self.prelim_morris_levels_spin = QSpinBox()
+        self.prelim_morris_levels_spin.setRange(4, 20)
+        self.prelim_morris_levels_spin.setSingleStep(2)
+        self.prelim_morris_levels_spin.setValue(4)
+        row_morris_p.addWidget(self.prelim_morris_levels_spin)
+        row_morris_p.addStretch(1)
+        layout.addLayout(row_morris_p)
+
         # ----------------------------
         # load saved files
         # ----------------------------
@@ -2304,6 +2327,8 @@ class ControlNodeSelectionDialog(QDialog):
         self.prelim_final_nodes_spin.setEnabled(prelim_on)
         self.prelim_keep_spin.setEnabled(prelim_on)
         self.prelim_amp_spin.setEnabled(prelim_on)
+        self.prelim_morris_trajectories_spin.setEnabled(prelim_on)
+        self.prelim_morris_levels_spin.setEnabled(prelim_on)
 
     def _browse_cn_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2353,6 +2378,8 @@ class ControlNodeSelectionDialog(QDialog):
             "prelim_final_control_nodes": int(self.prelim_final_nodes_spin.value()),
             "prelim_keep_fraction": float(self.prelim_keep_spin.value()),
             "prelim_doe_amplitude": float(self.prelim_amp_spin.value()),
+            "prelim_morris_trajectories": int(self.prelim_morris_trajectories_spin.value()),
+            "prelim_morris_levels": int(self.prelim_morris_levels_spin.value()),
         }
 
 

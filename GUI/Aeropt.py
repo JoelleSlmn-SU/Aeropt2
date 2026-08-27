@@ -1095,6 +1095,7 @@ class MainWindow(QMainWindow):
         Returns the remote path to morph_basis.json (Unix-style).
         """
         import json, os, posixpath, tempfile
+        import numpy as np
 
         # Sanity checks
         if not hasattr(self, "mesh_viewer") or self.mesh_viewer is None:
@@ -1106,6 +1107,19 @@ class MainWindow(QMainWindow):
         if not hasattr(mv, "control_nodes") or mv.control_nodes is None:
             self.logger.log("[OPT][ERROR] Control nodes not defined; save them before running optimisation.")
             return ""
+
+        if bool(getattr(mv, "prelim_enabled", False)):
+            t_points = np.asarray(getattr(mv, "points", []), dtype=float)
+            region_ids = np.asarray(getattr(mv, "point_region_ids", []), dtype=int)
+            if t_points.ndim != 2 or t_points.shape[1:] != (3,) or len(t_points) == 0:
+                self.logger.log("[PRELIM][ERROR] Extracted T-surface points are unavailable.")
+                return ""
+            if len(region_ids) != len(t_points):
+                self.logger.log(
+                    f"[PRELIM][ERROR] Region-label/T-point mismatch: "
+                    f"{len(region_ids)} labels for {len(t_points)} points."
+                )
+                return ""
     
 
         # 1) Build local JSON from mesh viewer state
@@ -1134,6 +1148,12 @@ class MainWindow(QMainWindow):
             "prelim_final_control_nodes": int(getattr(mv, "prelim_final_control_nodes", 0) or 0),
             "prelim_keep_fraction": float(getattr(mv, "prelim_keep_fraction", 0.67) or 0.67),
             "prelim_doe_amplitude": float(getattr(mv, "prelim_doe_amplitude", 1.0) or 1.0),
+            "prelim_morris_trajectories": int(getattr(mv, "prelim_morris_trajectories", 6) or 6),
+            "prelim_morris_levels": int(getattr(mv, "prelim_morris_levels", 4) or 4),
+            "t_surface_points": (
+                np.asarray(getattr(mv, "points", []), dtype=float).reshape((-1, 3)).tolist()
+                if np.asarray(getattr(mv, "points", [])).size else None
+            ),
 
             "point_region_ids": (
                 getattr(mv, "point_region_ids", None).tolist()
@@ -1659,6 +1679,15 @@ class MainWindow(QMainWindow):
         s["morph_basis_json"] = remote_basis_path
         s["monitor_config_json"] = monitor_remote_path
         s["previous_solution"] = self.get_previous_solution_config_for_cluster()
+        # NEW: bridge the objective editor's free-text constraints
+        # ("DC60_s111 <= 0.30", one per line) straight through to
+        # BayesianOptimiser -- it accepts this raw string form directly
+        # (see optimiser.py's _parse_constraint), so no extra translation
+        # is needed here, unlike "kernel"/"acquisition_function" above which
+        # presumably get mapped from combo-box text to real class/function
+        # objects somewhere in remoteOpt.py before BayesianOptimiser(...) is
+        # constructed.
+        s["constraints"] = self.objective_config.get("constraints", [])
         
         s["base_name"] = self.base
         s["input_dir"] = posixpath.join(self.remote_output_dir, "orig")

@@ -31,6 +31,7 @@ import time
 import shutil
 import traceback
 import subprocess
+import hashlib
 import numpy as np
 
 # ----------------------------------------------------------------------
@@ -46,7 +47,10 @@ for subdir in ["", "Optimisation", "FileRW", "Remote", "MeshGeneration", "ShapeP
 
 from remoteOpt import ClusterTestManager, _build_objective_callable
 from pipeline_cluster import ClusterPipelineManager
-from ShapeParameterization.controlNodeDisp import _surface_normals, _map_normals_to_control
+try:
+    from ShapeParameterization.controlNodeDisp import _surface_normals, _map_normals_to_control
+except ImportError:
+    from ShapeParameterization.controlNodeDisp import _surface_normals, _map_normals_to_control
 from morris_design import generate_morris_trajectories, save_design
 from Optimisation.response_surface_analysis import compute_elementary_effects
 
@@ -79,6 +83,11 @@ def as_array_or_none(x, dtype=float):
         return None
     arr = np.asarray(x, dtype=dtype)
     return arr
+
+
+def canonical_sha256(data):
+    payload = json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def farthest_point_sampling_indices(points, n_select, seed=0):
@@ -361,7 +370,11 @@ def main():
 
         point_region_ids = as_array_or_none(basis.get("point_region_ids", None), int)
         if point_region_ids is None or len(point_region_ids) != len(points):
-            raise RuntimeError("point_region_ids missing or incompatible with T-surface points.")
+            raise RuntimeError(
+                f"point_region_ids missing or incompatible with T-surface points: "
+                f"labels={0 if point_region_ids is None else len(point_region_ids)}, "
+                f"points={len(points)}. Re-export morph_basis.json from the current GUI."
+            )
 
         n_regions = int(basis.get("prelim_regions", int(point_region_ids.max()) + 1) or 1)
         amplitude = float(basis.get("prelim_doe_amplitude", 1.0) or 1.0)
@@ -373,6 +386,10 @@ def main():
 
         if amplitude <= 0.0:
             raise ValueError("prelim_doe_amplitude must be positive")
+        if morris_r < 2:
+            raise ValueError("Morris screening requires at least two trajectories.")
+        if morris_p < 4 or morris_p % 2:
+            raise ValueError("prelim_morris_levels must be an even integer >= 4.")
         region_centres = np.asarray(basis.get("control_nodes", []), dtype=float)
         if region_centres.shape != (n_regions, 3):
             raise RuntimeError(
@@ -416,16 +433,32 @@ def main():
             seed=seed,
         )
         design_path = os.path.join(prelim_run, "prelim_morris_design.json")
+        run_fingerprint = canonical_sha256({
+            "points": points.tolist(),
+            "point_region_ids": point_region_ids.tolist(),
+            "region_centres": region_centres.tolist(),
+            "objective": objective,
+            "conditions": objective.get("conditions", []),
+            "amplitude": amplitude,
+            "trajectories": morris_r,
+            "levels": morris_p,
+            "seed": seed,
+        })
         if os.path.exists(design_path):
             existing = load_json(design_path)
             existing_X = np.asarray(existing.get("X", []), dtype=float)
-            if existing_X.shape != design.X.shape or not np.allclose(existing_X, design.X):
+            if (existing.get("run_fingerprint") != run_fingerprint or
+                    existing_X.shape != design.X.shape or not np.allclose(existing_X, design.X)):
                 raise RuntimeError(
-                    "The existing preliminary outputs belong to a different Morris design. "
+                    "The existing preliminary outputs belong to different geometry, settings, "
+                    "objective conditions, or Morris design. "
                     "Use a new prelim_run_dir (or archive the old preliminary run) before rerunning."
                 )
         else:
             save_design(design, design_path)
+            saved_design = load_json(design_path)
+            saved_design["run_fingerprint"] = run_fingerprint
+            write_json(design_path, saved_design)
         X = design.X
         log(f"[PRELIM] Morris CFD cases = {len(X)} (= {morris_r} * ({n_regions} + 1))", log_path)
 

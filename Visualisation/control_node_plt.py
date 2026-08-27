@@ -285,10 +285,10 @@ def plot_convergence_history(
         "best_overall_idx": best_overall_idx,
     }
 
-mcsv_file = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation\bo_data.mcsv"
-out_dir = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation\conv_plot.png"
+mcsv_file = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation_2\bo_data_2.mcsv"
+out_dir = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation_2\conv_plot.png"
 
-training_data = 3          # number of initial LHS samples
+training_data = 29          # number of initial LHS samples
 objective = "MIN"          # "max" for pressure recovery♀
 variable_name = "CD"
 

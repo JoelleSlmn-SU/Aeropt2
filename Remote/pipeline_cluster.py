@@ -89,6 +89,8 @@ class ClusterPipelineManager:
         self.splitplot_exe = config_dict.get("splitplot_exe", "/home/s.engevabj/codes/utilities/splitplot2")
         self.makeplot_exe = config_dict.get("makeplot_exe", "/home/s.engevabj/codes/utilities/makeplot2")
         
+        self.orig_dir = os.path.join(self.remote_output, "orig")
+        
         # Modules
         self.python_module = "/home/s.2268086/.conda/envs/aeropt-hpc/bin/python"
         self.intel_module = config_dict.get("intel_module", "module load compiler/intel/2020/0")

@@ -1,8 +1,56 @@
-# Paraview.py — robust x-sweep plotting: rho, Mach, eta = P0/P0_inf
+# Paraview.py — unified post-processing: x-sweep contours (rho/Mach/eta) plus
+# AIP pressure recovery, distortion and swirl, all gated by boolean toggles.
 # Run: pvpython Paraview.py
+#
+# ---------------------------------------------------------------------------
+# WHAT CHANGED vs the previous two-script version (read once, then ignore):
+#  - Everything lives in one file again; the duplicate helper functions that
+#    existed in both Paraview.py and Paraview_AIP_Distortion_Swirl.py have
+#    been merged into single canonical versions (ensure_pressure/ensure_mach/
+#    ensure_speed/ensure_total_pressure). The AIP-only "_ensure_pressure_on"
+#    /"_ensure_speed_on"/"_ensure_P0AIP_on" variants are gone.
+#  - P0_inf (freestream total pressure) is now computed AT MOST ONCE per run
+#    (previously it was computed twice: once for the eta sweep, once again
+#    for the AIP section) and only if something actually needs it
+#    (PLOT_ETA or COMPUTE_PR).
+#  - The AIP pipeline is only rebuilt from scratch (full cleanup + re-open)
+#    if the x-sweep actually ran; if you only want AIP/CSV output (e.g.
+#    batch runs from an optimisation loop with the sweep plots off), the
+#    case is opened once and reused directly.
+#  - `isolate_surface_ids` (defined but never called anywhere in the
+#    original script) has been dropped as dead code.
+#  - Distortion and swirl are new: see the toggles and the method notes
+#    below the CONFIG block.
+# ---------------------------------------------------------------------------
+# METHOD NOTES for distortion/swirl (read before trusting the numbers):
+#  - AIP axis assumed = global +X through AIP_CENTER (same convention as the
+#    x-sweep slice normal [1,0,0]). Swirl is decomposed in the local
+#    cylindrical frame (x,r,theta) about that axis, theta=atan2(z-cz,y-cy).
+#    If the duct axis isn't exactly global X at the AIP station, this is
+#    wrong and needs a rotated frame — check first if swirl looks unphysical.
+#  - COMPUTE_SWIRL and COMPUTE_PR both use the actual isolated AIP surface
+#    mesh, triangle-area-weighted (not a plain point average — a plain mean
+#    over an unstructured resampled point cloud is biased toward wherever
+#    mesh points happen to be dense).
+#  - COMPUTE_DISTORTION uses a separate synthetic ring/rake polar probe grid
+#    (N_RINGS x N_RAKES, equal-area rings) resampled straight from the 3D
+#    volume field — this is the standard SAE ARP1420-style instrumentation
+#    pattern for a circumferential distortion coefficient DC(theta), and
+#    doesn't depend on the AIP surface-isolation fallbacks succeeding.
+#    DC_WINDOW_DEG defaults to 60 deg; N_RAKES=12 makes that exact (a 2-rake
+#    window). q_bar = mean(P0-p) over valid probes (SAE/compressible
+#    convention) — set QBAR_DEFINITION="0.5rhoU2" for the incompressible one.
+#  - Swirl reported here is BULK only (area-weighted mean signed, mean |.|,
+#    RMS, max). Full SAE AIR5686 paired (co-/counter-rotating) swirl
+#    detection is NOT implemented.
+#  - Clock convention for the distortion polar plot: "looking downstream",
+#    theta=0 at 12 o'clock, clockwise by default (POLAR_CLOCKWISE) — check
+#    this matches how you report clock positions elsewhere.
+# ---------------------------------------------------------------------------
 
 from pathlib import Path
-import os, glob
+import os, glob, csv, math
+from datetime import datetime
 import numpy as np
 import vtk
 
@@ -10,12 +58,12 @@ from paraview.simple import *
 from paraview.servermanager import Fetch
 from vtk.util import numpy_support as ns
 
-# ---------- CONFIG ----------
+# ============================== CONFIG (case) ================================
 folder = [
-    "corner_optimisation"
+    "corner_optimisation_2"
 ]
 
-x_case = 13
+x_case = 15
 gen = 0
 base = Path(r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples")
 case_root = base / folder[0]
@@ -23,6 +71,7 @@ case_root = base / folder[0]
 CASE_FILE = str(case_root / "postprocessed" / f"n_{gen}" / f"{str(x_case)}" / f"ENSIGHTcorner_{str(x_case)}.case")
 OUT_DIR   = str(case_root / "postprocessed" / f"n_{gen}" / f"{str(x_case)}" / f"x_sweep_out")
 os.makedirs(OUT_DIR, exist_ok=True)
+OUT_DIR = os.path.abspath(OUT_DIR)
 
 IMAGE_SIZE = (1200, 600)
 
@@ -42,9 +91,11 @@ NAME_ENERGY = "energy"
 MACH_RANGE = (0.39, 1.30)
 ETA_RANGE  = (0.75, 1.00)
 
-# Matplotlib discrete rainbow
+# Matplotlib discrete rainbow (sweep plots)
 CMAP_NAME = "rainbow"
 N_STEPS   = 24
+# Diverging colormap (AIP swirl/distortion plots)
+CMAP_DIVERGING = "RdBu_r"
 
 WRITE_PDFS = True
 
@@ -53,14 +104,56 @@ FS_CENTER  = (-8.0, 0.0, 0.0)
 FS_LENGTHS = (0.6, 5.0, 5.0)
 FS_NPTS    = 20000
 DROP_ZEROS = True
-# ======================= END CONFIG =======================
 
-OUT_DIR = os.path.abspath(OUT_DIR)
-os.makedirs(OUT_DIR, exist_ok=True)
+# ========================= WHAT TO RUN (toggles) =============================
+PLOT_DENSITY = False
+PLOT_MACH    = False
+PLOT_ETA     = False
+
+PLOT_AIP           = True   # generate AIP contour PNGs (velocity + whichever of PR/distortion/swirl are on)
+COMPUTE_PR         = True   # area-weighted pressure recovery on the AIP -> CSV
+COMPUTE_DISTORTION = True   # SAE-style DC(theta) circumferential distortion -> CSV
+COMPUTE_SWIRL      = True   # bulk swirl angle stats on the AIP -> CSV
+# ===============================================================================
+
+# AIP definition
+AIP_CENTER = (11.3, 0.4, 0.21)
+AIP_RADIUS = 0.37
+AIP_SELECTORS = [
+    "/Root/Surfaces/Surface 111",
+    "/Root/Surface 111",
+    "/Root/Blocks/Surface 111",
+    "/Root/Block_111",
+    "/Root/111",
+]
+
+# Distortion ring/rake grid
+N_RINGS = 5
+N_RAKES = 12               # 30 deg spacing; a 2-rake window = an EXACT 60 deg DC window
+RING_SPACING = "area"      # "area" (equal-area rings, SAE-style) or "radius"
+THETA_OFFSET_DEG = 0.0
+DC_WINDOW_DEG = 60.0
+QBAR_DEFINITION = "P0-p"   # "P0-p" (SAE/compressible) or "0.5rhoU2"
+POLAR_CLOCKWISE = True
+
+# Swirl / distortion plot ranges (None = auto per-run)
+SWIRL_RANGE = (-15.0, 15.0)   # deg
+
+RUN_TAG = f"{folder[0]}/n{gen}/x{x_case}"
+
+RUN_SWEEP       = PLOT_DENSITY or PLOT_MACH or PLOT_ETA
+RUN_AIP_SURFACE = PLOT_AIP or COMPUTE_PR or COMPUTE_SWIRL   # needs the real isolated AIP surface
+RUN_AIP_PROBES  = COMPUTE_DISTORTION                         # needs the ring/rake probe grid
+RUN_AIP         = RUN_AIP_SURFACE or RUN_AIP_PROBES
+NEED_P0_INF     = PLOT_ETA or COMPUTE_PR
+
 print(f"[INFO] CASE_FILE: {CASE_FILE}")
 print(f"[INFO] OUT_DIR:   {OUT_DIR}")
+print(f"[INFO] Sweep: density={PLOT_DENSITY} mach={PLOT_MACH} eta={PLOT_ETA}  ->  run_sweep={RUN_SWEEP}")
+print(f"[INFO] AIP:   plot={PLOT_AIP} PR={COMPUTE_PR} distortion={COMPUTE_DISTORTION} swirl={COMPUTE_SWIRL}  ->  run_aip={RUN_AIP}")
 
-# --------------------- helpers ---------------------
+# ================================ helpers =====================================
+
 def open_case(path):
     src = OpenDataFile(path)
     if not src:
@@ -105,15 +198,15 @@ def ensure_pointdata(proxy, array_name):
     Show(c2p); Hide(proxy)
     return c2p, array_name
 
-COLORMAP_NAME     = "Rainbow Uniform"     # or "Rainbow", "Rainbow Uniform", etc.
+COLORMAP_NAME     = "Rainbow Uniform"
 SHOW_COLORBAR     = True
 
 def render_colorfield(view, src_proxy, array_name, title, fixed_range=None):
     px, arr = ensure_pointdata(src_proxy, array_name)
     SetActiveSource(px)
-    rep = Show(px); rep.Representation = "Surface"
+    rep = Show(px, view)
+    rep.Representation = "Surface"
     ColorBy(rep, ("POINTS", arr))
-    # Apply rainbow colormap and (optional) fixed/global range
     lut = GetColorTransferFunction(arr)
     try:
         lut.ApplyPreset(COLORMAP_NAME, True)
@@ -187,17 +280,15 @@ def pngs_to_pdf(pattern, out_pdf):
     imgs[0].save(out_path, save_all=True, append_images=imgs[1:])
     print(f"[OK] PDF written: {out_path} ({len(imgs)} pages)")
 
-def apply_matplotlib_discrete_rainbow(array_name, cmap_name, n_steps, vmin, vmax, view, rep, title):
-    import numpy as _np
+def apply_matplotlib_discrete_cmap(array_name, cmap_name, n_steps, vmin, vmax, view, rep, title):
     from matplotlib import cm
-
     lut = GetColorTransferFunction(array_name)
     lut.Discretize = 1
     lut.NumberOfTableValues = int(n_steps)
     lut.RescaleTransferFunction(float(vmin), float(vmax))
 
     cmap = cm.get_cmap(cmap_name, int(n_steps))
-    vals = _np.linspace(float(vmin), float(vmax), int(n_steps))
+    vals = np.linspace(float(vmin), float(vmax), int(n_steps))
     RGBPoints = []
     for k, val in enumerate(vals):
         r, g, b, _ = cmap(k)
@@ -215,10 +306,10 @@ def apply_matplotlib_discrete_rainbow(array_name, cmap_name, n_steps, vmin, vmax
     sb.ScalarBarLength = 0.35
     sb.WindowLocation = "Upper Right Corner"
 
-def render_field(view, proxy, array_name, title, vmin=None, vmax=None, use_matplotlib=False):
+def render_field(view, proxy, array_name, title, vmin=None, vmax=None, use_matplotlib=False, cmap_name=None):
     px, arr = ensure_pointdata(proxy, array_name)
     SetActiveSource(px)
-    rep = Show(px)
+    rep = Show(px, view)
     rep.Representation = "Surface"
     ColorBy(rep, ("POINTS", arr))
 
@@ -229,7 +320,7 @@ def render_field(view, proxy, array_name, title, vmin=None, vmax=None, use_matpl
         pwf.RescaleTransferFunction(float(vmin), float(vmax))
 
     if use_matplotlib and (vmin is not None and vmax is not None):
-        apply_matplotlib_discrete_rainbow(arr, CMAP_NAME, N_STEPS, vmin, vmax, view, rep, title)
+        apply_matplotlib_discrete_cmap(arr, cmap_name or CMAP_NAME, N_STEPS, vmin, vmax, view, rep, title)
     else:
         rep.SetScalarBarVisibility(view, True)
         sb = GetScalarBar(GetColorTransferFunction(arr), view)
@@ -240,7 +331,7 @@ def render_field(view, proxy, array_name, title, vmin=None, vmax=None, use_matpl
 
     return px, rep
 
-# ---------------- physics helpers ----------------
+# ---------------- physics helpers (canonical, shared by sweep + AIP) ----------------
 def ensure_pressure(proxy):
     px_rho, rho = ensure_pointdata(proxy, NAME_RHO)
     px_e,   e   = ensure_pointdata(px_rho, NAME_ENERGY)
@@ -263,26 +354,26 @@ def ensure_mach(proxy):
     UpdatePipeline(proxy=calc)
     return calc, "Mach"
 
+def ensure_total_pressure(proxy, result_name="P0"):
+    """P0 = p*(1+0.5*(gamma-1)*M^2)^(gamma/(gamma-1)). Shared by ensure_eta
+    (freestream/local eta) and the AIP pressure-recovery contour."""
+    m_px, m = ensure_mach(proxy)
+    p_px, p = ensure_pointdata(m_px, "p_calc")   # p_calc already computed inside ensure_mach->ensure_pressure
+    calc = Calculator(Input=p_px)
+    calc.ResultArrayName = result_name
+    calc.Function = f"{p} * pow(1 + 0.5*({GAMMA}-1)*{m}*{m}, {GAMMA}/({GAMMA}-1))"
+    UpdatePipeline(proxy=calc)
+    return calc, result_name
+
 def ensure_eta(proxy, P0_inf):
-    p_px, p = ensure_pressure(proxy)
-    m_px, m = ensure_mach(p_px)
-
-    calc_P0 = Calculator(Input=m_px)
-    calc_P0.ResultArrayName = "P0_local"
-    calc_P0.Function = f"{p} * pow(1 + 0.5*({GAMMA}-1)*{m}*{m}, {GAMMA}/({GAMMA}-1))"
-    UpdatePipeline(proxy=calc_P0)
-
-    calc_eta = Calculator(Input=calc_P0)
+    p0_px, p0 = ensure_total_pressure(proxy, "P0_local")
+    calc_eta = Calculator(Input=p0_px)
     calc_eta.ResultArrayName = "eta"
-    calc_eta.Function = f"P0_local/{float(P0_inf)}"
+    calc_eta.Function = f"{p0}/{float(P0_inf)}"
     UpdatePipeline(proxy=calc_eta)
     return calc_eta, "eta"
 
-import numpy as np
-import math
-
 def ensure_speed(proxy):
-    """Return (proxy_with_speed, speed_array_name)."""
     px_u, u_nm = ensure_pointdata(proxy, NAME_U)
     calc = Calculator(Input=px_u)
     calc.ResultArrayName = "U_mag"
@@ -352,7 +443,7 @@ def compute_P0_inf(root3d):
 
     return P0_inf
 
-# ----------------- slice setup (ORIGINAL logic) -----------------
+# ----------------- slice setup (sweep) -----------------
 def build_slice(src):
     sl = Slice(registrationName="Slice", Input=src)
     sl.SliceType = "Plane"
@@ -362,182 +453,8 @@ def build_slice(src):
     UpdatePipeline(proxy=merged)
     return sl, merged
 
-# ========================= SWEEP MAIN =========================
-src = open_case(CASE_FILE)
-src = normalize_to_single_dataset(src)
-
-rv = GetActiveViewOrCreate("RenderView")
-rv.ViewSize = IMAGE_SIZE
-rv.Background = [1, 1, 1]
-rv.InteractionMode = "2D"
-Show(src)
-ResetCamera()
-
-# ORIGINAL camera
-rv.CameraParallelProjection = 1
-rv.CameraPosition = [-3, 0, 0]
-rv.CameraFocalPoint = [0, 0.5, 0]
-rv.CameraViewUp = [0, 0, 1]
-rv.CameraParallelScale = 1.8
-rv.StillRender()
-
-slice_obj, slice_merged = build_slice(src)
-Hide(src)
-
-# ✅ FIX: compute P0_inf from full 3D dataset, not the slice
-P0_inf = compute_P0_inf(src)
-
-# Prepare plotting proxies on the slice
-rho_proxy, _ = ensure_pointdata(slice_merged, NAME_RHO)
-mach_proxy, _ = ensure_mach(slice_merged)
-eta_proxy, _  = ensure_eta(slice_merged, P0_inf)
-
-x_vals = np.linspace(float(X_START), float(X_END), int(N_SLICES))
-
-print("\n[INFO] Starting sweep...")
-for i, xv in enumerate(x_vals):
-    slice_obj.SliceType.Origin = [float(xv), 0.0, 0.0]
-    UpdatePipeline(proxy=slice_merged)
-
-    if i % 10 == 0:
-        print(f"[INFO] Slice {i+1}/{N_SLICES} at x={xv:.3f}")
-
-    # Density
-    t = Text(); t.Text = f"Mach 1.3, AoA 3.0, AoS 0.0, WAT 6.0, x = {xv:.3f}"
-    trep = Show(t); trep.WindowLocation="Upper Left Corner"; trep.FontSize=14; trep.Color=[0,0,0]
-    px, rep = render_field(rv, rho_proxy, NAME_RHO, "Density")
-    rv.StillRender(); save_png(rv, f"x_{i:03d}_rho")
-    Hide(px); Hide(t); Delete(t)
-
-    # Mach (matplotlib rainbow)
-    t = Text(); t.Text = f"Mach 1.3, AoA 3.0, AoS 0.0, WAT 6.0, x = {xv:.3f}"
-    trep = Show(t); trep.WindowLocation="Upper Left Corner"; trep.FontSize=14; trep.Color=[0,0,0]
-    px, rep = render_field(rv, mach_proxy, "Mach", "Mach", vmin=MACH_RANGE[0], vmax=MACH_RANGE[1], use_matplotlib=True)
-    rv.StillRender(); save_png(rv, f"x_{i:03d}_mach")
-    Hide(px); Hide(t); Delete(t)
-
-    # eta (matplotlib rainbow)
-    t = Text(); t.Text = f"Mach 1.3, AoA 3.0, AoS 0.0, WAT 6.0, x = {xv:.3f}"
-    trep = Show(t); trep.WindowLocation="Upper Left Corner"; trep.FontSize=14; trep.Color=[0,0,0]
-    px, rep = render_field(rv, eta_proxy, "eta", "η [-]", vmin=ETA_RANGE[0], vmax=ETA_RANGE[1], use_matplotlib=True)
-    rv.StillRender(); save_png(rv, f"x_{i:03d}_eta")
-    Hide(px); Hide(t); Delete(t)
-
-print("[OK] Sweep complete.")
-
-if WRITE_PDFS:
-    pngs_to_pdf("x_*_rho.png",  "rho_sweep.pdf")
-    pngs_to_pdf("x_*_mach.png", "mach_sweep.pdf")
-    pngs_to_pdf("x_*_eta.png",  "eta_sweep.pdf")
-
-print(f"[OK] Sweep outputs in: {OUT_DIR}")
-
-# ========================= AIP: pressure recovery =========================
-# This section keeps your AIP logic conceptually, but fixes P0_inf and recovery calculation.
-
-
-print("\n" + "="*60)
-print("Starting AIP extraction and plotting")
-print("="*60)
-
-# ---- COMPLETE PIPELINE CLEANUP ----
-print("[INFO] Cleaning up sweep pipeline...")
-try:
-    # Delete all sweep-related filters
-    for obj in GetSources().values():
-        try:
-            Delete(obj)
-        except:
-            pass
-except Exception as e:
-    print(f"[WARN] Cleanup: {e}")
-
-# ---- FRESH START: Re-open the data file ----
-print(f"[INFO] Re-opening case file: {CASE_FILE}")
-# Keep the raw multiblock reader for AIP extraction.
-# Direct surface extraction needs the original block tree; do NOT MergeBlocks here.
-src_aip = open_case(CASE_FILE)
-UpdatePipeline(proxy=src_aip)
-Show(src_aip)
-
-# ---- Setup fresh render view ----
-rv = GetActiveViewOrCreate("RenderView")
-rv.ViewSize = IMAGE_SIZE
-rv.Background = [1, 1, 1]
-rv.InteractionMode = "3D"
-ResetCamera()
-
-P0_inf = compute_P0_inf(src_aip)
-
-# ---- AIP CONFIG ----
-AIP_CENTER = (11.3, 0.4, 0.21)
-AIP_RADIUS = 0.37
-AIP_SELECTORS = [
-    "/Root/Surfaces/Surface 111",
-    "/Root/Surface 111",
-    "/Root/Blocks/Surface 111",
-    "/Root/Block_111",
-    "/Root/111",
-]
-cx, cy, cz = AIP_CENTER
-
-print(f"[INFO] AIP center: ({cx}, {cy}, {cz}), radius: {AIP_RADIUS}")
-
-# ========== HELPER FUNCTIONS (inlined) ==========
-
-def _ensure_pressure_on(proxy):
-    # p = (energy - 0.5*rho*|U|^2)*(gamma-1)  [energy per unit volume]
-    px_rho, rho_nm = ensure_pointdata(proxy, NAME_RHO)
-    px_e,   e_nm   = ensure_pointdata(px_rho, NAME_ENERGY)
-    px_u,   u_nm   = ensure_pointdata(px_e,   NAME_U)
-    calc = Calculator(Input=px_u)
-    calc.ResultArrayName = "p_calc"
-    calc.Function = f"({e_nm} - 0.5*{rho_nm}*mag({u_nm})^2) * ({GAMMA}-1)"
-    Show(calc); Hide(px_u)
-    UpdatePipeline(proxy=calc)
-    return calc, "p_calc"
-
-def _ensure_speed_on(proxy):
-    px_u, u_nm = ensure_pointdata(proxy, NAME_U)
-    calc = Calculator(Input=px_u)
-    calc.ResultArrayName = "U_mag"
-    calc.Function = f"mag({u_nm})"
-    Show(calc); Hide(px_u)
-    UpdatePipeline(proxy=calc)
-    return calc, "U_mag"
-
-def _ensure_P0AIP_on(proxy):
-    """
-    Ensures a point-data array 'P0_AIP' exists on the given proxy.
-    Uses isentropic relation based on local Mach:
-      M = |U| / sqrt(gamma * p / rho)
-      P0 = p * (1 + 0.5*(gamma-1)*M^2)^(gamma/(gamma-1))
-    Returns: (proxy_with_P0, "P0_AIP")
-    """
-    # Ensure p, rho, U are available on the proxy
-    p_src, p_arr   = _ensure_pressure_on(proxy)          # yields Calc with p_arr
-    rho_src, rho   = ensure_pointdata(p_src, NAME_RHO)
-    u_src,   u     = ensure_pointdata(rho_src, NAME_U)
-
-    # Local Mach number
-    calc_M = Calculator(Input=u_src)
-    calc_M.ResultArrayName = "M_local"
-    calc_M.Function = f"mag({u})/sqrt({GAMMA}*{p_arr}/{rho})"
-    UpdatePipeline(proxy=calc_M)
-
-    # Total pressure on AIP
-    calc_P0 = Calculator(Input=calc_M)
-    calc_P0.ResultArrayName = "P0_AIP"
-    calc_P0.Function = (
-        f"{p_arr} * pow(1 + 0.5*({GAMMA}-1)*M_local*M_local, {GAMMA}/({GAMMA}-1))"
-    )
-    UpdatePipeline(proxy=calc_P0)
-
-    return calc_P0, "P0_AIP"
-
-
+# ---- AIP isolation chain ----
 def _vtk_polydata_to_proxy(polydata, name="IsolatedSurface"):
-    """Wrap a client-side vtkPolyData as a ParaView proxy."""
     if polydata is None or polydata.GetNumberOfPoints() == 0:
         return None
     prod = TrivialProducer(registrationName=name)
@@ -547,12 +464,9 @@ def _vtk_polydata_to_proxy(polydata, name="IsolatedSurface"):
 
 def _direct_extract_surface_blocks_local(root, target_sids):
     """
-    Direct multiblock extraction copied from the working remote monitor logic.
-
     In the EnSight multiblock tree, `Surface N` corresponds to block index N,
-    so this avoids fragile selector strings and avoids thresholding on arrays that
-    may not exist locally. Returns a ParaView proxy containing triangulated,
-    cleaned surface polydata.
+    so this avoids fragile selector strings. Returns a ParaView proxy
+    containing triangulated, cleaned surface polydata.
     """
     ds = Fetch(root)
     if ds is None or not hasattr(ds, "GetNumberOfBlocks"):
@@ -568,12 +482,10 @@ def _direct_extract_surface_blocks_local(root, target_sids):
         if sid < 0 or sid >= nblocks:
             print(f"[WARN] Surface {sid} is outside multiblock range 0..{nblocks-1}")
             continue
-
         block = ds.GetBlock(sid)
         if block is None:
             print(f"[WARN] Surface/block {sid} is None")
             continue
-
         pieces.append(block)
         try:
             npts = block.GetNumberOfPoints()
@@ -610,7 +522,6 @@ def _direct_extract_surface_blocks_local(root, target_sids):
     return _vtk_polydata_to_proxy(out, name="DirectSurfaceBlockExtract")
 
 def _threshold_set_local(thr, loc, arr_name, lo, hi):
-    """Configure Threshold filter across ParaView versions."""
     try:
         thr.SelectInputScalars = [loc, arr_name]
     except:
@@ -626,7 +537,6 @@ def _threshold_set_local(thr, loc, arr_name, lo, hi):
         thr.ThresholdRange = (float(lo), float(hi))
 
 def _threshold_surface_id_local(root, target_sid=111):
-    """Pick surface by surface_id array if present."""
     arrs = list_arrays(root)
     for nm in ("surface_id", "SurfaceId", "SURFACE_ID", "SurfaceID", "ElementBlockIds"):
         if nm in arrs:
@@ -635,8 +545,6 @@ def _threshold_surface_id_local(root, target_sid=111):
             thr = Threshold(Input=root)
             _threshold_set_local(thr, loc, nm, target_sid - 0.5, target_sid + 0.5)
             UpdatePipeline(proxy=thr)
-            
-            # Check if we got data
             ds = Fetch(thr)
             if ds and ds.GetNumberOfPoints() > 0:
                 print(f"[OK] Surface {target_sid} isolated via {nm}: {ds.GetNumberOfPoints()} points")
@@ -648,7 +556,6 @@ def _threshold_surface_id_local(root, target_sid=111):
     return None
 
 def _extract_block_local(root, selectors):
-    """Try ExtractBlock with various selectors."""
     for sel in selectors:
         try:
             print(f"[INFO] Trying ExtractBlock selector: {sel}")
@@ -671,17 +578,9 @@ def _extract_block_local(root, selectors):
     return None
 
 def _pick_aip_geometric_local(root, cx, cy, cz, r, dx=0.02, cos_tol=0.90):
-    """
-    Geometric picking: isolate disc at x≈cx, radius r in YZ plane.
-    More tolerant settings for robustness.
-    """
     print(f"[INFO] Geometric picking: dx={dx}, r={r}, cos_tol={cos_tol}")
-    
-    # 0) Extract surface
     surf = ExtractSurface(Input=root)
     UpdatePipeline(proxy=surf)
-    
-    # 1) Compute normals
     try:
         norms = SurfaceNormals(Input=surf)
     except:
@@ -689,41 +588,37 @@ def _pick_aip_geometric_local(root, cx, cy, cz, r, dx=0.02, cos_tol=0.90):
     norms.FeatureAngle = 180.0
     norms.ComputeCellNormals = 1
     UpdatePipeline(proxy=norms)
-    
-    # 2) X slab: |x - cx| <= dx
+
     c_absx = Calculator(Input=norms)
     c_absx.ResultArrayName = "abs_x_dist"
     c_absx.Function = f"abs(coordsX - {cx})"
     UpdatePipeline(proxy=c_absx)
-    
+
     t_x = Threshold(Input=c_absx)
     _threshold_set_local(t_x, "POINTS", "abs_x_dist", 0.0, float(dx))
     UpdatePipeline(proxy=t_x)
-    
+
     ds_x = Fetch(t_x)
     if not ds_x or ds_x.GetNumberOfPoints() == 0:
         print(f"[WARN] X-slab threshold returned no points")
         return None
     print(f"[INFO] After X-slab: {ds_x.GetNumberOfPoints()} points")
-    
-    # 3) Radial disc in YZ
+
     c_rad = Calculator(Input=t_x)
     c_rad.ResultArrayName = "r_from_center"
     c_rad.Function = f"sqrt((coordsY-{cy})^2 + (coordsZ-{cz})^2)"
     UpdatePipeline(proxy=c_rad)
-    
+
     t_r = Threshold(Input=c_rad)
     _threshold_set_local(t_r, "POINTS", "r_from_center", 0.0, float(r))
     UpdatePipeline(proxy=t_r)
-    
+
     ds_r = Fetch(t_r)
     if not ds_r or ds_r.GetNumberOfPoints() == 0:
         print(f"[WARN] Radial threshold returned no points")
         return None
     print(f"[INFO] After radial cut: {ds_r.GetNumberOfPoints()} points")
-    
-    # 4) Normal alignment: |n_x| >= cos_tol
-    # First ensure Normals is on POINTS
+
     arrs = list_arrays(t_r)
     if "Normals" in arrs and arrs["Normals"][1] == "CELLS":
         try:
@@ -735,62 +630,32 @@ def _pick_aip_geometric_local(root, cx, cy, cz, r, dx=0.02, cos_tol=0.90):
         base_for_norm = n2p
     else:
         base_for_norm = t_r
-    
+
     c_ax = Calculator(Input=base_for_norm)
     c_ax.ResultArrayName = "ax_align"
     c_ax.Function = "abs(Normals_X)"
     UpdatePipeline(proxy=c_ax)
-    
+
     t_ax = Threshold(Input=c_ax)
     _threshold_set_local(t_ax, "POINTS", "ax_align", float(cos_tol), 1.0)
     UpdatePipeline(proxy=t_ax)
-    
+
     ds_ax = Fetch(t_ax)
     if not ds_ax or ds_ax.GetNumberOfPoints() == 0:
         print(f"[WARN] Normal alignment threshold returned no points")
-        # Try without normal filtering
         print(f"[INFO] Skipping normal filter, using radial disc only")
         out = ExtractSurface(Input=t_r)
     else:
         print(f"[INFO] After normal filter: {ds_ax.GetNumberOfPoints()} points")
         out = ExtractSurface(Input=t_ax)
-    
+
     UpdatePipeline(proxy=out)
     cln = Clean(Input=out)
     UpdatePipeline(proxy=cln)
-    
     ds_final = Fetch(cln)
     if ds_final:
         print(f"[OK] Geometric picking complete: {ds_final.GetNumberOfPoints()} points")
     return cln
-
-def isolate_surface_ids(root, target_sids):
-    """Public helper: isolate one or more surface IDs as a ParaView proxy."""
-    surf = _direct_extract_surface_blocks_local(root, target_sids)
-    if surf:
-        return surf
-
-    # Fallback for datasets where the surface id is stored as an array instead
-    # of being represented by multiblock indices.
-    pieces = []
-    for sid in target_sids:
-        piece = _threshold_surface_id_local(root, target_sid=int(sid))
-        if piece:
-            pieces.append(piece)
-
-    if len(pieces) == 1:
-        return pieces[0]
-    if len(pieces) > 1:
-        try:
-            app = AppendDatasets(Input=pieces)
-            UpdatePipeline(proxy=app)
-            surf_out = ExtractSurface(Input=app)
-            UpdatePipeline(proxy=surf_out)
-            return surf_out
-        except Exception as e:
-            print(f"[WARN] Could not append thresholded surfaces: {e}")
-
-    raise RuntimeError(f"Could not isolate requested surfaces: {target_sids}")
 
 def isolate_aip_surface(root, cx, cy, cz, r):
     """Try the proven direct block extraction first, then robust fallbacks."""
@@ -798,356 +663,613 @@ def isolate_aip_surface(root, cx, cy, cz, r):
     surf = _direct_extract_surface_blocks_local(root, [111])
     if surf:
         return surf
-
     print("[INFO] Method 2: Attempting ExtractBlock selectors...")
     surf = _extract_block_local(root, AIP_SELECTORS)
     if surf:
         return surf
-
     print("[INFO] Method 3: Attempting surface_id threshold...")
     surf = _threshold_surface_id_local(root, target_sid=111)
     if surf:
         return surf
-
     print("[INFO] Method 4: Attempting geometric picking...")
     surf = _pick_aip_geometric_local(root, cx, cy, cz, r, dx=0.01, cos_tol=0.90)
     if surf:
         return surf
-
     raise RuntimeError("All AIP isolation methods failed!")
 
-# ========== FREESTREAM TOTAL PRESSURE ==========
+# -------------------- distortion / swirl helpers --------------------
 
-def compute_freestream_total_pressure(root, sample_region="far_upstream"):
-    """
-    Compute freestream total pressure P0_inf.
-    Strategy: Sample far upstream where flow is uniform.
-    
-    P0 = p * (1 + (gamma-1)/2 * M^2)^(gamma/(gamma-1))
-    or equivalently: P0 = p + 0.5*rho*U^2  (simplified for low Mach)
-    
-    For supersonic: use isentropic relation.
-    """
-    print("\n[INFO] Computing freestream total pressure...")
-    
-    # Sample a box far upstream (adjust coordinates for your domain)
-    # For your domain: x around 7.3 (upstream of geometry), full Y/Z span
-    box = Box(registrationName="FreeStreamBox")
-    box.XLength = 0.5  # thin slice
-    box.YLength = 5.0  # capture full span
-    box.ZLength = 5.0
-    box.Center = [-8.0, 0.0, 0.0]  # well upstream of X_START=7.3
-    UpdatePipeline(proxy=box)
-    
-    # Resample volume data onto this box
-    sampled = ResampleWithDataset(
-        SourceDataArrays=root,
-        DestinationMesh=box
-    )
-    UpdatePipeline(proxy=sampled)
-    
-    # Get pressure, density, velocity
-    p_src, p = _ensure_pressure_on(sampled)
-    rho_src, rho = ensure_pointdata(p_src, NAME_RHO)
-    u_src, u = ensure_pointdata(rho_src, NAME_U)
+def fetch_point_arrays(proxy, names, need_points=False):
+    ds = Fetch(proxy)
+    if ds is None:
+        raise RuntimeError("Fetch returned None dataset.")
+    pd = ds.GetPointData()
+    out = {}
+    for nm in names:
+        arr = pd.GetArray(nm) if pd else None
+        out[nm] = ns.vtk_to_numpy(arr) if arr is not None else None
+    if need_points:
+        pts = ds.GetPoints()
+        out["_points"] = ns.vtk_to_numpy(pts.GetData()) if pts is not None else None
+    return ds, out
 
-    # --- Compute local Mach number ---
-    calc_M = Calculator(Input=u_src)
-    calc_M.ResultArrayName = "M_inf"
-    calc_M.Function = f"mag({u})/sqrt({GAMMA}*{p}/{rho})"
-    UpdatePipeline(proxy=calc_M)
+def compute_physics(rho, u, p):
+    """Elementwise (M, P0, valid_mask) from rho[N], u[N,3], p[N]."""
+    rho = np.asarray(rho, dtype=float)
+    p = np.asarray(p, dtype=float)
+    u = np.asarray(u, dtype=float)
+    speed = np.linalg.norm(u, axis=1)
+    valid = np.isfinite(rho) & np.isfinite(p) & (rho > 0) & (p > 0)
+    M = np.full_like(p, np.nan)
+    P0 = np.full_like(p, np.nan)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        M[valid] = speed[valid] / np.sqrt(GAMMA * p[valid] / rho[valid])
+        P0[valid] = p[valid] * np.power(1.0 + 0.5 * (GAMMA - 1.0) * M[valid] ** 2, GAMMA / (GAMMA - 1.0))
+    return M, P0, valid
 
-    # --- Compute total (stagnation) pressure field ---
-    calc_P0 = Calculator(Input=calc_M)
-    calc_P0.ResultArrayName = "P0_total"
-    calc_P0.Function = f"{p} * pow(1 + 0.5*({GAMMA}-1)*M_inf*M_inf, {GAMMA}/({GAMMA}-1))"
-    UpdatePipeline(proxy=calc_P0)
+def cylindrical_decompose(u, theta):
+    """theta: local angle (rad) about +X axis, theta=atan2(z-cz, y-cy)."""
+    Ux, Uy, Uz = u[:, 0], u[:, 1], u[:, 2]
+    ct, st = np.cos(theta), np.sin(theta)
+    Ur = Uy * ct + Uz * st
+    Ut = -Uy * st + Uz * ct
+    swirl_deg = np.degrees(np.arctan2(Ut, Ux))
+    return Ux, Ur, Ut, swirl_deg
 
-    # --- Fetch data to NumPy for statistics ---
-    from paraview.servermanager import Fetch
-    from vtk.util import numpy_support as ns
-    vtk_data = Fetch(calc_P0)
-    arr = vtk_data.GetPointData().GetArray("P0_total")
-    p0_np = ns.vtk_to_numpy(arr)
-
-    # --- Use median/mean/std of that array ---
-    P0_inf  = float(np.median(p0_np))
-    P0_mean = float(np.mean(p0_np))
-    P0_std  = float(np.std(p0_np))
-
-    print(f"[OK] Freestream total pressure (median): {P0_inf:.2f} Pa")
-    print(f"     Mean: {P0_mean:.2f} Pa, Std: {P0_std:.2f} Pa")
-    print(f"     Sampled {p0_np.size} points")
-
-    # --- Cleanup proxies ---
-    Delete(calc_P0)
-    Delete(calc_M)
-    Delete(sampled)
-    Delete(box)
-    
-    return P0_inf
-
-# ========== PRESSURE RECOVERY COMPUTATION ==========
-
-def compute_pressure_recovery(aip_proxy, P0_inf, out_dir):
-    """
-    Compute (1) area-weighted mean P0 at AIP and (2) mass-flow-weighted mean P0,
-    then write both recoveries to CSV using the given freestream total pressure P0_inf.
-    """
-    from paraview.servermanager import Fetch
-    from vtk.util import numpy_support as ns
-
-    def _fetch_scalar(obj, name):
-        """Return first value of array 'name' from RowData, FieldData, or PointData, if present."""
-        data = Fetch(obj)
-        # Try RowData (vtkTable)
-        if hasattr(data, "GetRowData"):
-            arr = data.GetRowData().GetArray(name)
-            if arr:
-                return float(ns.vtk_to_numpy(arr)[0])
-        # Try FieldData (vtkDataSet)
-        if hasattr(data, "GetFieldData"):
-            arr = data.GetFieldData().GetArray(name)
-            if arr:
-                vals = ns.vtk_to_numpy(arr)
-                return float(vals[0]) if vals.size else float("nan")
-        # Fallback: PointData mean (shouldn't be needed for IntegrateVariables, but safe)
-        if hasattr(data, "GetPointData"):
-            arr = data.GetPointData().GetArray(name)
-            if arr:
-                vals = ns.vtk_to_numpy(arr)
-                return float(np.mean(vals)) if vals.size else float("nan")
+def circular_mean_deg(angles_deg):
+    a = np.radians(angles_deg[np.isfinite(angles_deg)])
+    if a.size == 0:
         return float("nan")
+    v = np.mean(np.exp(1j * a))
+    return float(np.degrees(np.angle(v)))
 
-    # --- Ensure p, rho, U on AIP ---
-    p_src, p_arr   = _ensure_pressure_on(aip_proxy)          # yields Calc with p_arr
-    rho_src, rho   = ensure_pointdata(p_src, NAME_RHO)
-    u_src,   u     = ensure_pointdata(rho_src, NAME_U)
+def triangle_areas_and_centroid_values(ds, point_values):
+    """Area-weighted mean of per-point scalar fields over a triangulated
+    surface `ds`. point_values: dict name -> np.ndarray[N] aligned with ds
+    points. Returns (means dict, total_area, triangulated_dataset)."""
+    tri = vtk.vtkTriangleFilter()
+    tri.SetInputData(ds)
+    tri.Update()
+    tds = tri.GetOutput()
 
-    # --- Total pressure on AIP (isentropic from local M) ---
-    calc_M = Calculator(Input=u_src)
-    calc_M.ResultArrayName = "M_local"
-    calc_M.Function = f"mag({u})/sqrt({GAMMA}*{p_arr}/{rho})"
-    UpdatePipeline(proxy=calc_M)
+    pts = ns.vtk_to_numpy(tds.GetPoints().GetData())
+    ncells = tds.GetNumberOfCells()
+    areas = np.zeros(ncells)
+    cell_vals = {k: np.zeros(ncells) for k in point_values}
 
-    calc_P0 = Calculator(Input=calc_M)
-    calc_P0.ResultArrayName = "P0_AIP"
-    calc_P0.Function = (
-        f"{p_arr} * pow(1 + 0.5*({GAMMA}-1)*M_local*M_local, {GAMMA}/({GAMMA}-1))"
-    )
-    UpdatePipeline(proxy=calc_P0)
+    same_topology = (tds.GetNumberOfPoints() == ds.GetNumberOfPoints())
+    if same_topology:
+        remapped = point_values
+    else:
+        loc = vtk.vtkPointLocator()
+        loc.SetDataSet(ds)
+        loc.BuildLocator()
+        idx = np.array([loc.FindClosestPoint(pts[i]) for i in range(pts.shape[0])])
+        remapped = {k: v[idx] for k, v in point_values.items()}
 
-    from paraview.servermanager import Fetch
-    from vtk.util import numpy_support as ns
-    import numpy as np
+    all_nan_counts = {k: 0 for k in point_values}
+    id_list = vtk.vtkIdList()
+    for c in range(ncells):
+        tds.GetCellPoints(c, id_list)
+        if id_list.GetNumberOfIds() != 3:
+            continue
+        i0, i1, i2 = id_list.GetId(0), id_list.GetId(1), id_list.GetId(2)
+        p0, p1, p2 = pts[i0], pts[i1], pts[i2]
+        area = 0.5 * np.linalg.norm(np.cross(p1 - p0, p2 - p0))
+        areas[c] = area
+        for k, v in remapped.items():
+            triplet = (v[i0], v[i1], v[i2])
+            # A triangle whose 3 vertices are ALL NaN (e.g. all 3 landed on
+            # resample points that failed compute_physics()'s validity mask)
+            # would make np.nanmean emit a noisy "Mean of empty slice"
+            # RuntimeWarning and return NaN anyway -- skip straight to NaN
+            # instead, and count it so a large fraction is visible rather
+            # than silently swallowed.
+            if not np.any(np.isfinite(triplet)):
+                cell_vals[k][c] = np.nan
+                all_nan_counts[k] += 1
+            else:
+                cell_vals[k][c] = np.nanmean(triplet)
 
-    # Fetch the AIP total pressure field to NumPy
-    vtk_data = Fetch(calc_P0)
-    p0_arr = vtk_data.GetPointData().GetArray("P0_AIP")
-    if p0_arr is None:
-        raise RuntimeError("P0_AIP array not found on AIP surface!")
+    for k, n_bad in all_nan_counts.items():
+        if n_bad > 0:
+            frac = n_bad / ncells
+            level = "WARN" if frac > 0.02 else "INFO"
+            print(f"[{level}] triangle_areas_and_centroid_values: {n_bad}/{ncells} "
+                  f"({frac*100:.1f}%) cells had all-NaN '{k}' vertices (excluded from "
+                  f"the area-weighted mean). A handful near the disc rim is expected "
+                  f"resampling edge-effect; >2% may mean part of the AIP surface is "
+                  f"landing outside the flow domain -- check AIP_CENTER/AIP_RADIUS.")
 
-    p0_vals = ns.vtk_to_numpy(p0_arr)
+    total_area = float(np.sum(areas))
+    means = {}
+    for k, v in cell_vals.items():
+        good = np.isfinite(v)
+        w = np.where(good, areas, 0.0)
+        denom = np.sum(w)
+        means[k] = float(np.sum(w * np.where(good, v, 0.0)) / denom) if denom > 0 else float("nan")
+    return means, total_area, tds
 
-    # Mean, median, standard deviation of P0 at AIP
-    P0_mean  = float(np.mean(p0_vals))
-    P0_median = float(np.median(p0_vals))
-    P0_std   = float(np.std(p0_vals))
+def build_polar_probe_cloud(cx, cy, cz, R, n_rings, n_rakes, ring_spacing="area", theta_offset_deg=0.0):
+    """Structured ring/rake point cloud in the plane x=cx, centred at (cy,cz)."""
+    if ring_spacing == "area":
+        r_edges = R * np.sqrt(np.arange(n_rings + 1) / float(n_rings))
+    elif ring_spacing == "radius":
+        r_edges = R * (np.arange(n_rings + 1) / float(n_rings))
+    else:
+        raise ValueError("RING_SPACING must be 'area' or 'radius'")
+    r_bar = np.sqrt(0.5 * (r_edges[:-1] ** 2 + r_edges[1:] ** 2))
 
-    # Compute pressure recovery (based on mean)
-    recovery = P0_mean / P0_inf
+    dtheta = 2.0 * np.pi / n_rakes
+    theta0 = np.radians(theta_offset_deg)
+    theta_centers = theta0 + dtheta * np.arange(n_rakes)
 
-    print(f"[INFO] AIP total pressure (mean): {P0_mean:.3f} Pa")
-    print(f"[INFO] AIP total pressure (median): {P0_median:.3f} Pa  |  Std: {P0_std:.3f}")
-    print(f"[RESULT] Pressure recovery (mean P0_AIP / P0_inf): {recovery:.5f}")
+    ring_idx = np.repeat(np.arange(n_rings), n_rakes)
+    rake_idx = np.tile(np.arange(n_rakes), n_rings)
+    r = r_bar[ring_idx]
+    theta = theta_centers[rake_idx]
 
-    # Optionally, save to CSV
-    csv_path = os.path.join(out_dir, "AIP_recovery.csv")
-    write_header = not os.path.exists(csv_path)
-    import csv
-    with open(csv_path, "a", newline="") as f:
-        w = csv.writer(f)
-        if write_header:
-            w.writerow(["P0_inf[Pa]", "P0_mean_AIP[Pa]", "P0_median_AIP[Pa]",
-                        "P0_std_AIP[Pa]", "PressureRecovery"])
-        w.writerow([P0_inf, P0_mean, P0_median, P0_std, recovery])
+    X = np.full_like(r, cx)
+    Y = cy + r * np.cos(theta)
+    Z = cz + r * np.sin(theta)
+    coords = np.column_stack([X, Y, Z]).astype(np.float64)
 
-    print(f"[OK] Wrote recovery result → {csv_path}")
+    vtk_pts = vtk.vtkPoints()
+    vtk_pts.SetData(ns.numpy_to_vtk(coords, deep=True))
+    poly = vtk.vtkPolyData()
+    poly.SetPoints(vtk_pts)
+    verts = vtk.vtkCellArray()
+    for i in range(coords.shape[0]):
+        verts.InsertNextCell(1)
+        verts.InsertCellPoint(i)
+    poly.SetVerts(verts)
 
-# ========== MAIN AIP PLOTTING ==========
+    proxy = _vtk_polydata_to_proxy(poly, name="AIP_PolarProbes")
+    return proxy, ring_idx, rake_idx, r, theta, r_edges, r_bar
 
-def plot_aip_fields(root, out_dir, cx, cy, cz, r, P0_inf=None):
-    """Plot pressure and velocity on AIP surface."""
-    
-    # 1) Isolate AIP geometry
-    print("\n[INFO] Isolating AIP surface...")
-    aip_geom = isolate_aip_surface(root, cx, cy, cz, r)
-    UpdatePipeline(proxy=aip_geom)
-    Show(aip_geom)
-    
-    ds_geom = Fetch(aip_geom)
-    if not ds_geom or ds_geom.GetNumberOfPoints() == 0:
-        raise RuntimeError("AIP geometry has no points!")
-    print(f"[OK] AIP geometry: {ds_geom.GetNumberOfPoints()} points")
-    
-    # 2) Resample volume data onto AIP surface
-    print("[INFO] Resampling volume data onto AIP...")
-    sampled = ResampleWithDataset(
-        registrationName="AIP_Sampled",
-        SourceDataArrays=root,
-        DestinationMesh=aip_geom
-    )
-    sampled.CellLocator = 'Static Cell Locator'
-    sampled.PassPointArrays = 1
-    sampled.PassCellArrays = 1
-    UpdatePipeline(proxy=sampled)
-    # Remove?
-    Show(sampled)
-    Hide(aip_geom)
-    Hide(src_aip)
-    
-    ds_sampled = Fetch(sampled)
-    if not ds_sampled or ds_sampled.GetNumberOfPoints() == 0:
-        raise RuntimeError("ResampleWithDataset returned no points!")
-    print(f"[OK] Resampled data: {ds_sampled.GetNumberOfPoints()} points")
-    
-    # Debug: check available arrays
-    print("[DEBUG] Available arrays after resampling:")
-    arrs = list_arrays(sampled)
-    for name, (ncomp, loc) in arrs.items():
-        print(f"  {name}: {ncomp} comp, {loc}")
-    
-    # 3) Camera setup
+def plot_polar_field(field_2d, r_edges, n_rakes, theta_offset_deg, clockwise,
+                      title, out_path, vmin=None, vmax=None, cmap="RdBu_r"):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    dtheta = 2.0 * np.pi / n_rakes
+    theta0 = np.radians(theta_offset_deg)
+    theta_edges = theta0 + dtheta * (np.arange(n_rakes + 1) - 0.5)
+
+    fig = plt.figure(figsize=(6, 6))
+    ax = fig.add_subplot(111, projection="polar")
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1 if clockwise else 1)
+
+    if vmin is None or vmax is None:
+        finite = field_2d[np.isfinite(field_2d)]
+        vmax_auto = float(np.nanmax(np.abs(finite))) if finite.size else 1.0
+        vmin, vmax = -vmax_auto, vmax_auto
+
+    mesh = ax.pcolormesh(theta_edges, r_edges, field_2d, cmap=cmap, vmin=vmin, vmax=vmax, shading="flat")
+    ax.set_rlabel_position(135)
+    ax.set_title(title)
+    fig.colorbar(mesh, ax=ax, pad=0.1)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"[OK] Saved: {out_path}")
+
+def clock_position(theta_deg, clockwise=True):
+    """Cosmetic conversion of a probe angle to a 12-o'clock-referenced clock
+    label, consistent with plot_polar_field's orientation."""
+    deg = theta_deg % 360.0
+    hours = (deg / 30.0) if clockwise else ((360.0 - deg) / 30.0)
+    hours = hours % 12.0
+    if hours == 0:
+        hours = 12.0
+    return hours
+
+# ================================= MAIN ========================================
+
+src_raw = open_case(CASE_FILE)               # raw multiblock reader (needed for AIP block extraction)
+src = normalize_to_single_dataset(src_raw)   # merged single dataset (used for all resampling)
+
+P0_inf = None
+if NEED_P0_INF:
+    P0_inf = compute_P0_inf(src)
+else:
+    print("[INFO] Skipping freestream P0_inf (PLOT_ETA and COMPUTE_PR are both off).")
+
+results = {
+    "timestamp": datetime.now().isoformat(timespec="seconds"),
+    "run_tag": RUN_TAG,
+    "case_file": CASE_FILE,
+    "P0_inf_Pa": P0_inf if P0_inf is not None else "",
+}
+
+# ================================= X-SWEEP =====================================
+if RUN_SWEEP:
     rv = GetActiveViewOrCreate("RenderView")
-    rv.CameraPosition = [cx + 2.5, cy, cz]
-    rv.CameraFocalPoint = [cx, cy, cz]
-    rv.CameraViewUp = [0, 0, 1]
+    rv.ViewSize = IMAGE_SIZE
+    rv.Background = [1, 1, 1]
+    rv.InteractionMode = "2D"
+    Show(src)
+    ResetCamera()
+
     rv.CameraParallelProjection = 1
-    rv.CameraParallelScale = r * 1.5
+    rv.CameraPosition = [-3, 0, 0]
+    rv.CameraFocalPoint = [0, 0.5, 0]
+    rv.CameraViewUp = [0, 0, 1]
+    rv.CameraParallelScale = 1.8
     rv.StillRender()
-    
-    # ---- PLOT 1: PRESSURE ----
-    print("\n[INFO] Plotting pressure...")
-    print("\n[INFO] Plotting pressure recovery on AIP (P0/P0_inf).")
-    try:
-        p0_src, p0_arr = _ensure_P0AIP_on(sampled)
-        UpdatePipeline(proxy=p0_src)
 
-        if P0_inf is None:
-            # If not provided, just plot P0_AIP (still useful)
-            field_src = p0_src
-            field_arr = p0_arr
-            title = "Total Pressure P0 [Pa]"
-            label = f"AIP Surface (x={cx:.2f}) - Total Pressure"
-            fixed_range = (0.9, 0.98)
-        else:
-            # Build recovery field: PR_AIP = P0_AIP / P0_inf
-            rec = Calculator(Input=p0_src)
-            rec.ResultArrayName = "PR_AIP"
-            rec.Function = f"{p0_arr} / {float(P0_inf)}"
-            UpdatePipeline(proxy=rec)
+    slice_obj, slice_merged = build_slice(src)
+    Hide(src)
 
-            field_src = rec
-            field_arr = "PR_AIP"
-            title = "Pressure Recovery (P0/P0_inf) [-]"
-            label = f"AIP Surface (x={cx:.2f}) - Pressure Recovery"
-            fixed_range = (0.9, 0.98)  # tweak if you want; or set None for auto
+    rho_proxy = mach_proxy = eta_proxy = None
+    if PLOT_DENSITY:
+        rho_proxy, _ = ensure_pointdata(slice_merged, NAME_RHO)
+    if PLOT_MACH:
+        mach_proxy, _ = ensure_mach(slice_merged)
+    if PLOT_ETA:
+        eta_proxy, _ = ensure_eta(slice_merged, P0_inf)
 
-        # --- Compute range on AIP surface ---
-        vmin, vmax = compute_range(field_src, field_arr)
-        print(f"[INFO] Pressure recovery range on AIP: {vmin:.4f} – {vmax:.4f}")
+    x_vals = np.linspace(float(X_START), float(X_END), int(N_SLICES))
 
-        px, arr, rep = render_colorfield(
-            rv, field_src, field_arr,
-            title=title,
-            fixed_range=fixed_range
-        )
+    print("\n[INFO] Starting sweep...")
+    for i, xv in enumerate(x_vals):
+        slice_obj.SliceType.Origin = [float(xv), 0.0, 0.0]
+        UpdatePipeline(proxy=slice_merged)
 
-        txt = Text()
-        txt.Text = label
-        txtrep = Show(txt)
-        txtrep.WindowLocation = "Upper Left Corner"
-        txtrep.FontSize = 16
-        txtrep.Color = [0, 0, 0]
+        if i % 10 == 0:
+            print(f"[INFO] Slice {i+1}/{N_SLICES} at x={xv:.3f}")
 
-        rv.StillRender()
-        save_png(rv, "AIP_pressure_recovery")
-        Hide(txt); Delete(txt); Hide(px)
-        print("[OK] AIP_pressure_recovery.png saved")
+        if PLOT_DENSITY:
+            t = Text(); t.Text = f"Mach 1.3, AoA 3.0, AoS 0.0, WAT 6.0, x = {xv:.3f}"
+            trep = Show(t); trep.WindowLocation="Upper Left Corner"; trep.FontSize=14; trep.Color=[0,0,0]
+            px, rep = render_field(rv, rho_proxy, NAME_RHO, "Density")
+            rv.StillRender(); save_png(rv, f"x_{i:03d}_rho")
+            Hide(px); Hide(t); Delete(t)
 
-    except Exception as e:
-        print(f"[ERROR] Pressure recovery plot failed: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    # ---- PLOT 2: VELOCITY ----
-    print("\n[INFO] Plotting velocity...")
-    try:
-        u_src, u_arr = _ensure_speed_on(sampled)
-        UpdatePipeline(proxy=u_src)
+        if PLOT_MACH:
+            t = Text(); t.Text = f"Mach 1.3, AoA 3.0, AoS 0.0, WAT 6.0, x = {xv:.3f}"
+            trep = Show(t); trep.WindowLocation="Upper Left Corner"; trep.FontSize=14; trep.Color=[0,0,0]
+            px, rep = render_field(rv, mach_proxy, "Mach", "Mach", vmin=MACH_RANGE[0], vmax=MACH_RANGE[1], use_matplotlib=True)
+            rv.StillRender(); save_png(rv, f"x_{i:03d}_mach")
+            Hide(px); Hide(t); Delete(t)
 
-        # --- Compute range on AIP surface ---
-        u_min, u_max = compute_range(u_src, u_arr)
-        print(f"[INFO] Velocity range on AIP: {u_min:.3f} – {u_max:.3f}")
+        if PLOT_ETA:
+            t = Text(); t.Text = f"Mach 1.3, AoA 3.0, AoS 0.0, WAT 6.0, x = {xv:.3f}"
+            trep = Show(t); trep.WindowLocation="Upper Left Corner"; trep.FontSize=14; trep.Color=[0,0,0]
+            px, rep = render_field(rv, eta_proxy, "eta", "\u03b7 [-]", vmin=ETA_RANGE[0], vmax=ETA_RANGE[1], use_matplotlib=True)
+            rv.StillRender(); save_png(rv, f"x_{i:03d}_eta")
+            Hide(px); Hide(t); Delete(t)
 
-        px, arr, rep = render_colorfield(
-            rv, u_src, u_arr,
-            title="Velocity [m/s]",
-            fixed_range=(u_min, 180)
-        )
-        
-        txt = Text()
-        txt.Text = f"AIP Surface (x={cx:.2f}) - Velocity Magnitude"
-        txtrep = Show(txt)
-        txtrep.WindowLocation = "Upper Left Corner"
-        txtrep.FontSize = 16
-        txtrep.Color = [0, 0, 0]
-        
-        rv.StillRender()
-        save_png(rv, "AIP_velocity")
-        Hide(txt); Delete(txt); Hide(px)
-        print("[OK] AIP_velocity.png saved")
-        
-    except Exception as e:
-        print(f"[ERROR] Velocity plot failed: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    # Optional PDF
+    print("[OK] Sweep complete.")
+
     if WRITE_PDFS:
-        try:
-            from PIL import Image
-            pngs = [
-                os.path.join(out_dir, "AIP_pressure.png"),
-                os.path.join(out_dir, "AIP_velocity.png")
-            ]
-            pngs = [p for p in pngs if os.path.exists(p) and os.path.getsize(p) > 0]
-            
-            if pngs:
-                imgs = [Image.open(p).convert("RGB") for p in pngs]
-                pdf_path = os.path.join(out_dir, "AIP_plots.pdf")
-                imgs[0].save(pdf_path, save_all=True, append_images=imgs[1:])
-                print(f"[OK] Created {pdf_path}")
-        except Exception as e:
-            print(f"[WARN] PDF creation failed: {e}")
-    return sampled
+        if PLOT_DENSITY: pngs_to_pdf("x_*_rho.png",  "rho_sweep.pdf")
+        if PLOT_MACH:    pngs_to_pdf("x_*_mach.png", "mach_sweep.pdf")
+        if PLOT_ETA:     pngs_to_pdf("x_*_eta.png",  "eta_sweep.pdf")
 
-# ========== RUN IT ==========
-try:
-    aip_sampled = plot_aip_fields(src_aip, OUT_DIR, cx, cy, cz, AIP_RADIUS, P0_inf=P0_inf)
+    print(f"[OK] Sweep outputs in: {OUT_DIR}")
+else:
+    print("[INFO] Skipping x-sweep entirely (PLOT_DENSITY, PLOT_MACH, PLOT_ETA are all off).")
+
+# ================================== AIP ========================================
+if RUN_AIP:
     print("\n" + "="*60)
-    print("AIP PLOTTING COMPLETE SUCCESS")
+    print("Starting AIP extraction / distortion / swirl")
     print("="*60)
-    root = open_case(CASE_FILE)
-    #P0_inf = compute_freestream_total_pressure(open_case(CASE_FILE))
-    compute_pressure_recovery(aip_sampled, P0_inf, OUT_DIR)
-    print("\n" + "="*60)
-    print("PRESSURE RECOVERY COMPUTED")
-    print("="*60)
-except Exception as e:
-    print(f"\n[CRITICAL ERROR] AIP plotting failed:")
-    print(f"  {e}")
-    import traceback
-    traceback.print_exc()
+
+    if RUN_SWEEP:
+        print("[INFO] Cleaning up sweep pipeline...")
+        try:
+            for obj in list(GetSources().values()):
+                try: Delete(obj)
+                except: pass
+        except Exception as e:
+            print(f"[WARN] Cleanup: {e}")
+        print(f"[INFO] Re-opening case file for AIP stage: {CASE_FILE}")
+        src_raw = open_case(CASE_FILE)
+        src = normalize_to_single_dataset(src_raw)
+
+    cx, cy, cz = AIP_CENTER
+    print(f"[INFO] AIP center: ({cx}, {cy}, {cz}), radius: {AIP_RADIUS}")
+
+    rv = None
+
+    if PLOT_AIP:
+        rv = GetActiveViewOrCreate("RenderView")
+        rv.ViewSize = IMAGE_SIZE
+        rv.Background = [1, 1, 1]
+        rv.InteractionMode = "3D"
+
+        # ---------------------------------------------------------
+        # AIP-ONLY VIEW
+        # Hide every existing ParaView source before plotting AIP.
+        # ---------------------------------------------------------
+        for proxy in list(GetSources().values()):
+            try:
+                Hide(proxy, rv)
+            except Exception:
+                pass
+
+        # Look directly downstream at the AIP.
+        # The AIP plane normal is +X, so the camera sits upstream/downstream
+        # on the X axis and looks directly at the Y-Z plane.
+        rv.CameraPosition = [cx + 2.5, cy, cz]
+        rv.CameraFocalPoint = [cx, cy, cz]
+        rv.CameraViewUp = [0, 0, 1]
+
+        # Orthographic view prevents perspective distortion of the disc.
+        rv.CameraParallelProjection = 1
+
+        # Frame tightly around the AIP.
+        rv.CameraParallelScale = AIP_RADIUS * 1.15
+
+        rv.StillRender()
+
+    else:
+        print(
+            "[INFO] PLOT_AIP is off — skipping RenderView/screenshot "
+            "setup, computing metrics only."
+        )
+
+    # ---------- PATH 1: real AIP surface (PR + swirl, area-weighted) ----------
+    P0_bar_area = p_bar_area = q_bar_area = None
+    swirl_mean_signed = swirl_mean_abs = swirl_rms = swirl_max_abs = None
+
+    if RUN_AIP_SURFACE:
+        try:
+            print("\n[INFO] Isolating AIP surface...")
+            aip_surf = isolate_aip_surface(src_raw, cx, cy, cz, AIP_RADIUS)
+            UpdatePipeline(proxy=aip_surf)
+            
+            print("\n[DEBUG] Arrays directly on extracted Surface 111:")
+            print(list_arrays(aip_surf))
+
+            print("[INFO] Using flow arrays already present on extracted Surface 111...")
+            sampled_surf = aip_surf
+            UpdatePipeline(proxy=sampled_surf)
+            
+            ds_check = Fetch(sampled_surf)
+
+            mask = ds_check.GetPointData().GetArray("vtkValidPointMask")
+
+            if mask is not None:
+                mask_np = ns.vtk_to_numpy(mask).astype(bool)
+                print(
+                    f"[DEBUG] AIP Resample validity: "
+                    f"{np.count_nonzero(mask_np)}/{len(mask_np)} "
+                    f"({100*np.mean(mask_np):.2f}%)"
+                )
+
+            p_src, p_arr = ensure_pressure(sampled_surf)
+            ds_surf, arrs = fetch_point_arrays(p_src, [NAME_RHO, NAME_U, p_arr], need_points=True)
+            rho = arrs[NAME_RHO]; u = arrs[NAME_U]; p = arrs[p_arr]; pts = arrs["_points"]
+            if rho is None or u is None or p is None or pts is None:
+                raise RuntimeError("Missing expected arrays on the resampled AIP surface.")
+
+            M, P0, valid = compute_physics(rho, u, p)
+            theta = np.arctan2(pts[:, 2] - cz, pts[:, 1] - cy)
+            Ux, Ur, Ut, swirl_deg = cylindrical_decompose(u, theta)
+
+            P0m = np.where(valid, P0, np.nan)
+            pm = np.where(valid, p, np.nan)
+            swirlm = np.where(valid, swirl_deg, np.nan)
+
+            means, total_area, tds = triangle_areas_and_centroid_values(
+                ds_surf, {"P0": P0m, "p": pm, "abs_swirl": np.abs(swirlm), "sq_swirl": swirlm ** 2}
+            )
+            P0_bar_area = means["P0"]; p_bar_area = means["p"]
+            q_bar_area = (P0_bar_area - p_bar_area) if (not math.isnan(P0_bar_area) and not math.isnan(p_bar_area)) else float("nan")
+            swirl_mean_abs = means["abs_swirl"]
+            swirl_rms = math.sqrt(means["sq_swirl"]) if not math.isnan(means["sq_swirl"]) else float("nan")
+            swirl_mean_signed = circular_mean_deg(swirlm)
+            swirl_max_abs = float(np.nanmax(np.abs(swirlm))) if np.any(np.isfinite(swirlm)) else float("nan")
+
+            print(f"[OK] AIP surface: {ds_surf.GetNumberOfPoints()} points, area = {total_area:.5g} m^2")
+            if COMPUTE_PR and P0_inf:
+                print(f"[RESULT] Pressure recovery (area-weighted) = {P0_bar_area/P0_inf:.5f}  (P0_bar={P0_bar_area:.6g} Pa)")
+            if COMPUTE_SWIRL:
+                print(f"[RESULT] Swirl (area-weighted): mean(signed)={swirl_mean_signed:.2f} deg, "
+                      f"mean(|.|)={swirl_mean_abs:.2f} deg, RMS={swirl_rms:.2f} deg, max(|.|)={swirl_max_abs:.2f} deg")
+
+            if PLOT_AIP:
+                print("\n[INFO] Plotting velocity...")
+                u_src, u_arr = ensure_speed(sampled_surf)
+                u_min, u_max = compute_range(u_src, u_arr)
+                px, arr, rep = render_colorfield(rv, u_src, u_arr, title="Velocity [m/s]", fixed_range=(u_min, 180))
+                txt = Text(); txt.Text = f"AIP Surface (x={cx:.2f}) - Velocity Magnitude"
+                trep = Show(txt); trep.WindowLocation = "Upper Left Corner"; trep.FontSize = 16; trep.Color = [0, 0, 0]
+                rv.StillRender(); save_png(rv, "AIP_velocity")
+                Hide(txt); Delete(txt); Hide(px)
+                print("[OK] AIP_velocity.png saved")
+
+                if COMPUTE_PR:
+                    print("\n[INFO] Plotting pressure recovery (P0/P0_inf)...")
+                    p0_src, p0_arr = ensure_total_pressure(sampled_surf, "P0_AIP")
+                    rec = Calculator(Input=p0_src)
+                    rec.ResultArrayName = "PR_AIP"
+                    rec.Function = f"{p0_arr} / {float(P0_inf)}"
+                    UpdatePipeline(proxy=rec)
+                    px, arr, rep = render_colorfield(rv, rec, "PR_AIP", title="Pressure Recovery (P0/P0_inf) [-]",
+                                                       fixed_range=(0.9, 0.98))
+                    txt = Text(); txt.Text = f"AIP Surface (x={cx:.2f}) - Pressure Recovery"
+                    trep = Show(txt); trep.WindowLocation = "Upper Left Corner"; trep.FontSize = 16; trep.Color = [0, 0, 0]
+                    rv.StillRender(); save_png(rv, "AIP_pressure_recovery")
+                    Hide(txt); Delete(txt); Hide(px)
+                    print("[OK] AIP_pressure_recovery.png saved")
+
+                if COMPUTE_SWIRL:
+                    print("\n[INFO] Plotting swirl angle...")
+                    ds_plot = vtk.vtkPolyData()
+                    ds_plot.DeepCopy(ds_surf)
+                    swirl_vtk = ns.numpy_to_vtk(np.nan_to_num(swirlm, nan=0.0), deep=True)
+                    swirl_vtk.SetName("SwirlAngleDeg")
+                    ds_plot.GetPointData().AddArray(swirl_vtk)
+                    swirl_plot_proxy = _vtk_polydata_to_proxy(ds_plot, name="AIP_Swirl_Plot")
+
+                    if SWIRL_RANGE is not None:
+                        svmin, svmax = SWIRL_RANGE
+                    else:
+                        finite = swirlm[np.isfinite(swirlm)]
+                        svmax = float(np.nanmax(np.abs(finite))) if finite.size else 10.0
+                        svmin, svmax = -svmax, svmax
+
+                    px, rep = render_field(rv, swirl_plot_proxy, "SwirlAngleDeg", "Swirl angle [deg]",
+                                            vmin=svmin, vmax=svmax, use_matplotlib=True, cmap_name=CMAP_DIVERGING)
+                    txt = Text(); txt.Text = f"AIP Surface (x={cx:.2f}) - Swirl Angle"
+                    trep = Show(txt); trep.WindowLocation = "Upper Left Corner"; trep.FontSize = 16; trep.Color = [0, 0, 0]
+                    rv.StillRender(); save_png(rv, "AIP_swirl_angle")
+                    Hide(txt); Delete(txt); Hide(px)
+                    print("[OK] AIP_swirl_angle.png saved")
+
+        except Exception as e:
+            print(f"[ERROR] AIP surface path (PR/swirl) failed: {e}")
+            import traceback; traceback.print_exc()
+
+    # ---------- PATH 2: ring/rake probe grid (distortion) ----------
+    DC_value = radial_distortion = q_bar_probes = P0_bar_probes = None
+    worst_ring = DC_worst_clock = effective_window_deg = None
+
+    if RUN_AIP_PROBES:
+        try:
+            print("\n[INFO] Building ring/rake probe grid and resampling volume field onto it...")
+            probe_proxy, ring_idx, rake_idx, r_probe, theta_probe, r_edges, r_bar = build_polar_probe_cloud(
+                cx, cy, cz, AIP_RADIUS, N_RINGS, N_RAKES, RING_SPACING, THETA_OFFSET_DEG
+            )
+            sampled_probes = ResampleWithDataset(registrationName="AIP_Probes_Sampled",
+                                                  SourceDataArrays=src, DestinationMesh=probe_proxy)
+            sampled_probes.PassPointArrays = 1
+            sampled_probes.PassCellArrays = 1
+            UpdatePipeline(proxy=sampled_probes)
+
+            p_src2, p_arr2 = ensure_pressure(sampled_probes)
+            _, arrs2 = fetch_point_arrays(p_src2, [NAME_RHO, NAME_U, p_arr2, "vtkValidPointMask"])
+            rho2 = arrs2[NAME_RHO]; u2 = arrs2[NAME_U]; p2 = arrs2[p_arr2]; mask2 = arrs2["vtkValidPointMask"]
+            if rho2 is None or u2 is None or p2 is None:
+                raise RuntimeError("Probe-grid resampling did not produce expected arrays.")
+
+            M2, P0_2, phys_valid = compute_physics(rho2, u2, p2)
+            probe_mask = mask2.astype(bool) if mask2 is not None else np.ones_like(p2, dtype=bool)
+            if mask2 is None:
+                print("[WARN] 'vtkValidPointMask' not found; assuming all probes are valid.")
+            valid2 = probe_mask & phys_valid
+
+            valid_fraction = float(np.mean(valid2))
+            if valid_fraction < 0.98:
+                print(f"[WARN] Only {valid_fraction*100:.1f}% of ring/rake probes landed inside the flow domain "
+                      f"— check AIP_CENTER/AIP_RADIUS and the assumed +X axial direction if this is low.")
+
+            P0_valid = np.where(valid2, P0_2, np.nan)
+            p_valid = np.where(valid2, p2, np.nan)
+            P0_grid = P0_valid.reshape(N_RINGS, N_RAKES)
+
+            P0_bar_probes = float(np.nanmean(P0_valid))
+            p_bar_probes = float(np.nanmean(p_valid))
+            if QBAR_DEFINITION == "P0-p":
+                q_bar_probes = P0_bar_probes - p_bar_probes
+            elif QBAR_DEFINITION == "0.5rhoU2":
+                speed2 = np.linalg.norm(u2, axis=1)
+                q_bar_probes = float(np.nanmean(np.where(valid2, 0.5 * rho2 * speed2 ** 2, np.nan)))
+            else:
+                raise ValueError("QBAR_DEFINITION must be 'P0-p' or '0.5rhoU2'")
+
+            ring_avgs = np.nanmean(P0_grid, axis=1)
+
+            rake_spacing_deg = 360.0 / N_RAKES
+            n_window = max(1, int(round(DC_WINDOW_DEG / rake_spacing_deg)))
+            effective_window_deg = n_window * rake_spacing_deg
+            if abs(effective_window_deg - DC_WINDOW_DEG) > 1e-6:
+                print(f"[WARN] Requested DC window {DC_WINDOW_DEG:.1f} deg isn't a multiple of the rake spacing "
+                      f"({rake_spacing_deg:.2f} deg/rake, N_RAKES={N_RAKES}). Using {effective_window_deg:.2f} deg "
+                      f"instead (adjust N_RAKES for an exact window).")
+
+            DC_ring = np.full(N_RINGS, np.nan)
+            DC_ring_theta = np.full(N_RINGS, np.nan)
+            theta_grid = theta_probe.reshape(N_RINGS, N_RAKES)
+            for k in range(N_RINGS):
+                best_avg = np.inf
+                best_start = 0
+                for start in range(N_RAKES):
+                    idx = [(start + i) % N_RAKES for i in range(n_window)]
+                    vals = P0_grid[k, idx]
+                    if np.all(np.isnan(vals)):
+                        continue
+                    avg = np.nanmean(vals)
+                    if avg < best_avg:
+                        best_avg = avg
+                        best_start = start
+                if np.isfinite(best_avg) and np.isfinite(q_bar_probes) and q_bar_probes != 0:
+                    DC_ring[k] = (ring_avgs[k] - best_avg) / q_bar_probes
+                    DC_ring_theta[k] = np.degrees(theta_grid[k, best_start])
+
+            worst_ring = int(np.nanargmax(DC_ring)) if np.any(np.isfinite(DC_ring)) else None
+            DC_value = float(DC_ring[worst_ring]) if worst_ring is not None else float("nan")
+            DC_worst_clock = clock_position(DC_ring_theta[worst_ring], POLAR_CLOCKWISE) if worst_ring is not None else float("nan")
+            radial_distortion = (float((np.nanmax(ring_avgs) - np.nanmin(ring_avgs)) / P0_bar_probes)
+                                  if np.isfinite(P0_bar_probes) and P0_bar_probes != 0 else float("nan"))
+
+            print(f"[OK] Probe-grid P0_bar = {P0_bar_probes:.6g} Pa, q_bar ({QBAR_DEFINITION}) = {q_bar_probes:.6g} Pa")
+            print(f"[RESULT] DC({effective_window_deg:.0f}) = {DC_value:.4f} "
+                  f"(worst ring {worst_ring+1 if worst_ring is not None else '?'}/{N_RINGS}, "
+                  f"~{DC_worst_clock:.1f} o'clock)")
+            print(f"[RESULT] Radial pressure distortion (ring-to-ring) = {radial_distortion:.4f}")
+
+            if P0_bar_area is not None and P0_bar_probes:
+                pct_diff = 100.0 * abs(P0_bar_area - P0_bar_probes) / P0_bar_probes
+                print(f"[CHECK] Area-weighted P0_bar vs probe-grid P0_bar differ by {pct_diff:.2f}% "
+                      f"(large disagreement -> increase N_RINGS/N_RAKES or re-check AIP_CENTER/AIP_RADIUS).")
+
+            if PLOT_AIP:
+                print("\n[INFO] Plotting distortion polar carpet...")
+                plot_polar_field(
+                    P0_grid / (P0_bar_probes if P0_bar_probes else 1.0) - 1.0,
+                    r_edges, N_RAKES, THETA_OFFSET_DEG, POLAR_CLOCKWISE,
+                    "AIP P0 deficit (P0/P0bar - 1)",
+                    os.path.join(OUT_DIR, "AIP_distortion_polar.png"),
+                    cmap=CMAP_DIVERGING,
+                )
+
+        except Exception as e:
+            print(f"[ERROR] AIP probe-grid (distortion) path failed: {e}")
+            import traceback; traceback.print_exc()
+
+    # ---------- CSV ----------
+    results.update({
+        "P0_bar_area_Pa": P0_bar_area if P0_bar_area is not None else "",
+        "recovery_area": (P0_bar_area / P0_inf) if (COMPUTE_PR and P0_bar_area is not None and P0_inf) else "",
+        "P0_bar_probes_Pa": P0_bar_probes if P0_bar_probes is not None else "",
+        "recovery_probes": (P0_bar_probes / P0_inf) if (COMPUTE_PR and P0_bar_probes is not None and P0_inf) else "",
+        "q_bar_Pa": q_bar_probes if q_bar_probes is not None else "",
+        "qbar_definition": QBAR_DEFINITION if COMPUTE_DISTORTION else "",
+        "DC_window_deg_requested": DC_WINDOW_DEG if COMPUTE_DISTORTION else "",
+        "DC_window_deg_effective": effective_window_deg if effective_window_deg is not None else "",
+        "DC_value": DC_value if DC_value is not None else "",
+        "DC_worst_ring": (worst_ring + 1) if worst_ring is not None else "",
+        "DC_worst_clock_oclock": DC_worst_clock if DC_worst_clock is not None else "",
+        "radial_pressure_distortion": radial_distortion if radial_distortion is not None else "",
+        "swirl_mean_signed_deg": swirl_mean_signed if swirl_mean_signed is not None else "",
+        "swirl_mean_abs_deg": swirl_mean_abs if swirl_mean_abs is not None else "",
+        "swirl_rms_deg": swirl_rms if swirl_rms is not None else "",
+        "swirl_max_abs_deg": swirl_max_abs if swirl_max_abs is not None else "",
+        "N_RINGS": N_RINGS if COMPUTE_DISTORTION else "",
+        "N_RAKES": N_RAKES if COMPUTE_DISTORTION else "",
+        "AIP_center": str(AIP_CENTER),
+        "AIP_radius_m": AIP_RADIUS,
+        "PLOT_DENSITY": PLOT_DENSITY, "PLOT_MACH": PLOT_MACH, "PLOT_ETA": PLOT_ETA, "PLOT_AIP": PLOT_AIP,
+        "COMPUTE_PR": COMPUTE_PR, "COMPUTE_DISTORTION": COMPUTE_DISTORTION, "COMPUTE_SWIRL": COMPUTE_SWIRL,
+    })
+
+    csv_path = os.path.join(OUT_DIR, "AIP_results.csv")
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(results.keys()))
+        if write_header:
+            w.writeheader()
+        w.writerow(results)
+    print(f"\n[OK] Wrote AIP results (PR / distortion / swirl) -> {csv_path}")
+
+else:
+    print("\n[INFO] Skipping AIP stage entirely (PLOT_AIP, COMPUTE_PR, COMPUTE_DISTORTION, COMPUTE_SWIRL are all off).")
 
 print(f"\nAll outputs in: {OUT_DIR}")
