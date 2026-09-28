@@ -220,7 +220,7 @@ def plot_convergence_history(
     # ------------------------------------------------------------
     # Plot
     # ------------------------------------------------------------
-    count_limit = 0
+    count_limit = 5
     if count_limit is None:
         count_limit = max(xs)
 
@@ -285,10 +285,380 @@ def plot_convergence_history(
         "best_overall_idx": best_overall_idx,
     }
 
-mcsv_file = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation_2\bo_data_2.mcsv"
-out_dir = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation_2\conv_plot.png"
 
-training_data = 29          # number of initial LHS samples
+def plot_design_variable_heatmap(
+    X,
+    xlower,
+    xupper,
+    var_names=None,
+    row_labels=None,
+    gen0_count=None,
+    fail_mask=None,
+    annotate=True,
+    fmt="{:.2f}",
+    cmap_diverging="RdBu_r",
+    title="Design Variable Coefficients per Case",
+    save_prefix=None,
+    out_dir=".",
+    show=False,
+    figsize=None,
+):
+    """
+    Matrix view of every evaluated design vector: rows = cases (in evaluation
+    order), columns = design variables (modal coefficients). Cell COLOR encodes
+    where the value sits within its own [lower, upper] bound (-1 = at the lower
+    bound, 0 = mid-range, +1 = at the upper bound), so variables with different
+    physical ranges stay visually comparable on one shared scale; the cell TEXT
+    gives the exact raw value, so nothing is lost to the normalization.
+
+    Diverging (not sequential) color is deliberate: 0 is a physically
+    meaningful midpoint here (the undeformed/baseline shape for a modal
+    coefficient set to 0), so "which side of baseline, and how far" is the
+    actual question this plot answers per cell.
+
+    Parameters
+    ----------
+    X : (N, n_vars) array
+        Design vectors, one row per evaluated case, in evaluation order.
+    xlower, xupper : scalar or (n_vars,) array
+        Per-variable bounds. A scalar is broadcast to all variables.
+    var_names : list[str], optional
+        Length n_vars column labels (defaults to "v1".."v{n_vars}").
+    row_labels : list[str], optional
+        Length N row labels (defaults to case index 0..N-1).
+    gen0_count : int, optional
+        Number of rows belonging to the initial baseline+LHS batch (rows
+        0..gen0_count-1). If given, draws a line separating them from the
+        subsequent BO iterations -- consistent with the gen0/BO split used in
+        plot_convergence_history, so the two figures read together.
+    fail_mask : (N,) bool array, optional
+        Marks failed/penalized evaluations (see the fail_threshold convention
+        used for the convergence plot). The design VECTOR for a failed case is
+        still drawn -- it's a real, valid DV combination that happened to
+        crash the solver, which is itself useful to see in DV space -- but the
+        row gets a red outline and a "FAILED" label so it can't be mistaken
+        for a converged, trustworthy result.
+
+    Returns
+    -------
+    dict with the normalized bound-utilization matrix and the fail mask, for
+    downstream inspection/testing.
+    """
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import matplotlib as mpl
+
+    X = np.atleast_2d(np.asarray(X, dtype=float))
+    n_cases, n_vars = X.shape
+
+    xlower = np.broadcast_to(np.asarray(xlower, dtype=float), (n_vars,)).copy()
+    xupper = np.broadcast_to(np.asarray(xupper, dtype=float), (n_vars,)).copy()
+    if np.any(xupper <= xlower):
+        raise ValueError("xupper must be strictly greater than xlower for every variable.")
+
+    if var_names is None:
+        var_names = [f"v{i+1}" for i in range(n_vars)]
+    elif len(var_names) != n_vars:
+        raise ValueError(f"var_names has {len(var_names)} entries but X has {n_vars} columns.")
+
+    if row_labels is None:
+        row_labels = [str(i) for i in range(n_cases)]
+    elif len(row_labels) != n_cases:
+        raise ValueError(f"row_labels has {len(row_labels)} entries but X has {n_cases} rows.")
+
+    if fail_mask is None:
+        fail_mask = np.zeros(n_cases, dtype=bool)
+    else:
+        fail_mask = np.asarray(fail_mask, dtype=bool)
+        if fail_mask.shape != (n_cases,):
+            raise ValueError(f"fail_mask must have shape ({n_cases},), got {fail_mask.shape}.")
+
+    out_of_bounds = (X < xlower) | (X > xupper)
+    if out_of_bounds.any():
+        bad_cases, bad_vars = np.where(out_of_bounds)
+        print(f"[WARN] {len(bad_cases)} (case, variable) value(s) fall outside the "
+              f"supplied bounds -- e.g. case {row_labels[bad_cases[0]]}, "
+              f"{var_names[bad_vars[0]]} = {X[bad_cases[0], bad_vars[0]]:.4f} not in "
+              f"[{xlower[bad_vars[0]]:.4f}, {xupper[bad_vars[0]]:.4f}]. Clipped for the "
+              f"color scale only -- the annotated text still shows the true value, so "
+              f"check whether this is a bound-definition mismatch or a genuine "
+              f"optimizer excursion past the constraint.")
+
+    # Signed bound-utilization: -1 at lower bound, 0 at mid-range, +1 at upper bound.
+    mid = 0.5 * (xlower + xupper)
+    half_range = 0.5 * (xupper - xlower)
+    util = np.clip((X - mid) / half_range, -1.0, 1.0)
+
+    if figsize is None:
+        figsize = (max(6.0, 1.1 * n_vars + 2.0), max(4.0, 0.32 * n_cases + 1.5))
+    fig, ax = plt.subplots(figsize=figsize)
+
+    cmap = plt.get_cmap(cmap_diverging)
+    cnorm = mpl.colors.Normalize(vmin=-1.0, vmax=1.0)
+    im = ax.imshow(util, cmap=cmap, norm=cnorm, aspect="auto")
+
+    ax.set_xticks(np.arange(n_vars))
+    ax.set_xticklabels(var_names, rotation=30, ha="right", fontsize=9)
+    ax.set_yticks(np.arange(n_cases))
+    ax.set_yticklabels(row_labels, fontsize=8)
+    ax.set_ylabel("Case (evaluation order)")
+    ax.set_title(title)
+
+    # Cell gridlines (offset minor ticks so they fall between cells, not on them).
+    ax.set_xticks(np.arange(-0.5, n_vars, 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, n_cases, 1), minor=True)
+    ax.grid(which="minor", color="white", linewidth=1.2)
+    ax.tick_params(which="minor", bottom=False, left=False)
+
+    if annotate:
+        for i in range(n_cases):
+            for j in range(n_vars):
+                rgba = cmap(cnorm(util[i, j]))
+                lum = 0.299 * rgba[0] + 0.587 * rgba[1] + 0.114 * rgba[2]
+                txt_color = "white" if lum < 0.5 else "black"
+                ax.text(j, i, fmt.format(X[i, j]), ha="center", va="center",
+                         fontsize=6.5, color=txt_color)
+
+    if gen0_count is not None and 0 < gen0_count < n_cases:
+        ax.axhline(gen0_count - 0.5, color="black", linewidth=1.5)
+        ax.text(n_vars - 0.5, gen0_count - 0.5, " BO starts ", fontsize=8,
+                 va="center", ha="left", color="black",
+                 bbox=dict(boxstyle="round", fc="white", ec="black", alpha=0.85))
+
+    for i in np.flatnonzero(fail_mask):
+        ax.add_patch(plt.Rectangle((-0.5, i - 0.5), n_vars, 1, fill=False,
+                                     edgecolor="crimson", linewidth=2.2, zorder=5))
+        ax.text(-0.7, i, "FAILED", fontsize=7, color="crimson", ha="right",
+                 va="center", fontweight="bold")
+
+    cbar = fig.colorbar(im, ax=ax, pad=0.02)
+    cbar.set_label("Position within bound  (-1 = lower, 0 = mid, +1 = upper)")
+
+    plt.tight_layout()
+
+    if save_prefix is not None:
+        os.makedirs(out_dir, exist_ok=True)
+        base = os.path.join(out_dir, save_prefix)
+        fig.savefig(base + ".png", dpi=300)
+        fig.savefig(base + ".pdf")
+        print(f"[OK] Saved: {base}.png / .pdf")
+
+    if show:
+        plt.show()
+    plt.close(fig)
+
+    return {"util": util.tolist(), "fail_mask": fail_mask.tolist()}
+
+
+def plot_design_variable_case(
+    x_case,
+    xlower,
+    xupper,
+    var_names=None,
+    case_label="",
+    y_value=None,
+    y_label="Y",
+    is_failed=False,
+    baseline_case=None,
+    cmap_diverging="RdBu_r",
+    ax=None,
+    figsize=(7, 4.5),
+):
+    """
+    Single-case lollipop view: one design vector's modal coefficients plotted
+    against their bounds. Each variable gets its own column with a shaded band
+    for [lower, upper], a dashed line at 0 (the undeformed/baseline
+    coefficient), and a stem+marker at this case's value, colored the same way
+    (and on the same -1..+1 bound-utilization scale) as
+    plot_design_variable_heatmap so a reader can move between the two figures
+    without re-learning the color mapping.
+
+    x_case  : (n_vars,) design vector for ONE case
+    xlower, xupper : scalar or (n_vars,) bounds, same convention as the heatmap
+    baseline_case  : optional (n_vars,) reference vector (e.g. case 0) drawn as
+                     small grey ticks, so you can see how far this case moved
+                     from the baseline design at a glance
+    ax      : draw into an existing Axes instead of creating a figure (used by
+              the batch export below); if None, a new figure is created
+
+    Returns (fig, ax) -- fig is None if `ax` was supplied by the caller.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import matplotlib as mpl
+
+    x_case = np.asarray(x_case, dtype=float).flatten()
+    n_vars = x_case.shape[0]
+
+    xlower = np.broadcast_to(np.asarray(xlower, dtype=float), (n_vars,)).copy()
+    xupper = np.broadcast_to(np.asarray(xupper, dtype=float), (n_vars,)).copy()
+    if np.any(xupper <= xlower):
+        raise ValueError("xupper must be strictly greater than xlower for every variable.")
+
+    if var_names is None:
+        var_names = [f"v{i+1}" for i in range(n_vars)]
+    elif len(var_names) != n_vars:
+        raise ValueError(f"var_names has {len(var_names)} entries but x_case has {n_vars}.")
+
+    mid = 0.5 * (xlower + xupper)
+    half_range = 0.5 * (xupper - xlower)
+    util = np.clip((x_case - mid) / half_range, -1.0, 1.0)
+    out_of_bounds = (x_case < xlower) | (x_case > xupper)
+
+    cmap = plt.get_cmap(cmap_diverging)
+    cnorm = mpl.colors.Normalize(vmin=-1.0, vmax=1.0)
+
+    fig = None
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+
+    xpos = np.arange(n_vars)
+
+    for i in xpos:
+        ax.add_patch(plt.Rectangle((i - 0.35, xlower[i]), 0.7, xupper[i] - xlower[i],
+                                     facecolor="0.92", edgecolor="0.75", zorder=0))
+
+    ax.axhline(0.0, color="0.5", linestyle="dashed", linewidth=1.0, zorder=1)
+
+    if baseline_case is not None:
+        baseline_case = np.asarray(baseline_case, dtype=float).flatten()
+        ax.scatter(xpos, baseline_case, marker="_", s=260, color="0.45",
+                    linewidths=1.6, zorder=2, label="Baseline (case 0)")
+
+    colors = [cmap(cnorm(u)) for u in util]
+    ax.vlines(xpos, 0.0, x_case, color=colors, linewidth=2.2, zorder=3)
+    ax.scatter(xpos, x_case, s=90, color=colors, edgecolors="0.2", linewidths=0.8, zorder=4)
+
+    for i in xpos:
+        va = "bottom" if x_case[i] >= 0 else "top"
+        offset = 0.03 * (xupper[i] - xlower[i])
+        ax.text(i, x_case[i] + (offset if x_case[i] >= 0 else -offset),
+                 f"{x_case[i]:.3f}", ha="center", va=va, fontsize=8)
+        if out_of_bounds[i]:
+            ax.text(i, xupper[i] + 0.08 * (xupper[i] - xlower[i]), "OUT OF BOUNDS",
+                     ha="center", va="bottom", fontsize=7, color="crimson", fontweight="bold")
+
+    ax.set_xticks(xpos)
+    ax.set_xticklabels(var_names, rotation=20, ha="right", fontsize=9)
+    lo_all, hi_all = float(np.min(xlower)), float(np.max(xupper))
+    pad = 0.15 * (hi_all - lo_all)
+    ax.set_ylim(lo_all - pad, hi_all + pad)
+    ax.set_xlim(-0.6, n_vars - 0.4)
+    ax.set_ylabel("Coefficient value")
+    ax.grid(axis="y", alpha=0.25)
+
+    title = f"Case {case_label}" if case_label != "" else "Case"
+    if y_value is not None:
+        title += f"  |  {y_label} = {y_value:.5f}"
+    if is_failed:
+        title += "   [FAILED]"
+        for spine in ax.spines.values():
+            spine.set_edgecolor("crimson")
+            spine.set_linewidth(2.0)
+    ax.set_title(title, fontsize=11)
+
+    if baseline_case is not None:
+        ax.legend(loc="upper right", fontsize=8)
+
+    if fig is not None:
+        plt.tight_layout()
+
+    return fig, ax
+
+
+def plot_design_variables_case_by_case(
+    X,
+    xlower,
+    xupper,
+    var_names=None,
+    row_labels=None,
+    Y=None,
+    y_label="Y",
+    fail_mask=None,
+    baseline_idx=0,
+    out_dir=".",
+    save_prefix="dv_case",
+    combine_pdf=True,
+    dpi=200,
+):
+    """
+    Calls plot_design_variable_case() once per row of X, saves one PNG per
+    case (dv_case_000.png, dv_case_001.png, ...), and -- if PIL is available
+    -- stitches them into a single multi-page PDF you can page through, the
+    same pattern pngs_to_pdf() uses for the x-sweep contours in Paraview.py.
+
+    baseline_idx: row of X drawn as the grey reference ticks on every case's
+                  plot (default 0, i.e. the undeformed baseline design -- set
+                  to None to disable the overlay).
+    """
+    import os
+    import glob
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    X = np.atleast_2d(np.asarray(X, dtype=float))
+    n_cases, n_vars = X.shape
+
+    if row_labels is None:
+        row_labels = [str(i) for i in range(n_cases)]
+    elif len(row_labels) != n_cases:
+        raise ValueError(f"row_labels has {len(row_labels)} entries but X has {n_cases} rows.")
+
+    if fail_mask is None:
+        fail_mask = np.zeros(n_cases, dtype=bool)
+    else:
+        fail_mask = np.asarray(fail_mask, dtype=bool)
+        if fail_mask.shape != (n_cases,):
+            raise ValueError(f"fail_mask must have shape ({n_cases},), got {fail_mask.shape}.")
+
+    baseline_case = X[baseline_idx] if baseline_idx is not None else None
+
+    os.makedirs(out_dir, exist_ok=True)
+    saved_paths = []
+    for i in range(n_cases):
+        y_val = float(Y[i]) if Y is not None else None
+        fig, ax = plot_design_variable_case(
+            x_case=X[i],
+            xlower=xlower,
+            xupper=xupper,
+            var_names=var_names,
+            case_label=row_labels[i],
+            y_value=y_val,
+            y_label=y_label,
+            is_failed=bool(fail_mask[i]),
+            baseline_case=baseline_case,
+        )
+        path = os.path.join(out_dir, f"{save_prefix}_{i:03d}.png")
+        fig.savefig(path, dpi=dpi)
+        plt.close(fig)
+        saved_paths.append(path)
+    print(f"[OK] Saved {len(saved_paths)} per-case plots -> {out_dir} "
+          f"({save_prefix}_000.png .. {save_prefix}_{n_cases-1:03d}.png)")
+
+    if combine_pdf:
+        try:
+            from PIL import Image
+        except Exception:
+            print("[WARN] PIL not available; skipping PDF build (individual PNGs are still saved).")
+            return saved_paths
+        frames = sorted(glob.glob(os.path.join(out_dir, f"{save_prefix}_*.png")))
+        frames = [p for p in frames if os.path.getsize(p) > 0]
+        if not frames:
+            print("[WARN] No per-case PNGs found to combine into a PDF.")
+            return saved_paths
+        imgs = [Image.open(p).convert("RGB") for p in frames]
+        pdf_path = os.path.join(out_dir, f"{save_prefix}.pdf")
+        imgs[0].save(pdf_path, save_all=True, append_images=imgs[1:])
+        print(f"[OK] PDF written: {pdf_path} ({len(imgs)} pages)")
+
+    return saved_paths
+
+
+mcsv_file = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation_cd\bo_data.mcsv"
+out_dir = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation_cd\dv_case_plots"
+
+training_data = 27          # number of initial LHS samples
 objective = "MIN"          # "max" for pressure recovery♀
 variable_name = "CD"
 
@@ -318,6 +688,57 @@ plot_convergence_history(
     out_dir = out_dir,
     show=True,
     var=variable_name,
+)
+
+# ------------------------------------------------------------------
+# Plot design variable (modal coefficient) coverage per case
+# ------------------------------------------------------------------
+# NOTE: bounds below default to (-1, 1) for every coefficient, matching the
+# range X actually spans in bo_data.mcsv and the xlim used elsewhere in this
+# file (animate_design_variable_gif_pretty). If Aeropt2's modal
+# parameterization defines different (e.g. per-mode or asymmetric) bounds,
+# replace these with the real arrays -- xlower/xupper each take either a
+# scalar or a length-n_vars array.
+n_vars = X.shape[1]
+dv_xlower = -1.0
+dv_xupper = 1.0
+dv_names = [f"Modal Coeff {i+1}" for i in range(n_vars)]
+
+# Same "solver crashed" sentinel convention flagged for the convergence plot:
+# CD/PR values are O(1), so anything at/above this magnitude is a penalty
+# value, not a real evaluation.
+fail_threshold = 1e6
+fail_mask = np.abs(Y) >= fail_threshold
+
+plot_design_variable_heatmap(
+    X=X,
+    xlower=dv_xlower,
+    xupper=dv_xupper,
+    var_names=dv_names,
+    gen0_count=training_data + 1,
+    fail_mask=fail_mask,
+    save_prefix="dv_heatmap",
+    out_dir=out_dir,
+    show=True,
+)
+
+# ------------------------------------------------------------------
+# Same design variables, one plot per case (paged PDF)
+# ------------------------------------------------------------------
+dv_case_dir = os.path.join(out_dir if os.path.isdir(out_dir) else ".", "dv_case_plots")
+
+plot_design_variables_case_by_case(
+    X=X,
+    xlower=dv_xlower,
+    xupper=dv_xupper,
+    var_names=dv_names,
+    Y=Y,
+    y_label=variable_name,
+    fail_mask=fail_mask,
+    baseline_idx=0,
+    out_dir=dv_case_dir,
+    save_prefix="dv_case",
+    combine_pdf=True,
 )
 
 

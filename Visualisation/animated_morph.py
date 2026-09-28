@@ -57,11 +57,15 @@ def add_slider_safe(plotter: pv.Plotter, **kwargs):
 def set_camera_from_paraview(pl: pv.Plotter):
     """Hard-coded camera copied from ParaView (edit as needed)."""
     pos   = (7238.4, 2356.68, 4036.5)
+    #pos = (51.9, 162.54, 82.247)
     focal = (6160.7,  964.62, 26.20)
+    #focal = (59.2, 56.596, -7.136)
     up    = (-0.0645, -0.937, 0.343)
+    #up = (0.0, -0.645, 0.7643)
     
     pl.camera_position = (pos, focal, up)
-    #pl.camera.zoom(9)
+    pl.camera.zoom(9)
+    pl.reset_camera()
     
     try:
         pl.camera.view_angle = 30
@@ -86,6 +90,15 @@ def frame_camera_on_mesh(plotter: pv.Plotter, mesh: pv.PolyData, view="isometric
     else:  # isometric-ish
         plotter.camera_position = (center + np.array([dist, dist, dist]), center, (0, 0, 1))
 
+    plotter.reset_camera()
+    
+    plotter.camera_position = [
+            (51.9, 162.54, 82.247),   # camera position
+            (59.2, 56.596, -7.136),     # focus point
+            (0.0, -0.645, 0.7643),     # view-up vector
+        ]
+    
+    plotter.camera.zoom(9)
     plotter.reset_camera()
 
 
@@ -223,7 +236,7 @@ def animate_fro_morph_surface(
     base_opacity=0.12,
     morph_opacity=1.0,
     show_edges=True,
-    deform_scale=1.0,
+    deform_scale=8.0,
     color_by_displacement=True,
 ):
     f0 = FroFile.fromFile(fro0_path)
@@ -253,7 +266,7 @@ def animate_fro_morph_surface(
 
     if color_by_displacement:
         morph_mesh["disp_mag"] = disp_mag  # global-sized; matches global point array
-        pl.add_mesh(morph_mesh, scalars="disp_mag", cmap="jet", opacity=morph_opacity, show_edges=False)
+        pl.add_mesh(morph_mesh, scalars="disp_mag", cmap="viridis", opacity=morph_opacity, show_edges=False)
     else:
         pl.add_mesh(morph_mesh, opacity=morph_opacity, show_edges=show_edges)
 
@@ -261,7 +274,7 @@ def animate_fro_morph_surface(
                 position="upper_left", font_size=12, color="black")
 
     set_camera_from_paraview(pl)
-    pl.reset_camera()
+    #pl.reset_camera()
 
     if out_path.lower().endswith(".gif"):
         pl.open_gif(out_path, fps=fps)
@@ -400,7 +413,7 @@ def animate_fro_morph_surface_both(
     base_opacity=0.12,
     morph_opacity=1.0,
     show_edges=True,
-    deform_scale=2.0,
+    deform_scale=8.0,
     color_by_displacement=True,
     save_mp4=True, save_gif=True,
 ):
@@ -456,7 +469,7 @@ def export_morph_series_multiblock(
     out_dir,
     base_name="morph",
     n_frames=60,
-    deform_scale=1.0,
+    deform_scale=8.0,
     file_ext="vtm",
 ):
     """Export a ParaView-friendly time-series as MULTIBLOCK files (.vtm).
@@ -533,7 +546,7 @@ def interactive_fro_morph_surface(
     fro0_path,
     fro1_path,
     surface_id,
-    deform_scale=1.0,
+    deform_scale=8.0,
     show_edges=True,
     color_by_displacement=True,
     show=True,
@@ -612,14 +625,14 @@ if __name__ == "__main__":
     from pathlib import Path
     
     folder = [
-        "param3"
+        "sphere_prelim"
     ]
 
     x_case = 1
-    gen = "0"
-    filename = "corner"
+    gen = "0p"
+    filename = "sphere"
     ##
-    for x_case in range(1,5):
+    for x_case in range(1,11):
         base = Path(r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples")
         case_root = base / folder[0]
 

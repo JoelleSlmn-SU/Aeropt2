@@ -1122,95 +1122,13 @@ class MainWindow(QMainWindow):
                 return ""
     
 
-        # 1) Build local JSON from mesh viewer state
-        basis_cfg = {
-            "control_nodes": mv.control_nodes.tolist(),
-            "control_normals": getattr(mv, "control_normals", None).tolist()
-                if getattr(mv, "control_normals", None) is not None else None,
-
-            "parameterisation_method": getattr(mv, "parameterisation_method", "modal"),
-            "direct_parameterisation_subtype": getattr(mv, "direct_parameterisation_subtype", None),
-
-            "selection_mode": getattr(mv, "control_node_selection_mode", None),
-            "loaded_control_nodes_path": getattr(mv, "loaded_control_nodes_path", None),
-            "loaded_control_normals_path": getattr(mv, "loaded_control_normals_path", None),
-
-            "t_patch_scale": getattr(mv, "t_patch_scale", None),
-            "amp_alpha": getattr(mv, "amp_alpha", 0.001),
-
-            "TSurfaces": getattr(mv, "TSurfaces", []),
-            "USurfaces": getattr(mv, "USurfaces", []),
-            "CSurfaces": getattr(mv, "CSurfaces", []),
-            
-            # preliminary response-surface / regional screening metadata
-            "prelim_enabled": bool(getattr(mv, "prelim_enabled", False)),
-            "prelim_regions": int(getattr(mv, "prelim_regions", 1) or 1),
-            "prelim_final_control_nodes": int(getattr(mv, "prelim_final_control_nodes", 0) or 0),
-            "prelim_keep_fraction": float(getattr(mv, "prelim_keep_fraction", 0.67) or 0.67),
-            "prelim_doe_amplitude": float(getattr(mv, "prelim_doe_amplitude", 1.0) or 1.0),
-            "prelim_morris_trajectories": int(getattr(mv, "prelim_morris_trajectories", 6) or 6),
-            "prelim_morris_levels": int(getattr(mv, "prelim_morris_levels", 4) or 4),
-            "t_surface_points": (
-                np.asarray(getattr(mv, "points", []), dtype=float).reshape((-1, 3)).tolist()
-                if np.asarray(getattr(mv, "points", [])).size else None
-            ),
-
-            "point_region_ids": (
-                getattr(mv, "point_region_ids", None).tolist()
-                if getattr(mv, "point_region_ids", None) is not None else None
-            ),
-            "control_node_region_ids": (
-                getattr(mv, "control_node_region_ids", None).tolist()
-                if getattr(mv, "control_node_region_ids", None) is not None else None
-            ),
-            "region_centres": (
-                getattr(mv, "region_centres", None).tolist()
-                if getattr(mv, "region_centres", None) is not None else None
-            ),
-            "control_node_point_indices": (
-                getattr(mv, "control_node_point_indices", None).tolist()
-                if getattr(mv, "control_node_point_indices", None) is not None else None
-            ),
-
-            "k_modes": getattr(mv, "k_modes", 0),
-            "spectral_p": getattr(mv, "spectral_p", None),
-            "coeff_frac": getattr(mv, "coeff_frac", None),
-            "seed": getattr(mv, "seed", 0),
-
-            "normal_project": getattr(mv, "normal_project", None),
-            "vector_mode": getattr(mv, "vector_mode", None),
-            "frame_knn": getattr(mv, "frame_knn", None),
-
-            "use_local_modes": getattr(mv, "use_local_modes", False),
-            "global_modes": getattr(mv, "global_modes_selected", False),
-            "global_only": getattr(mv, "global_only", False),
-            "global_mode_config": getattr(mv, "global_mode_config", []),
-            "basis_axes": getattr(mv, "basis_axes", None),
-
-            "use_pca": getattr(mv, "use_pca", False),
-            "pca_cache_path": getattr(mv, "pca_cache_path", None),
-            "pca_train_M": getattr(mv, "pca_train_M", None),
-            "pca_energy": getattr(mv, "pca_energy", None),
-            "pca_k_red": getattr(mv, "pca_k_red", None),
-            "pca_k_final": getattr(mv, "pca_k_final", None),
-
-            "bump_enable": getattr(mv, "bump_enable", False),
-            "bump_center": getattr(mv, "bump_center", None),
-            "bump_radius": getattr(mv, "bump_radius", None),
-            "bump_one_sided": getattr(mv, "bump_one_sided", False),
-            
-            "use_protection": bool(
-                getattr(mv, "use_protection", bool(getattr(mv, "protected_control_nodes", [])))
-            ),
-            "protected_control_nodes": [int(i) for i in getattr(mv, "protected_control_nodes", [])],
-            "protection_radius": (
-                float(getattr(mv, "protection_radius", 0.0))
-                if getattr(mv, "protection_radius", None) is not None
-                else None
-            ),
-
-            "rigid_translation": getattr(mv, "rigid_boundary_translation", True),
-        }
+        # 1) Build local JSON from mesh viewer state (shared with the modal
+        #    explorer and save_controlnodes - see GUI/morph_basis_builder.py)
+        try:
+            from GUI.morph_basis_builder import build_morph_basis
+        except ImportError:
+            from morph_basis_builder import build_morph_basis
+        basis_cfg = build_morph_basis(mv)
 
         local_tmp = tempfile.mkdtemp()
         local_basis = os.path.join(local_tmp, "morph_basis.json")

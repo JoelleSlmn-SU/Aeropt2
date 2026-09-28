@@ -13,11 +13,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import os, sys
-sys.path.append(os.path.dirname("MeshGeneration"))
+sys.path.append(os.path.dirname("ShapeParameterization"))
 
-from MeshGeneration.modalBasis import build_laplacian_basis, expand_modal_coeffs
-from MeshGeneration.controlNodeDisp import estimate_normals
-from MeshGeneration.pcaBasis import load_pca_basis, reconstruct_disp_flat  # PCABasis cache
+from ShapeParameterization.modalBasis import build_laplacian_basis, expand_modal_coeffs
+from ShapeParameterization.controlNodeDisp import estimate_normals
+from ShapeParameterization.pcaBasis import load_pca_basis, reconstruct_disp_flat  # PCABasis cache
 
 def plot_quiver(control_nodes, disp, out_png, title="", scale=1.0, stride=1):
     """

@@ -33,6 +33,7 @@ else:
     sys.path.insert(0, script_dir)
 
 from ShapeParameterization.controlNodeDisp import estimate_normals, getDisplacements
+from ShapeParameterization.designDisplacement import control_displacements_from_basis
 
 class Batchfile:
     def __init__(self, name: str):
@@ -658,7 +659,6 @@ class ClusterPipelineManager:
                     basis = json.load(bf)
 
                 cn = np.asarray(basis["control_nodes"], float)
-                cn_normals = np.asarray(basis["control_normals"], float)
                 t_surfaces = basis["TSurfaces"]
                 if cn.size > 0:
                     cn = cn.reshape((-1, 3))
@@ -667,187 +667,17 @@ class ClusterPipelineManager:
                     t_surfaces = list(map(int, basis.get("TSurfaces", [])))
                     u_surfaces = list(map(int, basis.get("USurfaces", [])))
                     c_surfaces = list(map(int, basis.get("CSurfaces", [])))
-                    
-                                        # -----------------------------
-                    # top-level parameterisation info
-                    # -----------------------------
-                    parameterisation_method = str(
-                        basis.get("parameterisation_method", "modal")
-                    ).strip().lower()
 
-                    direct_subtype = basis.get("direct_parameterisation_subtype", None)
-
-                    use_pca = bool(basis.get("use_pca", False))
-                    pca_cache_path = basis.get("pca_cache_path", None)
-
-                    normal_project = bool(basis.get("normal_project", True))
-                    vector_mode = str(basis.get("vector_mode", "local_frame"))
-                    frame_knn = basis.get("frame_knn", 12)
-
-                    global_modes = bool(basis.get("global_modes", False))
-                    global_mode_config = basis.get("global_mode_config", [])
-                    basis_axes = basis.get("basis_axes", None)
-
-                    use_local_modes = bool(basis.get("use_local_modes", True))
-                    global_only = bool(basis.get("global_only", False))
-                    if global_only:
-                        use_local_modes = False
-
-                    k = int(basis.get("k_modes", 5))
-                    # design coeffs (from BO / optimiser)
-                    coeffs = np.asarray(
-                        [] if self.modal_coeffs is None else self.modal_coeffs,
-                        dtype=float
-                    ).reshape(-1)
-
-                    self._log(
-                        f"[PIPELINE] gen={self.gen} n={self.n} "
-                        f"param={parameterisation_method} "
-                        f"use_pca={use_pca} coeffs_len={int(coeffs.size)}"
+                    # Design vector -> control-node displacement.
+                    # Shared with GUI/modal_explorer_gui.py (designDisplacement.py)
+                    # so the explorer interprets coefficients identically.
+                    d_ctrl = control_displacements_from_basis(
+                        self.remote_output,
+                        basis,
+                        self.modal_coeffs,
+                        log=self._log,
+                        tag=f"gen={self.gen} n={self.n}",
                     )
-                    
-                    use_protection = bool(basis.get("use_protection", False))
-                    protected_nodes = [int(i) for i in basis.get("protected_control_nodes", [])]
-                    protection_radius = basis.get("protection_radius", None)
-
-                    if protection_radius is not None:
-                        protection_radius = float(protection_radius)
-
-                    if not use_protection:
-                        protected_nodes = []
-                        protection_radius = None
-
-                    # -------------------------------------------------
-                    # DIRECT PARAMETERISATION
-                    # -------------------------------------------------
-                    if parameterisation_method == "direct":
-                        subtype = str(direct_subtype or "").strip().lower()
-
-                        if subtype == "xyz":
-                            expected_len = 3 * len(cn)
-                        elif subtype == "normal":
-                            expected_len = len(cn)
-                        else:
-                            raise RuntimeError(
-                                f"Unknown direct_parameterisation_subtype: {direct_subtype}"
-                            )
-
-                        if coeffs.size < expected_len:
-                            coeffs = np.pad(coeffs, (0, expected_len - coeffs.size))
-                        elif coeffs.size > expected_len:
-                            coeffs = coeffs[:expected_len]
-
-                        d_ctrl = getDisplacements(
-                            self.remote_output,
-                            control_nodes=cn,
-                            normals=cn_normals,
-                            coeffs=coeffs,
-                            t_patch_scale=basis.get("t_patch_scale", None),
-                            amp_alpha=float(basis.get("amp_alpha", 0.005)),
-                            parameterisation_method="direct",
-                            direct_parameterisation_subtype=subtype,
-                            protected_nodes=protected_nodes,
-                            radius=protection_radius,
-                        )
-
-                    # -------------------------------------------------
-                    # PCA-REDUCED MODAL PARAMETERISATION
-                    # -------------------------------------------------
-                    elif use_pca:
-                        if not pca_cache_path:
-                            raise RuntimeError(
-                                "use_pca=True but no pca_cache_path provided in morph_basis.json"
-                            )
-
-                        # try to size from morph_basis first, otherwise pass through
-                        pca_k_final = basis.get("pca_k_final", None)
-                        if pca_k_final is not None:
-                            pca_k_final = int(pca_k_final)
-                            if coeffs.size < pca_k_final:
-                                coeffs = np.pad(coeffs, (0, pca_k_final - coeffs.size))
-                            elif coeffs.size > pca_k_final:
-                                coeffs = coeffs[:pca_k_final]
-
-                        d_ctrl = getDisplacements(
-                            self.remote_output,
-                            control_nodes=cn,
-                            normals=cn_normals,
-                            use_pca=True,
-                            pca_cache_path=pca_cache_path,
-                            pca_coeffs=coeffs,
-                            normal_project=normal_project,
-                            t_patch_scale=basis.get("t_patch_scale", None),
-                            amp_alpha=float(basis.get("amp_alpha", 0.005)),
-                            vector_mode=vector_mode,
-                            frame_knn=frame_knn,
-                            global_modes=global_modes,
-                            global_mode_config=global_mode_config,
-                            basis_axes=basis_axes,
-                            use_local_modes=use_local_modes,
-                            global_only=global_only,
-                            protected_nodes=protected_nodes,
-                            radius=protection_radius,
-                        )
-
-                    # -------------------------------------------------
-                    # STANDARD MODAL PARAMETERISATION
-                    # -------------------------------------------------
-                    else:
-                        n_global = (
-                            len(global_mode_config)
-                            if global_modes and global_mode_config
-                            else (8 if global_modes else 0)
-                        )
-
-                        if use_local_modes:
-                            if normal_project:
-                                valid_local = (k,)
-                                default_local = k
-                            else:
-                                if vector_mode == "xyz":
-                                    valid_local = (3 * k,)
-                                    default_local = 3 * k
-                                else:
-                                    valid_local = (k, 2 * k, 3 * k)
-                                    default_local = 3 * k
-                        else:
-                            valid_local = (0,)
-                            default_local = 0
-
-                        valid_full = tuple(n_global + v for v in valid_local)
-                        if coeffs.size in valid_local or coeffs.size in valid_full:
-                            expected_len = int(coeffs.size)
-                        else:
-                            expected_len = n_global + default_local
-
-                        if coeffs.size < expected_len:
-                            coeffs = np.pad(coeffs, (0, expected_len - coeffs.size))
-                        elif coeffs.size > expected_len:
-                            coeffs = coeffs[:expected_len]
-
-                        d_ctrl = getDisplacements(
-                            self.remote_output,
-                            seed=int(basis.get("seed", 0)),
-                            control_nodes=cn,
-                            normals=cn_normals,
-                            coeffs=coeffs,
-                            k_modes=k,
-                            normal_project=normal_project,
-                            t_patch_scale=basis.get("t_patch_scale", None),
-                            amp_alpha=float(basis.get("amp_alpha", 0.005)),
-                            vector_mode=vector_mode,
-                            frame_knn=frame_knn,
-                            global_modes=global_modes,
-                            global_mode_config=global_mode_config,
-                            basis_axes=basis_axes,
-                            parameterisation_method="modal",
-                            use_local_modes=use_local_modes,
-                            global_only=global_only,
-                            protected_nodes=protected_nodes,
-                            radius=protection_radius,
-                        )
-
-                    d_ctrl = np.asarray(d_ctrl, dtype=float)
                 else:
                     self._log("[PIPELINE] morph_basis_json has no control_nodes; leaving morph zero.")
             except Exception as e:

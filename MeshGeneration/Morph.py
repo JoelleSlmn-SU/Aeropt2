@@ -124,101 +124,15 @@ def dedup_sf(S, F, tol=1e-6):
     uniq_idx = np.sort(uniq_idx)
     return S[uniq_idx], F[uniq_idx]
 
-def compute_adaptive_rbf_params(control_nodes, d_verts, anchor_points=None,
-                                k_nn=3,
-                                beta=1.0,
-                                min_clip_frac=0.01,
-                                max_clip_frac=0.15):
-    """
-    Returns:
-        min_R_frac, fallback_R_frac, R_scale
-
-    Idea:
-      - Use kNN spacing between control nodes as the main locality measure
-      - Convert to fractions of the T/U patch scale L
-      - Keep R_scale as the main global multiplier knob
-    """
-    ctrl = np.asarray(control_nodes, dtype=float)
-    T = np.asarray(d_verts, dtype=float)
-
-    if ctrl.ndim != 2 or ctrl.shape[1] != 3:
-        raise ValueError(f"control_nodes must be (N,3), got {ctrl.shape}")
-    if T.ndim != 2 or T.shape[1] != 3:
-        raise ValueError(f"d_verts must be (M,3), got {T.shape}")
-
-    # Patch scale used by transformT internally as well
-    mins = T.min(axis=0)
-    maxs = T.max(axis=0)
-    L = float(np.linalg.norm(maxs - mins))
-    L = max(L, 1e-12)
-
-    n_ctrl = ctrl.shape[0]
-
-    # ---- one-control special case ----
-    if n_ctrl == 1:
-        if anchor_points is not None and len(anchor_points) > 0:
-            A = np.asarray(anchor_points, dtype=float).reshape(-1, 3)
-            da = np.linalg.norm(A - ctrl[0][None, :], axis=1)
-            d_ref = float(np.median(da)) if da.size else 0.05 * L
-        else:
-            d_ref = 0.05 * L
-
-        d_ref = float(np.clip(d_ref, min_clip_frac * L, max_clip_frac * L))
-        min_R_frac = d_ref / L
-        fallback_R_frac = d_ref / L
-        R_scale = beta
-        return min_R_frac, fallback_R_frac, R_scale
-
-    # ---- control-node kNN spacing ----
-    try:
-        from scipy.spatial import cKDTree
-        tree = cKDTree(ctrl)
-        k_eff = min(max(2, k_nn + 1), n_ctrl)   # +1 because self is included
-        dists, _ = tree.query(ctrl, k=k_eff)
-        # last column = distance to k_nn-th neighbour
-        d_knn = dists[:, -1]
-    except Exception:
-        # fallback brute force
-        diff = ctrl[:, None, :] - ctrl[None, :, :]
-        D = np.linalg.norm(diff, axis=2)
-        np.fill_diagonal(D, np.inf)
-        k_eff = min(max(1, k_nn), n_ctrl - 1)
-        d_knn = np.partition(D, kth=k_eff - 1, axis=1)[:, k_eff - 1]
-
-    d_knn = np.asarray(d_knn, float)
-    d_knn = d_knn[np.isfinite(d_knn)]
-    if d_knn.size == 0:
-        d_knn = np.array([0.05 * L], dtype=float)
-
-    # Robust spacing stats
-    d_p10 = float(np.percentile(d_knn, 10))
-    d_p50 = float(np.percentile(d_knn, 50))
-    d_p90 = float(np.percentile(d_knn, 90))
-
-    # Clip to sensible fractions of patch size
-    d_min = float(np.clip(d_p10, min_clip_frac * L, max_clip_frac * L))
-    d_typ = float(np.clip(d_p50, min_clip_frac * L, max_clip_frac * L))
-    d_max = float(np.clip(d_p90, min_clip_frac * L, max_clip_frac * L))
-
-    # Convert to transformT-style parameters
-    min_R_frac = d_min / L
-    fallback_R_frac = d_typ / L
-
-    # beta is your main locality knob:
-    #   smaller beta -> more local
-    #   larger beta  -> smoother / more global
-    R_scale = float(beta)
-
-    print(
-        "[ADAPT-RBF] "
-        f"L={L:.6f}, "
-        f"d10={d_p10:.6f}, d50={d_p50:.6f}, d90={d_p90:.6f}, "
-        f"min_R_frac={min_R_frac:.6f}, "
-        f"fallback_R_frac={fallback_R_frac:.6f}, "
-        f"R_scale={R_scale:.6f}"
-    )
-
-    return min_R_frac, fallback_R_frac, R_scale
+# compute_adaptive_rbf_params now lives in morphPropagation (shared with the
+# modal explorer). Re-exported here so existing imports keep working.
+from MeshGeneration.morphPropagation import (  # noqa: E402
+    compute_adaptive_rbf_params,
+    classify_regions,
+    rbf_parameters,
+    deform_region,
+    seam_report,
+)
 
 class DummyLogger:
     def log(self, msg):
@@ -230,8 +144,13 @@ def MorphMesh(mesh_in: FroFile, base_name, morph_model, viewer, output_dir,
     Single-region morph:
       D = T ∪ U  (deforming region)
       C          (fixed region)
-      anchors    = D nodes connected to C
-    Deform D directly, with decay-to-zero approaching anchors.
+      anchors    = D nodes shared with / connected to C
+    Deform D directly with a compact Wendland RBF (morphPropagation).
+
+    NOTE: with anchor_taper=False and boundary_recover=False (production flags)
+    the anchors only set the RBF support radius; zero displacement at the seam
+    is NOT enforced. The [SEAM] log line reports how much the seam moved.
+    The GUI modal explorer calls the same morphPropagation functions.
     """
     import os
     import numpy as np
@@ -240,38 +159,32 @@ def MorphMesh(mesh_in: FroFile, base_name, morph_model, viewer, output_dir,
 
     mesh_out = mesh_in.copy()
 
-    # --- convenience sets ---
-    t_gids = set(morph_model.get_t_node_gids(mesh_in))
-    u_gids = set(morph_model.get_u_node_gids(mesh_in))
-    c_gids = set(morph_model.get_c_node_gids(mesh_in))
+    # --- region classification (shared with the modal explorer) ---
+    regions = classify_regions(mesh_in, morph_model)
+    t_gids, u_gids, c_gids = regions.t_gids, regions.u_gids, regions.c_gids
 
     logger.log(f"[CHECK] T surfaces: {morph_model.t_surfaces}")
     logger.log(f"[CHECK] U surfaces: {morph_model.u_surfaces}")
     logger.log(f"[CHECK] count(T_gids)={len(t_gids)}, count(U_gids)={len(u_gids)}, count(C_gids)={len(c_gids)}")
 
+    if getattr(mesh_out, "node_count", None) != getattr(mesh_in, "node_count", None):
+        # FroFile.copy() compacts unreferenced nodes; gids would then no longer
+        # line up between mesh_in and mesh_out.
+        logger.log(
+            f"[WARNING] mesh_out.node_count={getattr(mesh_out, 'node_count', None)} != "
+            f"mesh_in.node_count={getattr(mesh_in, 'node_count', None)} "
+            "(unreferenced nodes in the baseline?) - node ids may be misaligned."
+        )
+
     # STEP 2 - Deform D = T & U
     logger.log("STEP 2 - Translating (D = T ∪ U)")
 
-    # mappings and coords for T and U (needed later to split)
-    t_gtl, t_verts = morph_model.get_t_node_vertices(mesh_in)  # {gid: local}, list of coords
-    u_gtl, u_verts = ({}, [])
-    if len(u_gids) > 0:
-        u_gtl, u_verts = morph_model.get_u_node_vertices(mesh_in)
-
-    # build D (union)
-    d_gids = sorted(t_gids | u_gids)
-    d_gtl, d_verts = mesh_in.convert_node_ids_to_coordinates(d_gids)  # {gid: local}, list coords
-
-    # Get shared points with C subset
-    shared = sorted((t_gids | u_gids) & c_gids)
-    if len(shared) > 0:
-        anchor_gids = shared
-    else:
-        anchor_gids = [
-            g for g in d_gids
-            if any(nb in c_gids for nb in mesh_in.node_connections.get(g, []))
-        ]
-    anchor_points = [mesh_in.nodes[g] for g in anchor_gids]
+    t_gtl, t_verts = regions.t_gtl, regions.t_verts
+    u_gtl, u_verts = regions.u_gtl, regions.u_verts
+    d_gtl = regions.d_gtl
+    d_gids = regions.d_gids
+    anchor_gids = regions.anchor_gids
+    shared = regions.shared
     logger.log(f"[STEP2] |D|={len(d_gids)} anchors(D↔C)={len(anchor_gids)} (shared={len(shared)})")
 
     if len(anchor_gids) == 0:
@@ -279,45 +192,15 @@ def MorphMesh(mesh_in: FroFile, base_name, morph_model, viewer, output_dir,
     if len(anchor_gids) == len(d_gids):
         logger.log("[WARNING] All D nodes are anchored to C. Nothing can move.")
 
-    min_R_frac, fallback_R_frac, R_scale = compute_adaptive_rbf_params(
-        control_nodes=morph_model.control_nodes,
-        d_verts=d_verts,
-        anchor_points=anchor_points,
-        k_nn=3,
-        beta=2.2,        # < 1.0 = more local, > 1.0 = smoother
-        min_clip_frac=0.01,
-        max_clip_frac=0.4,
-    )
-
-    # optional: tighten seam correction a bit too
-    corr_R_frac = max(0.5 * min_R_frac, 0.008)
-    corr_band_frac = max(0.75 * fallback_R_frac, 0.02)
-    
-    if len(morph_model.control_nodes) == 1:
-        min_R_frac = 0.5
-        fallback_R_frac = 0.75
-        R_scale = 2.0
-
-        corr_R_frac = 0.01
-        corr_band_frac = 0.10
-
-    print(
-        "[ADAPT-RBF] "
-        f"corr_R_frac={corr_R_frac:.6f}, "
-        f"corr_band_frac={corr_band_frac:.6f}"
-    )
+    params = rbf_parameters(morph_model.control_nodes, regions.d_verts, regions.anchor_points)
 
     # deform D directly
-    d_verts_m = morph_model.transformT(
-        d_verts,
-        anchor_points=anchor_points,
-        min_R_frac=min_R_frac,
-        fallback_R_frac=fallback_R_frac,
-        R_scale=R_scale,
-        anchor_taper=False,
-        boundary_recover=False,
-        corr_R_frac=corr_R_frac,
-        corr_band_frac=corr_band_frac,
+    d_verts_m = deform_region(morph_model, regions, params)
+
+    sr = seam_report(regions, d_verts_m)
+    logger.log(
+        f"[SEAM] max|u| D={sr['d_max']:.6e}, max|u| anchors={sr['seam_max']:.6e} "
+        f"(ratio={sr['seam_ratio']:.3f}, n_anchor={sr['n_anchor']}, n_shared={sr['n_shared']})"
     )
 
     # split D back into T and U using the gid→local maps

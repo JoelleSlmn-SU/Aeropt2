@@ -1215,6 +1215,33 @@ class MeshViewer(QWidget):
         # keep the point cloud available for all branches, including loaded CNs
         self.points = np.asarray(t_mesh.points, float)
 
+        # --- Build/save preview PolyData from U surface NAMES ---
+        # U is the "unconstrained" bucket, but in the actual morph pipeline
+        # (runSimLocal.py / runSimRemote.py) it is pinned to zero displacement
+        # exactly like C, so it's a valid fixed context surface to display
+        # alongside the deforming T surface in the modal explorer.
+        u_mesh = None
+        for nm in getattr(self, "U_names", []):
+            surf = self.mesh_obj.get_surface_mesh(nm)
+            if surf is None or surf.n_cells == 0:
+                continue
+            u_mesh = surf.copy() if u_mesh is None else u_mesh.merge(surf)
+
+        self.u_mesh_path = None
+        if u_mesh is not None and u_mesh.n_cells > 0:
+            u_mesh = u_mesh.extract_surface().triangulate().clean()
+            u_output_path = os.path.join(self.output_dir, "surfaces", "output_U.vtk")
+            os.makedirs(os.path.dirname(u_output_path), exist_ok=True)
+            u_mesh.save(u_output_path)
+            self.u_mesh_path = u_output_path
+            self.log(
+                f"[INFO] Saved U-surface preview mesh ({u_mesh.n_points} points) -> {u_output_path}"
+            )
+        else:
+            self.log(
+                "[INFO] No U-surface cells available; modal explorer will show T only."
+            )
+
         if mode == "auto":
             if getattr(self, "prelim_enabled", False):
                 self.prelim_select_control_nodes(output_path, self.prelim_regions)
@@ -1525,7 +1552,13 @@ class MeshViewer(QWidget):
         self.main_layout.addWidget(self.save_btn)
         
         self.modal_explorer_btn = QPushButton("Explore Modal Coefficients")
-        self.modal_explorer_btn.setEnabled(False)
+        # Control nodes (and, for the modal family, the parameter widgets below)
+        # already exist at this point - CN selection runs before this form is
+        # built - so the preview no longer waits for "Save Control Nodes / Basis".
+        # Save just persists the same values this button already previews live.
+        self.modal_explorer_btn.setEnabled(
+            self.parameterisation_method == "modal" and self.control_nodes is not None
+        )
         self.modal_explorer_btn.clicked.connect(self.open_modal_explorer)
         self.main_layout.addWidget(self.modal_explorer_btn)
         
@@ -1546,61 +1579,68 @@ class MeshViewer(QWidget):
             self.log(f"[ERROR] Could not go back: {e}")
             
     
+    def _explorer_basis_and_checks(self):
+        """morph_basis dict for the explorer + list of blocking problems."""
+        try:
+            from GUI.morph_basis_builder import build_morph_basis, live_overlay
+        except ImportError:
+            from morph_basis_builder import build_morph_basis, live_overlay
+
+        # Same values save_controlnodes() would commit from the on-screen form,
+        # so the explorer can be opened before "Save Control Nodes / Basis".
+        basis = build_morph_basis(live_overlay(self))
+
+        problems = []
+        if not basis["TSurfaces"]:
+            problems.append("No T surfaces selected.")
+        if not basis["CSurfaces"]:
+            self.log("[MODAL][WARN] No C surfaces selected: MorphModel falls back to "
+                     "'everything not T/U, excluding farfield'.")
+        baseline = getattr(self, "input_filepath", None)
+        if not baseline or not os.path.exists(baseline):
+            problems.append(f"Baseline mesh not found: {baseline}")
+        if not getattr(self, "output_dir", None):
+            problems.append("Output directory not set.")
+        elif not os.path.exists(os.path.join(self.output_dir, "surfaces", "output.vtk")):
+            problems.append("surfaces/output.vtk missing (select T surfaces / control nodes first).")
+        return basis, baseline, problems
+
     def open_modal_explorer(self):
         if getattr(self, "parameterisation_method", None) != "modal":
             self.log("[MODAL] Modal explorer is only available for modal parameterisation.")
             return
-
         if getattr(self, "control_nodes", None) is None:
-            self.log("[MODAL][ERROR] Save control nodes first.")
+            self.log("[MODAL][ERROR] Select control nodes first.")
             return
-
         if getattr(self, "control_normals", None) is None:
             self.log("[MODAL][ERROR] Control normals are missing.")
             return
 
-        mesh_path = os.path.join(self.output_dir, "surfaces", "output.vtk")
-        if not os.path.exists(mesh_path):
-            self.log(f"[MODAL][ERROR] Could not find T-surface preview mesh: {mesh_path}")
+        try:
+            basis, baseline, problems = self._explorer_basis_and_checks()
+        except Exception as e:
+            self.log(f"[MODAL][ERROR] Could not assemble morph basis: {e}")
+            return
+        if problems:
+            for p in problems:
+                self.log(f"[MODAL][ERROR] {p}")
             return
 
         from GUI.modal_explorer_gui import ModalSliderExplorer, ModalState
 
         state = ModalState(
-            mesh_path=mesh_path,
-            control_nodes=np.asarray(self.control_nodes, float),
-            control_normals=np.asarray(self.control_normals, float),
-            output_dir=getattr(self, "output_dir", None),
-
-            k_modes=int(getattr(self, "k_modes", 5)),
-            knn=int(getattr(self, "frame_knn", 12)),
-            seed=int(getattr(self, "seed", 0)),
-
-            amp_alpha=float(getattr(self, "amp_alpha", 0.005)),
-            t_patch_scale=getattr(self, "t_patch_scale", None),
-            normal_project=bool(getattr(self, "normal_project", True)),
-            vector_mode=str(getattr(self, "vector_mode", "local_frame")),
-            frame_knn=int(getattr(self, "frame_knn", 12)),
-
-            global_modes=bool(getattr(self, "global_modes_selected", False)),
-            global_mode_config=getattr(self, "global_mode_config", []),
-
+            basis=basis,                      # exactly what the optimiser will be given
+            baseline_mesh_path=baseline,      # same mesh remoteMorph.py converts
+            output_dir=self.output_dir,       # holds Control Nodes/modal_basis_T_surface.npz
             deform_scale=10.0,
-            rbf_kernel="thin_plate_spline",
-            rbf_smoothing=1e-8,
-            
-            graph_method=getattr(self, "graph_method", "mutual_knn"),
-            delaunay_cutoff_factor=float(getattr(self, "delaunay_cutoff_factor", 2.5)),
-
-            use_protection=bool(getattr(self, "use_protection", False)),
-            protected_control_nodes=getattr(self, "protected_control_nodes", []),
-            protection_radius=getattr(self, "protection_radius", None),
         )
-
         self.modal_explorer_window = ModalSliderExplorer(initial=state)
         self.modal_explorer_window.show()
-
-        self.log("[MODAL] Opened modal coefficient explorer.")
+        self.log(
+            f"[MODAL] Opened modal explorer: T={basis['TSurfaces']} U={basis['USurfaces']} "
+            f"C={basis['CSurfaces']} k={basis['k_modes']} amp_alpha={basis['amp_alpha']} "
+            f"baseline={os.path.basename(baseline)}"
+        )
 
     def save_controlnodes(self):
 
@@ -1674,7 +1714,14 @@ class MeshViewer(QWidget):
             self.coeff_frac = float(getattr(self, "coeff_frac", 0.15))
             self.seed = int(getattr(self, "seed", 0))
             self.vector_mode = str(getattr(self, "vector_mode", "local_frame"))
-            self.frame_knn = int(getattr(self, "frame_knn", 16))
+            # NOTE: was defaulting to 16 here vs. 12 everywhere else frame_knn
+            # is defaulted (open_modal_explorer, build_t_surface_modal_cache).
+            # Harmless as long as the "Advanced modal settings" dialog was
+            # opened at least once (it sets self.frame_knn explicitly either
+            # way), but silently changed the basis between the live preview and
+            # the saved cache for anyone who never touched that dialog. Aligned
+            # to 12 to match the rest of the pipeline.
+            self.frame_knn = int(getattr(self, "frame_knn", 12))
             self.use_local_modes = bool(getattr(self, "use_local_modes", True))
             self.global_modes_selected = bool(getattr(self, "global_modes_selected", False))
             self.global_only = bool(getattr(self, "global_only", False))
@@ -1815,7 +1862,24 @@ class MeshViewer(QWidget):
             self.modal_cache_path = modal_cache_path
             meta["modal_cache_path"] = modal_cache_path
             self.log(f"[MODAL] Saved T-surface modal cache -> {modal_cache_path}")
-            
+
+        # Persist the full morph_basis (same dict the optimiser uploads) next to
+        # the cache, plus the baseline mesh path, so the modal explorer can be
+        # reopened standalone from disk.
+        try:
+            try:
+                from GUI.morph_basis_builder import build_morph_basis
+            except ImportError:
+                from morph_basis_builder import build_morph_basis
+            basis_local = build_morph_basis(self)
+            basis_local["baseline_mesh_path"] = getattr(self, "input_filepath", None)
+            basis_path = os.path.join(self.output_dir, "Control Nodes", "morph_basis.json")
+            with open(basis_path, "w", encoding="utf-8") as f:
+                json.dump(basis_local, f, indent=2)
+            self.log(f"[INFO] Saved morph basis -> {basis_path}")
+        except Exception as e:
+            self.log(f"[WARN] Failed to save morph_basis.json: {e}")
+
         self.control_ready.emit()
         
     @pyqtSlot()
