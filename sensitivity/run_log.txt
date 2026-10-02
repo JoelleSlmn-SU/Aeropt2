@@ -1,0 +1,19 @@
+[14:26:03] === run_surface_sensitivity  doe=C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2
+[14:26:03] building designs.csv ...
+[14:26:04] from-doe FAILED - see C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\sensitivity\from_doe.log
+  File "C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\venv\Lib\site-packages\pandas\core\frame.py", line 12884, in merge
+    return merge(
+           ^^^^^^
+  File "C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\venv\Lib\site-packages\pandas\core\reshape\merge.py", line 385, in merge
+    op = _MergeOperation(
+         ^^^^^^^^^^^^^^^^
+  File "C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\venv\Lib\site-packages\pandas\core\reshape\merge.py", line 1018, in __init__
+    ) = self._get_merge_keys()
+        ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\venv\Lib\site-packages\pandas\core\reshape\merge.py", line 1633, in _get_merge_keys
+    left_keys.append(left._get_label_or_level_values(lk))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\venv\Lib\site-packages\pandas\core\generic.py", line 1776, in _get_label_or_level_values
+    raise KeyError(key)
+KeyError: 'design_id'
+

@@ -372,11 +372,25 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    def _is_2d_case(self) -> bool:
+        mv = getattr(self, "mesh_viewer", None)
+        return int(getattr(mv, "mesh_dim", 3) or 3) == 2
+
     def _stage_before_hpc_run(self, action_name="run") -> bool:
         """
         Refresh remote orig/ from the latest local files immediately before
         submitting an HPC action.
         """
+        if self._is_2d_case():
+            # The 3D chain (Surf3D/Mesh3D/3D prepro + solver) must not run on a
+            # 2D case. Remove this guard once Remote/pipeline_cluster_2d.py exists.
+            self.logger.log(
+                f"[{action_name}][2D][ERROR] 2D cases cannot run {action_name} yet: the 2D cluster "
+                "pipeline (pipeline_cluster_2d) and 2D executables are not set up. "
+                "Use 'Explore Edge Modes' to morph and export 2D meshes locally."
+            )
+            return False
+
         if getattr(self, "run_mode", "") != "HPC":
             return True
 
@@ -480,7 +494,7 @@ class MainWindow(QMainWindow):
             self,
             "Open File",
             "",
-            "EnSight Case (*.case);;VTM Files (*.vtm);;VTK Files (*.vtk);;All Files (*);; CAD Files (*.step *.stp *.iges *.igs)"
+            "EnSight Case (*.case);;VTM Files (*.vtm);;VTK Files (*.vtk);;2D FLITE mesh (*.fro);;All Files (*);; CAD Files (*.step *.stp *.iges *.igs)"
         )
         if not filename:
             return
@@ -501,11 +515,16 @@ class MainWindow(QMainWindow):
             self.geo_viewer.load_cad(filename)
             self.geo_viewer.set_input_filepath(self.input_file_path)
             self.logger.log("[INFO] Routed CAD to Geometry panel.")
-        elif ext in (".case", ".vtk", ".vtm"):
+        elif ext in (".case", ".vtk", ".vtm", ".fro"):
             self.display_stack.setCurrentIndex(self.IDX_MESH)
-            self.mesh_viewer.load_mesh_file(self.input_file_path)
+            try:
+                self.mesh_viewer.load_mesh_file(self.input_file_path)
+            except Exception as e:
+                self.logger.log(f"[ERROR] Could not load mesh '{self.input_filename}': {e}")
+                return
             self.mesh_viewer.set_input_filepath(self.input_file_path)
-            self.logger.log("[INFO] Mesh loaded into Mesh viewer.")
+            dim = int(getattr(self.mesh_viewer, "mesh_dim", 3) or 3)
+            self.logger.log(f"[INFO] Mesh loaded into Mesh viewer ({dim}D).")
         else:
             self.logger.log(f"[WARN] Unsupported file type: {ext}.")
         
@@ -980,6 +999,10 @@ class MainWindow(QMainWindow):
             self.logger.log("[SIM][ERROR] Still no conditions. Aborting.")
             return
         
+        if self._is_2d_case():
+            self._stage_before_hpc_run("SIM")   # logs why 2D cannot run yet
+            return
+
         if getattr(self, "run_mode", "") == "HPC":
             if not self._stage_before_hpc_run("SIM"):
                 return
@@ -1052,6 +1075,7 @@ class MainWindow(QMainWindow):
             )
 
         existing = {monitor_key(m) for m in self.monitor_config["monitors"]}
+        by_key = {monitor_key(m): m for m in self.monitor_config["monitors"]}
 
         for term in terms:
             source = str(term.get("source", "auto")).lower()
@@ -1084,6 +1108,19 @@ class MainWindow(QMainWindow):
             if k not in existing:
                 self.monitor_config["monitors"].append(mon)
                 existing.add(k)
+                by_key[k] = mon
+            else:
+                # Keep an auto-created monitor's name in step with the term's
+                # symbol (e.g. after renaming PR -> PR_s111). Monitors the user
+                # created by hand in the Monitor Editor (no "objective_symbol")
+                # are left untouched.
+                old = by_key[k]
+                if "objective_symbol" in old and old.get("name") != mon["name"]:
+                    self.logger.log(f"[MON] Renaming monitor '{old.get('name')}' -> '{mon['name']}' "
+                                    f"to match objective symbol")
+                    old["name"] = mon["name"]
+                    old["objective_symbol"] = mon["objective_symbol"]
+                old["reduction"] = mon["reduction"]
 
         return self.monitor_config
         
@@ -1989,6 +2026,15 @@ class MainWindow(QMainWindow):
         parameterisation_method = str(
             getattr(mv, "parameterisation_method", "modal")
         ).strip().lower()
+
+        # --------------------------------------------------
+        # 2D EDGE LAPLACIAN MODES
+        # bounds = bound_frac x mesh-validity limit of each mode
+        # --------------------------------------------------
+        if parameterisation_method == "edge_modes_2d":
+            for k, (lb, ub) in enumerate(getattr(mv, "edge_mode_bounds", None) or []):
+                info.append({"name": f"Edge mode {k+1}", "lb": float(lb), "ub": float(ub)})
+            return info
 
         # --------------------------------------------------
         # DIRECT CONTROL-NODE PARAMETERISATION
@@ -3070,6 +3116,63 @@ class ObjectiveEditor(QDialog):
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
+        # Surface IDs are typed into a plain cell, so the symbol must also be
+        # refreshed when that cell changes (previously only a Metric change
+        # did it -> symbol "PR" stayed while surfaces were "111").
+        self.term_table.itemChanged.connect(self._on_term_item_changed)
+
+        # Re-opening the editor used to reset everything to the Drag defaults
+        # and drop the saved terms/constraints. Load the current config.
+        self._load_config(getattr(parent, "objective_config", None))
+
+    def _load_config(self, cfg):
+        if not cfg or not cfg.get("terms"):
+            return
+        self.term_table.setRowCount(0)
+        for t in cfg.get("terms", []):
+            self._add_term_row(
+                metric=str(t.get("metric", "CD")),
+                source=str(t.get("source", "auto")),
+                surfaces=",".join(str(x) for x in (t.get("surface_ids") or [])),
+                reduction=str(t.get("reduction", "last")),
+                symbol=str(t.get("symbol", "")),
+                weight=str(t.get("weight", 1.0)),
+                direction=str(t.get("direction", "x")),
+                symmetry=str(t.get("symmetry_factor", 1)),
+            )
+        conds = cfg.get("conditions", []) or []
+        if conds:
+            self.table.setRowCount(0)
+            for c in conds:
+                self._add_row(defaults=[
+                    f"{c.get('Altitude', 36000.0):g}", f"{c.get('AoA', 3.0):g}", f"{c.get('Mach', 1.2):g}",
+                    f"{c.get('Re', 6.9e6):g}", str(c.get("TurbModel", 1)), str(c.get("EngineFlow", 2)),
+                    f"{c.get('MassFlow', 1.0):g}", f"{c.get('Weight', 1.0):g}",
+                ])
+        obj_type = cfg.get("objective_type", "Custom Expression")
+        if obj_type in ("Drag", "Lift", "Lift-to-Drag", "Custom Expression"):
+            self.obj_type.setCurrentText(obj_type)   # may overwrite expr via preset...
+        self.custom_expr.setText(str(cfg.get("expression", "")))  # ...so set expr after
+        self.constraints_edit.setPlainText("\n".join(cfg.get("constraints", []) or []))
+
+    def _on_term_item_changed(self, item):
+        if item is None or item.column() != 2:
+            return
+        self._refresh_term_symbol(item.row())
+
+    def _refresh_term_symbol(self, row):
+        metric_cb = self.term_table.cellWidget(row, 0)
+        source_cb = self.term_table.cellWidget(row, 1)
+        if metric_cb is None:
+            return
+        surf_item = self.term_table.item(row, 2)
+        surf_txt = surf_item.text() if surf_item else ""
+        self.term_table.setItem(row, 4, QTableWidgetItem(self._make_symbol(metric_cb.currentText(), surf_txt)))
+        if source_cb is not None and source_cb.currentText() == "auto":
+            source_cb.setCurrentText(
+                "monitor" if self._parse_surface_ids(surf_txt) or metric_cb.currentText() not in ("CD", "CL", "CM", "CL/CD") else "rsd"
+            )
+
     def _combo(self, values, current):
         cb = QComboBox()
         cb.addItems(values)
@@ -3139,10 +3242,11 @@ class ObjectiveEditor(QDialog):
         self.term_table.setCellWidget(row, 7, sym_cb)
 
         def refresh_symbol():
-            surf_txt = self.term_table.item(row, 2).text() if self.term_table.item(row, 2) else ""
-            self.term_table.setItem(row, 4, QTableWidgetItem(self._make_symbol(metric_cb.currentText(), surf_txt)))
-            if source_cb.currentText() == "auto":
-                source_cb.setCurrentText("monitor" if self._parse_surface_ids(surf_txt) or metric_cb.currentText() not in ("CD", "CL", "CM", "CL/CD") else "rsd")
+            # look the row up at call time: the captured `row` goes stale once
+            # an earlier row is removed
+            r = self.term_table.indexAt(metric_cb.pos()).row()
+            if r >= 0:
+                self._refresh_term_symbol(r)
 
         metric_cb.currentTextChanged.connect(lambda _t: refresh_symbol())
 
@@ -3201,18 +3305,19 @@ class ObjectiveEditor(QDialog):
         return terms
 
     def _build_expression_from_terms(self):
-        parts = []
+        expr = ""
         for t in self._term_dicts():
             w = float(t.get("weight", 1.0))
+            if w == 0.0:
+                continue            # e.g. a DC60 term that is only a constraint
             sym = t["symbol"]
-            if w == 1.0:
-                parts.append(sym)
-            elif w == -1.0:
-                parts.append(f"-{sym}")
+            mag = "" if abs(w) == 1.0 else f"{abs(w):g}*"
+            if not expr:
+                expr = f"{'-' if w < 0 else ''}{mag}{sym}"
             else:
-                parts.append(f"{w:g}*{sym}")
+                expr += f" {'-' if w < 0 else '+'} {mag}{sym}"
         self.obj_type.setCurrentText("Custom Expression")
-        self.custom_expr.setText(" + ".join(parts) if parts else "CD")
+        self.custom_expr.setText(expr or "CD")
 
     def _on_preset_changed(self, text):
         presets = {
@@ -3231,7 +3336,96 @@ class ObjectiveEditor(QDialog):
                 return
         if not self.custom_expr.text().strip():
             self._build_expression_from_terms()
+
+        problems, sign_warnings = self._check_expression_and_constraints()
+        if problems:
+            QMessageBox.warning(self, "Objective / constraints", "\n\n".join(problems))
+            return
+        if sign_warnings:
+            ans = QMessageBox.question(
+                self, "Objective direction",
+                "\n\n".join(sign_warnings) + "\n\nBO always MINIMISES the expression. Save anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ans != QMessageBox.Yes:
+                return
         self.accept()
+
+    _RSD_SYMBOLS = {"CL", "CD", "CM", "CL_over_CD"}
+    _EXPR_FUNCS = {"abs", "min", "max", "pow", "sqrt", "log", "exp"}
+    _CONS_RE = r"^(.*?)\s*(<=|>=)\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*$"
+
+    @classmethod
+    def _names_in(cls, expr):
+        import ast, re
+        e = str(expr).strip()
+        m = re.match(r"^\s*(min|max)\s*\(\s*(.*)\s*\)\s*$", e, flags=re.IGNORECASE)
+        if m:
+            e = m.group(2)
+        e = e.replace("CL/CD", "CL_over_CD")
+        tree = ast.parse(e, mode="eval")
+        return {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} - cls._EXPR_FUNCS, e
+
+    def _check_expression_and_constraints(self):
+        """Mirror of remoteOpt's launch check, so mistakes are caught here
+        rather than after the job is submitted. Returns (errors, warnings)."""
+        import re, math
+        terms = self._term_dicts()
+        provided = set(self._RSD_SYMBOLS) | {t["symbol"] for t in terms if t.get("symbol")}
+        problems, warnings = [], []
+
+        expr = self.custom_expr.text().strip()
+        inner = None
+        if expr.lower() not in ("drag", "lift", "lift-to-drag", "lift to drag"):
+            try:
+                names, inner = self._names_in(expr)
+                missing = names - provided
+                if missing:
+                    problems.append(f"Expression '{expr}' uses {sorted(missing)}, but the terms "
+                                    f"only provide {sorted(provided)}. Fix the symbol in the "
+                                    f"table or the expression.")
+            except SyntaxError as e:
+                problems.append(f"Expression '{expr}' is not valid: {e}")
+
+        for ln in [l.strip() for l in self.constraints_edit.toPlainText().splitlines() if l.strip()]:
+            m = re.match(self._CONS_RE, ln)
+            if not m:
+                problems.append(f"Constraint '{ln}' must look like '<expr> <= <number>' or '<expr> >= <number>'.")
+                continue
+            try:
+                missing = self._names_in(m.group(1))[0] - provided
+                if missing:
+                    problems.append(f"Constraint '{ln}' uses {sorted(missing)}; terms provide {sorted(provided)}. "
+                                    f"Add a term for it (weight 0 if it is only a constraint).")
+            except SyntaxError as e:
+                problems.append(f"Constraint '{ln}' is not valid: {e}")
+
+        # Direction sanity: d(expr)/d(symbol) at a nominal point. Pressure
+        # recovery must DECREASE the minimised objective; drag must increase it.
+        if inner and not problems:
+            want = {"pressure_recovery": -1, "drag": +1, "CD": +1}
+            base_env = {k: 1.0 for k in provided}
+            env_funcs = {"abs": abs, "min": min, "max": max, "pow": pow,
+                         "sqrt": math.sqrt, "log": math.log, "exp": math.exp}
+            maximise = expr.strip().lower().startswith("max(")
+            try:
+                f0 = float(eval(inner, {"__builtins__": {}, **env_funcs}, dict(base_env)))
+                for t in terms:
+                    sgn = want.get(t["metric"])
+                    sym = t.get("symbol")
+                    if sgn is None or sym not in self._names_in(inner)[0]:
+                        continue
+                    env = dict(base_env); env[sym] = 1.0 + 1e-3
+                    d = float(eval(inner, {"__builtins__": {}, **env_funcs}, env)) - f0
+                    if maximise:
+                        d = -d
+                    if d != 0 and (d > 0) != (sgn > 0):
+                        what = "maximised" if sgn < 0 else "minimised"
+                        warnings.append(f"'{sym}' ({t['metric']}) should be {what}, but with this "
+                                        f"expression the optimiser will push it the other way. "
+                                        f"Use a {'negative' if sgn < 0 else 'positive'} coefficient.")
+            except Exception:
+                pass
+        return problems, warnings
 
     def get_config(self):
         obj_type = self.obj_type.currentText()

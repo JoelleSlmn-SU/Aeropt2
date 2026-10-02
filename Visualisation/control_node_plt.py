@@ -655,12 +655,12 @@ def plot_design_variables_case_by_case(
     return saved_paths
 
 
-mcsv_file = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation_cd\bo_data.mcsv"
-out_dir = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation_cd\dv_case_plots"
+mcsv_file = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation_mo\bo_data.mcsv"
+out_dir = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation_mo\dv_case_plots"
 
-training_data = 27          # number of initial LHS samples
-objective = "MIN"          # "max" for pressure recovery♀
-variable_name = "CD"
+training_data = 34          # number of initial LHS samples
+objective = "Multi-Objective -w1*Cd+w2*PR"          # "max" for pressure recovery♀
+variable_name = "fitness"
 
 # ------------------------------------------------------------------
 # Load BO data
@@ -735,7 +735,7 @@ plot_design_variables_case_by_case(
     Y=Y,
     y_label=variable_name,
     fail_mask=fail_mask,
-    baseline_idx=0,
+    baseline_idx=1,
     out_dir=dv_case_dir,
     save_prefix="dv_case",
     combine_pdf=True,

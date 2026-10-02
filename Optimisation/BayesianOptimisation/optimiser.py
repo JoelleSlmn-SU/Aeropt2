@@ -279,7 +279,7 @@ class BayesianOptimiser:
         self.X = data["X"]
         self.Y = np.array([y[0] for y in data["Y"]])
         self.X_uneval = data["X_uneval"]
-        self.gen_num = int(data["gen_num"][0])
+        self.gen_num = int(np.ravel(data["gen_num"])[0])  # numpy>=2: int() of a 1-elem array raises
         for cons in self.constraints:
             name = cons["metric"]
             key = f"C__{name}"

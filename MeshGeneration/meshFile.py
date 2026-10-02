@@ -525,9 +525,128 @@ class VtmMesh(Mesh):
             self.global_ids[name] = np.array(gids)
             self.local_ids[name] = np.array(lids)
 
+# ---------------------------------------------------------------------------
+# 2D: boundary EDGES exposed through the same API the GUI uses for surfaces
+# ---------------------------------------------------------------------------
+def find_dat_for(filepath):
+    """FLITE 2D geometry next to the mesh: <stem>.dat, else None."""
+    stem = os.path.splitext(filepath)[0]
+    cand = stem + ".dat"
+    return cand if os.path.exists(cand) else None
+
+
+class EdgeMeshView(Mesh):
+    """
+    Wraps FileRW.EdgeMesh2D so MeshViewer can treat edges like surfaces:
+    get_surface_names / get_surface_id / get_surface_mesh / get_surface_points,
+    friendly_names, norm_label_to_id. Surface "ids" are the edge ids (the .dat
+    curve ids when a .dat is used).
+    """
+    dim = 2
+
+    def __init__(self, filepath, dat_path=None, mesh2d=None):
+        super().__init__(filepath)
+        self.dat_path = dat_path
+        self.mesh2d = mesh2d
+
+    def load(self):
+        from FileRW.EdgeMesh2D import EdgeMesh2D
+        if self.mesh2d is None:
+            self.mesh2d = EdgeMesh2D.from_file(self.filepath, self.dat_path)
+        m = self.mesh2d
+        self.label_source = m.label_source
+        self.id_to_label, self.label_to_id = {}, {}
+        for e in m.edges.values():
+            self.id_to_label[e.id] = e.name
+            self.label_to_id[e.name] = e.id
+        self.friendly_names = dict(self.label_to_id)
+        self.norm_label_to_id = dict(self.label_to_id)
+        self.surface_id_map = dict(self.label_to_id)
+        self.surfaces = {}
+        for e in m.edges.values():
+            _, g = m.get_surface_nodes(e.id)
+            self.surfaces[e.name] = np.asarray(g, dtype=np.int64)
+        self.global_ids = dict(self.surfaces)
+        self.local_ids = {k: np.arange(len(v)) for k, v in self.surfaces.items()}
+        self._edge_polys = {}
+
+    # names / ids
+    def _eid(self, name_or_id):
+        if isinstance(name_or_id, (int, np.integer)) or (isinstance(name_or_id, str) and name_or_id.isdigit()):
+            eid = int(name_or_id)
+            if eid not in self.id_to_label:
+                raise KeyError(f"Edge id {eid} not found")
+            return eid
+        if name_or_id in self.label_to_id:
+            return self.label_to_id[name_or_id]
+        raise KeyError(f"Edge '{name_or_id}' not found")
+
+    def get_surface_names(self):
+        return list(self.label_to_id.keys())
+
+    def get_surface_id(self, name_or_id):
+        return self._eid(name_or_id)
+
+    def get_surface_name(self, name_or_id):
+        return self.id_to_label[self._eid(name_or_id)]
+
+    def get_surface_points(self, name_or_id):
+        return self.mesh2d.nodes[self.surfaces[self.get_surface_name(name_or_id)]]
+
+    def get_surface_mesh(self, name_or_id):
+        """Polyline of the edge (pv.PolyData with line cells)."""
+        eid = self._eid(name_or_id)
+        if eid not in self._edge_polys:
+            nodes = self.mesh2d.edges[eid].nodes
+            P = self.mesh2d.nodes[nodes]
+            poly = pv.PolyData(P, lines=np.concatenate([[len(P)], np.arange(len(P))]).astype(np.int64))
+            poly.cell_data["surface_id"] = np.array([eid], dtype=np.int32)
+            self._edge_polys[eid] = poly
+        return self._edge_polys[eid]
+
+    def get_all_points(self):
+        return self.mesh2d.nodes
+
+    def domain_mesh(self):
+        """The 2D domain triangulation as pv.PolyData (for display only)."""
+        if not hasattr(self, "_domain_poly"):
+            T = self.mesh2d.triangles
+            faces = np.column_stack([np.full(len(T), 3), T]).ravel()
+            self._domain_poly = pv.PolyData(self.mesh2d.nodes, faces)
+        return self._domain_poly
+
+    def assign_global_ids_by_coordinates(self):
+        pass   # node ids are already global in 2D
+
+    def save(self, path):
+        self.mesh2d.write_file(path)
+
+    def export_step(self, path, surface_name=None):
+        raise NotImplementedError("STEP export is not available for 2D meshes.")
+
+    def _collect_surface_nodes(self, surface_list):
+        pts = [self.get_surface_points(n) for n in surface_list]
+        return np.vstack(pts) if pts else np.zeros((0, 3))
+
+
+def mesh_dim(mesh) -> int:
+    return int(getattr(mesh, "dim", 3))
+
+
 # Factory function
-def load_mesh(filepath):
+def load_mesh(filepath, dat_path=None):
+    """
+    Load a mesh for the GUI. 2D (planar) geometries are detected from ALL
+    points merged and returned as EdgeMeshView; `dat_path` defaults to
+    <stem>.dat next to the mesh when it exists.
+    """
+    from FileRW.EdgeMesh2D import detect_dim
     ext = os.path.splitext(filepath)[1].lower()
+    if ext == ".fro":
+        dat = dat_path or find_dat_for(filepath)
+        mesh = EdgeMeshView(filepath, dat)   # EdgeMesh2D raises if the .fro is 3D
+        mesh.load()
+        return mesh
     if ext in (".vtm", ".case"):          # ✅ treat EnSight case like a MultiBlock
         mesh = VtmMesh(filepath)
     elif ext == ".vtk":
@@ -535,5 +654,20 @@ def load_mesh(filepath):
     else:
         raise ValueError(f"Unsupported mesh format: {ext}")
     mesh.load()
+
+    if ext in (".vtm", ".case") and not getattr(mesh, "blocks", None):
+        stem = os.path.splitext(os.path.basename(filepath))[0]
+        raise ValueError(
+            f"'{os.path.basename(filepath)}' contains no readable blocks. A .vtm only lists its "
+            f"piece files (e.g. {stem}/{stem}_0_0.vtu); the '{stem}' folder must sit next to it."
+        )
+
+    pts = np.asarray(mesh.get_all_points(), float)
+    if len(pts) >= 3 and detect_dim(pts) == 2:
+        dat = dat_path or find_dat_for(filepath)
+        mesh2 = EdgeMeshView(filepath, dat)
+        mesh2.load()
+        return mesh2
+
     mesh.assign_global_ids_by_coordinates()
     return mesh

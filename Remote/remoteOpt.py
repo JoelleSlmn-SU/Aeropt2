@@ -100,16 +100,24 @@ def _build_objective_callable(objective_dict: dict):
                         local_vars[str(k)] = float(v)
                     except Exception:
                         pass
-            local_vars.setdefault("CL", 0.0)
-            local_vars.setdefault("CD", 1e9)
-            local_vars.setdefault("CM", 0.0)
+            nan = float("nan")
+            local_vars.setdefault("CL", nan)
+            local_vars.setdefault("CD", nan)
+            local_vars.setdefault("CM", nan)
             if "CL_over_CD" not in local_vars:
-                local_vars["CL_over_CD"] = local_vars["CL"] / max(local_vars["CD"], 1e-30)
+                local_vars["CL_over_CD"] = local_vars["CL"] / local_vars["CD"] if local_vars["CD"] else nan
             val = float(eval(inner, safe_globals, local_vars))
+            if not np.isfinite(val):
+                # A missing metric must NEVER turn into a fake number: with the
+                # old 1e9 default a maximised term (e.g. -0.75*PR) became
+                # -7.5e8, i.e. the apparent global optimum. NaN is imputed
+                # explicitly (and logged) in eval_func instead.
+                print(f"[OBJECTIVE][ERROR] '{inner}' evaluated to {val} (missing metric?) metrics={mdict}", flush=True)
+                return nan
             return -val if sense == "max" else val
         except Exception as e:
             print(f"[OBJECTIVE][ERROR] Could not evaluate '{inner}' with metrics={mdict}: {e}", flush=True)
-            return 1e9
+            return float("nan")
 
     pretty = f"-{inner}" if sense == "max" else inner
     return obj_func, pretty
@@ -162,6 +170,209 @@ def _metric_aliases(metric: str):
         "CM": ["CM", "cm", "moment"],
     }
     return aliases.get(metric, aliases.get(m, [metric, m]))
+
+
+# ---------------------------------------------------------------------------
+# Monitor-CSV parsing (module level so the --check mode can reuse it exactly)
+#
+# paraview_cluster.py writes ONE wide CSV row per post-processed iteration,
+# with column names that depend on the monitor TYPE and its "name" in
+# monitors.json -- NOT on the objective symbol:
+#     pressure_recovery -> "<name>_pressure_recovery"
+#     distortion/dc60   -> "<name>"
+#     drag              -> "<name>_over_q"
+# The previous lookup only tried exact alias names ("pressure_recovery",
+# "pr", ...), so a PR term never matched "<name>_pressure_recovery" and its
+# symbol silently fell back to 1e9. The resolver below maps a term to its
+# column using, in order:
+#   1. an explicit "column" key on the term (manual override)
+#   2. monitors.json in the solution dir: monitor with same type AND same
+#      surface_ids as the term -> column via the naming rule above
+#   3. exact symbol / "<symbol><suffix>"
+#   4. legacy aliases
+#   5. a UNIQUE column ending in the type's suffix (ambiguity -> no match)
+# ---------------------------------------------------------------------------
+_MONITOR_TYPE_OF_METRIC = {
+    "pressure_recovery": "pressure_recovery", "pressure recovery": "pressure_recovery",
+    "pr": "pressure_recovery", "p0_recovery": "pressure_recovery",
+    "distortion": "distortion", "dc60": "distortion", "distortion_dc60": "distortion",
+    "drag": "drag", "cd": "drag", "duct_drag": "drag",
+}
+# column suffix appended by paraview_cluster.main() for each monitor type
+_COLUMN_SUFFIX = {"pressure_recovery": "_pressure_recovery", "distortion": "", "drag": "_over_q"}
+
+
+def _canon_monitor_type(t):
+    return _MONITOR_TYPE_OF_METRIC.get(str(t or "").strip().lower(), str(t or "").strip().lower())
+
+
+def _load_monitor_cfg(sol_dir):
+    p = os.path.join(sol_dir, "Monitors", "monitors.json")
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _resolve_term_columns(term, columns, monitor_cfg):
+    """Return (list_of_candidate_columns_in_priority_order, how)."""
+    cols = [c for c in columns if c]
+    colset = set(cols)
+    symbol = str(term.get("symbol", "")).strip()
+    mtype = _canon_monitor_type(term.get("metric", ""))
+    suffix = _COLUMN_SUFFIX.get(mtype, "")
+
+    explicit = str(term.get("column", "") or "").strip()
+    if explicit:
+        return ([explicit] if explicit in colset else []), f"explicit column '{explicit}'"
+
+    want_sids = sorted(int(s) for s in (term.get("surface_ids") or []))
+    for mon in (monitor_cfg or {}).get("monitors", []) or []:
+        if not mon.get("enabled", True):
+            continue
+        if _canon_monitor_type(mon.get("type", "")) != mtype:
+            continue
+        if sorted(int(s) for s in (mon.get("surface_ids") or [])) != want_sids:
+            continue
+        name = str(mon.get("name", mon.get("type", ""))).strip() or str(mon.get("type", ""))
+        col = f"{name}{suffix}"
+        if col in colset:
+            return [col], f"monitors.json match (name='{name}', surface_ids={want_sids})"
+
+    for cand in (symbol, f"{symbol}{suffix}"):
+        if cand and cand in colset:
+            return [cand], "symbol match"
+
+    for alias in _metric_aliases(term.get("metric", "")):
+        if alias in colset:
+            return [alias], f"legacy alias '{alias}'"
+
+    if suffix:
+        ends = [c for c in cols if c.endswith(suffix)]
+        if len(ends) == 1:
+            return ends, f"unique '*{suffix}' column"
+        if len(ends) > 1:
+            return [], f"AMBIGUOUS: {ends} all end in '{suffix}' -- set \"column\" on the term"
+    return [], "no matching column"
+
+
+def parse_rsd(path):
+    """Last row of <base>_<n>.rsd -> CL/CD/CM (existing convention: tokens[2..4]).
+    Missing/unreadable file -> NaN (NOT a fake 'good' number)."""
+    nan = float("nan")
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.read().splitlines()
+        last = None
+        for raw in reversed(lines):
+            toks = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", raw)
+            if len(toks) >= 4:
+                last = toks
+                break
+        if not last:
+            print(f"[CLUSTER-TM][WARN] No numeric rows in {path}", flush=True)
+            return {"CL": nan, "CD": nan, "CM": nan, "CL_over_CD": nan}
+        CL = float(last[2]) if len(last) > 2 else nan
+        CD = float(last[3]) if len(last) > 3 else nan
+        CM = float(last[4]) if len(last) > 4 else nan
+        return {"CL": CL, "CD": CD, "CM": CM, "CL_over_CD": CL / CD if CD else nan}
+    except Exception as e:
+        print(f"[CLUSTER-TM][WARN] Error parsing {path}: {e}", flush=True)
+        return {"CL": nan, "CD": nan, "CM": nan, "CL_over_CD": nan}
+
+
+def read_monitor_rows(sol_dir):
+    import csv
+    candidates = [
+        os.path.join(sol_dir, "Monitors", "monitors.csv"),
+        os.path.join(sol_dir, "Monitors", "pressure_recovery.csv"),
+    ]
+    rows = []
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore", newline="") as f:
+                sample = f.read(4096)
+                f.seek(0)
+                if "," in sample and any(h in sample.lower() for h in ["iter", "pressure", "drag", "distortion", "dc60"]):
+                    rdr = csv.DictReader(f)
+                    rows.extend([{k: v for k, v in row.items()} for row in rdr])
+                else:
+                    for line in f:
+                        toks = [x.strip() for x in line.split(",")]
+                        if len(toks) >= 2:
+                            rows.append({"pressure_recovery": toks[-1]})
+        except Exception as e:
+            print(f"[CLUSTER-TM][WARN] Failed reading monitor csv {path}: {e}", flush=True)
+    return rows
+
+
+def parse_monitors(sol_dir, base_metrics, objective_terms):
+    metrics = dict(base_metrics)
+    rows = read_monitor_rows(sol_dir)
+    monitor_terms = [t for t in (objective_terms or []) if str(t.get("source", "")).lower() == "monitor"]
+    if not rows:
+        if monitor_terms:
+            print(f"[CLUSTER-TM][WARN] No monitor rows in {sol_dir}/Monitors -- "
+                  f"monitor symbols {[t.get('symbol') for t in monitor_terms]} set to NaN", flush=True)
+        for t in monitor_terms:
+            if t.get("symbol"):
+                metrics[str(t["symbol"]).strip()] = float("nan")
+        return metrics
+
+    # Raw columns (sanitised names), last finite value -- unchanged behaviour.
+    by_col = {}
+    for row in rows:
+        for k, v in row.items():
+            if k is None:
+                continue
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            by_col.setdefault(str(k).strip(), []).append(fv)
+    for k, vals in by_col.items():
+        safe = re.sub(r"\W+", "_", k).strip("_")
+        metrics[safe] = _reduce_values(vals, "last", default=float("nan"))
+
+    columns = []
+    for row in rows:
+        for k in row.keys():
+            if k is not None and k not in columns:
+                columns.append(k)
+    monitor_cfg = _load_monitor_cfg(sol_dir)
+
+    for term in monitor_terms:
+        symbol = str(term.get("symbol", "")).strip()
+        if not symbol:
+            continue
+        reduction = term.get("reduction", "last")
+        vals = []
+        # Legacy long-format CSV (one row per monitor with a name column)
+        for row in rows:
+            row_name = str(row.get("name", row.get("monitor", row.get("objective_symbol", "")))).strip()
+            if row_name and row_name == symbol:
+                for alias in _metric_aliases(term.get("metric", "")) + ["value", symbol]:
+                    if alias in row:
+                        vals.append(row.get(alias))
+        how = "long-format rows"
+        if not vals:
+            cols, how = _resolve_term_columns(term, columns, monitor_cfg)
+            for row in rows:
+                for c in cols:
+                    if c in row:
+                        vals.append(row.get(c))
+        metrics[symbol] = _reduce_values(vals, reduction, default=float("nan"))
+        if not np.isfinite(metrics[symbol]):
+            print(f"[CLUSTER-TM][WARN] {sol_dir}: symbol '{symbol}' unresolved/non-finite "
+                  f"({how}); available columns={columns}", flush=True)
+        else:
+            print(f"[CLUSTER-TM] {os.path.basename(os.path.normpath(sol_dir))}: {symbol} = "
+                  f"{metrics[symbol]:.6g} via {how}", flush=True)
+    return metrics
+
 
 class ClusterTestManager:
     """
@@ -277,98 +488,6 @@ class ClusterTestManager:
 
         print("[CLUSTER-TM] All SOLVER_DONE markers present. Parsing objective metrics.", flush=True)
 
-        def parse_rsd(path):
-            try:
-                with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                    lines = f.read().splitlines()
-                last = None
-                for raw in reversed(lines):
-                    toks = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", raw)
-                    if len(toks) >= 4:
-                        last = toks
-                        break
-                if not last:
-                    return {"CL": 0.0, "CD": 1e9, "CM": 0.0, "CL_over_CD": 0.0}
-                # Existing convention in your code: CL=tokens[2], CD=tokens[3], CM=tokens[4] if present.
-                CL = float(last[2]) if len(last) > 2 else 0.0
-                CD = float(last[3]) if len(last) > 3 else 1e9
-                CM = float(last[4]) if len(last) > 4 else 0.0
-                return {"CL": CL, "CD": CD, "CM": CM, "CL_over_CD": CL / max(CD, 1e-30)}
-            except Exception as e:
-                print(f"[CLUSTER-TM] Error parsing {path}: {e}", flush=True)
-                return {"CL": 0.0, "CD": 1e9, "CM": 0.0, "CL_over_CD": 0.0}
-
-        def read_monitor_rows(sol_dir):
-            import csv
-            candidates = [
-                os.path.join(sol_dir, "Monitors", "monitors.csv"),
-                os.path.join(sol_dir, "Monitors", "pressure_recovery.csv"),
-            ]
-            rows = []
-            for path in candidates:
-                if not os.path.exists(path):
-                    continue
-                try:
-                    with open(path, "r", encoding="utf-8", errors="ignore", newline="") as f:
-                        sample = f.read(4096)
-                        f.seek(0)
-                        if "," in sample and any(h in sample.lower() for h in ["iter", "pressure", "drag", "distortion", "dc60"]):
-                            rdr = csv.DictReader(f)
-                            rows.extend([{k: v for k, v in row.items()} for row in rdr])
-                        else:
-                            # fallback for simple CSV with no reliable header
-                            for line in f:
-                                toks = [x.strip() for x in line.split(",")]
-                                if len(toks) >= 2:
-                                    rows.append({"pressure_recovery": toks[-1]})
-                except Exception as e:
-                    print(f"[CLUSTER-TM][WARN] Failed reading monitor csv {path}: {e}", flush=True)
-            return rows
-
-        def parse_monitors(sol_dir, base_metrics):
-            metrics = dict(base_metrics)
-            rows = read_monitor_rows(sol_dir)
-            if not rows:
-                return metrics
-
-            # Add last numeric value for every column using both original and sanitised names.
-            by_col = {}
-            for row in rows:
-                for k, v in row.items():
-                    if k is None:
-                        continue
-                    try:
-                        fv = float(v)
-                    except Exception:
-                        continue
-                    by_col.setdefault(str(k).strip(), []).append(fv)
-            for k, vals in by_col.items():
-                safe = re.sub(r"\W+", "_", k).strip("_")
-                metrics[safe] = _reduce_values(vals, "last", default=0.0)
-
-            # Objective terms define the symbols we actually need.
-            for term in getattr(self, "objective_terms", []):
-                if str(term.get("source", "")).lower() != "monitor":
-                    continue
-                symbol = str(term.get("symbol", "")).strip()
-                metric = str(term.get("metric", "")).strip()
-                reduction = term.get("reduction", "last")
-                vals = []
-                # Prefer exact objective_symbol/name matching if paraview_cluster writes it.
-                for row in rows:
-                    row_name = str(row.get("name", row.get("monitor", row.get("objective_symbol", "")))).strip()
-                    if row_name and row_name == symbol:
-                        for alias in _metric_aliases(metric) + ["value", symbol]:
-                            if alias in row:
-                                vals.append(row.get(alias))
-                    else:
-                        for alias in _metric_aliases(metric) + [symbol]:
-                            if alias in row:
-                                vals.append(row.get(alias))
-                if symbol:
-                    metrics[symbol] = _reduce_values(vals, reduction, default=metrics.get(symbol, 1e9))
-            return metrics
-
         results = []
         for i, _x in enumerate(X_list, 1):
             n_index = self._alloc_n_index(gen_num, i)
@@ -376,17 +495,125 @@ class ClusterTestManager:
             for nc in range(1, num_conds + 1):
                 sol_dir = _sol_dir(n_index, nc)
                 m = parse_rsd(_rsd_path(n_index, nc))
-                m = parse_monitors(sol_dir, m)
+                m = parse_monitors(sol_dir, m, getattr(self, "objective_terms", []))
                 per_cond.append(m)
                 print(f"[CLUSTER-TM] gen={gen_num} n={n_index} cond={nc} metrics={m}", flush=True)
             results.append(per_cond)
         return results
 
+_RSD_SYMBOLS = {"CL", "CD", "CM", "CL_over_CD"}
+_EXPR_FUNCS = {"abs", "min", "max", "pow", "sqrt", "log", "exp"}
+
+
+def _expression_symbols(expr):
+    """Identifiers referenced by an objective/constraint expression."""
+    import ast
+    _, inner = _strip_outer_minmax(expr)
+    inner = inner.replace("CL/CD", "CL_over_CD")
+    try:
+        tree = ast.parse(inner, mode="eval")
+    except SyntaxError as e:
+        raise ValueError(f"Expression {expr!r} is not valid Python syntax: {e}")
+    return {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} - _EXPR_FUNCS
+
+
+def _check_objective_symbols(objective, constraints):
+    """Return a list of problems: symbols used in the expression/constraints
+    that no term (or the .rsd parser) will ever produce. This is exactly the
+    '-PR_s111' vs symbol 'PR' mismatch -- catch it at launch, not after
+    days of CFD."""
+    from Optimisation.BayesianOptimisation.optimiser import _parse_constraint
+    provided = set(_RSD_SYMBOLS)
+    for t in objective.get("terms", []) or []:
+        if t.get("symbol"):
+            provided.add(str(t["symbol"]).strip())
+    problems = []
+    expr = (objective.get("expression") or "").strip()
+    if expr and expr.lower() not in ("drag", "lift", "lift-to-drag", "lift to drag"):
+        missing = _expression_symbols(expr) - provided
+        if missing:
+            problems.append(f"expression '{expr}' uses {sorted(missing)}; terms provide {sorted(provided)}")
+    for c in constraints or []:
+        metric = _parse_constraint(c)["metric"]
+        missing = _expression_symbols(metric) - provided
+        if missing:
+            problems.append(f"constraint '{c}' uses {sorted(missing)}; terms provide {sorted(provided)}")
+    return problems
+
+
+def _impute_nonfinite(new_vals, history, direction, label, log):
+    """Replace NaN/inf in new_vals with a finite, deliberately BAD value:
+    worst finite observation (history + this batch) plus 10% of the observed
+    spread. direction=+1 -> larger is worse (minimised objective, '<='
+    constraint); direction=-1 -> smaller is worse ('>=' constraint).
+    Keeps the GP finite (NaN would poison C_mean/Y_mean for every point)
+    while steering the search away from the failed design."""
+    new_vals = np.asarray(new_vals, dtype=float).copy()
+    bad = ~np.isfinite(new_vals)
+    if not np.any(bad):
+        return new_vals
+    pool = np.concatenate([np.asarray(history, dtype=float).ravel(), new_vals[~bad]])
+    pool = pool[np.isfinite(pool)]
+    if pool.size == 0:
+        fill = 1e9 * direction
+        log(f"[REMOTE-OPT][WARN] {label}: no finite values anywhere; imputing {fill:g}")
+    else:
+        worst = np.max(pool) if direction > 0 else np.min(pool)
+        spread = float(np.ptp(pool)) if pool.size > 1 else abs(float(worst)) * 0.1
+        fill = float(worst + direction * 0.1 * max(spread, 1e-12))
+    log(f"[REMOTE-OPT][WARN] {label}: {int(bad.sum())} non-finite value(s) at batch index "
+        f"{np.where(bad)[0].tolist()} -> imputed {fill:.6g} (treated as failed design)")
+    new_vals[bad] = fill
+    return new_vals
+
+
+def check_mode(argv):
+    """
+    python remoteOpt.py --check <run_dir> <sol_dir> [<sol_dir> ...]
+
+    Runs the EXACT metric/objective/constraint code path used during the
+    optimisation on existing solution folders (single condition each), and
+    prints the result. Use it on the baseline and a few designs from the
+    Excel sheet before launching, to confirm CD / PR / DC60 match.
+    """
+    from Optimisation.BayesianOptimisation.objective_evaluator import ConstraintSet
+    run_dir = os.path.abspath(argv[0])
+    with open(os.path.join(run_dir, "objective.json")) as f:
+        objective = json.load(f)
+    with open(os.path.join(run_dir, "bo_settings.json")) as f:
+        settings_json = json.load(f)
+    constraints = settings_json.get("constraints") or objective.get("constraints", [])
+    problems = _check_objective_symbols(objective, constraints)
+    for p in problems:
+        print(f"[CHECK][SYMBOL-ERROR] {p}")
+    obj_func, pretty = _build_objective_callable(objective)
+    cset = ConstraintSet(constraints)
+    terms = objective.get("terms", []) or []
+    base_name = settings_json.get("base_name", "model")
+    print(f"[CHECK] objective (minimised): {pretty} | constraints: {constraints}")
+    for sol_dir in argv[1:]:
+        sol_dir = os.path.abspath(sol_dir)
+        rsd = [f for f in os.listdir(sol_dir) if f.startswith(base_name) and f.endswith(".rsd")]
+        rsd_path = os.path.join(sol_dir, sorted(rsd)[0]) if rsd else os.path.join(sol_dir, "missing.rsd")
+        m = parse_monitors(sol_dir, parse_rsd(rsd_path), terms)
+        shown = {k: m[k] for k in m if k in _RSD_SYMBOLS or any(k == t.get("symbol") for t in terms)}
+        c = cset.evaluate([m])
+        print(f"[CHECK] {sol_dir}\n        rsd={os.path.basename(rsd_path)} metrics={shown}\n"
+              f"        objective={obj_func(m)} constraints={c}")
+
+
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "--check":
+        if len(sys.argv) < 4:
+            print("Usage: remoteOpt.py --check <run_dir> <sol_dir> [<sol_dir> ...]", flush=True)
+            sys.exit(2)
+        check_mode(sys.argv[2:])
+        return
+
     if len(sys.argv) < 2:
         print("Usage: remoteOpt.py <run_directory>", flush=True)
         sys.exit(2)
-    
+
     run_dir = os.path.abspath(sys.argv[1])
     log_path = os.path.join(run_dir, "remote_opt.log")
     os.makedirs(run_dir, exist_ok=True)
@@ -455,7 +682,34 @@ def main():
     obj_func, obj_expr = _build_objective_callable(objective)
     objective_terms = objective.get("terms", []) or []
     _log(f"[REMOTE-OPT] Objective expression (minimised): {obj_expr}", log_path)
-    _log(f"[REMOTE-OPT] Objective terms: {objective_terms}", log_path)    
+    _log(f"[REMOTE-OPT] Objective terms: {objective_terms}", log_path)
+
+    # ---- Constraints ----
+    # Previously objective.json["constraints"] was never forwarded: the
+    # optimiser only reads settings["constraints"], which this run's
+    # bo_settings.json did not contain -> BO ran UNCONSTRAINED. Take them
+    # from objective.json when bo_settings.json has none.
+    obj_cons = list(objective.get("constraints", []) or [])
+    set_cons = list(settings_json.get("constraints", []) or [])
+    if set_cons and obj_cons and set_cons != obj_cons:
+        _log(f"[REMOTE-OPT][WARN] bo_settings.json constraints {set_cons} differ from "
+             f"objective.json constraints {obj_cons}; using bo_settings.json.", log_path)
+    constraints = set_cons or obj_cons
+    settings["constraints"] = constraints
+    from Optimisation.BayesianOptimisation.objective_evaluator import ConstraintSet
+    from Optimisation.BayesianOptimisation.optimiser import _parse_constraint
+    cset = ConstraintSet(constraints)
+    cons_parsed = [_parse_constraint(c) for c in constraints]
+    _log(f"[REMOTE-OPT] Constraints: {constraints if constraints else 'NONE (unconstrained)'}", log_path)
+
+    problems = _check_objective_symbols(objective, constraints)
+    for p in problems:
+        _log(f"[REMOTE-OPT][SYMBOL-ERROR] {p}", log_path)
+    if problems and not settings_json.get("allow_unknown_symbols", False):
+        _log("[REMOTE-OPT][ERROR] Aborting before any CFD is submitted. Fix objective.json "
+             "(or set \"allow_unknown_symbols\": true in bo_settings.json if you reference raw "
+             "monitor column names directly).", log_path)
+        sys.exit(1)
     
     _log(f"[REMOTE-OPT] Conditions: {conds}", log_path)
     _log(f"[REMOTE-OPT] Weights: {weights}", log_path)
@@ -516,11 +770,37 @@ def main():
             y = 0.0
             for cond, m in zip(conds, metrics_per_cond):
                 w = float(cond.get("Weight", 1.0))
-                y += w * obj_func(m)
+                y += w * obj_func(m)          # NaN propagates -> imputed below
             Y.append(float(y))
 
-        _log(f"[REMOTE-OPT] Generation {gen_num} objectives: {Y}", log_path)
-        return np.array(Y, dtype=float)
+        logf = lambda msg: _log(msg, log_path)
+        Y = _impute_nonfinite(Y, bo.Y, +1, f"gen {gen_num} objective", logf)
+
+        if not cons_parsed:
+            _log(f"[REMOTE-OPT] Generation {gen_num} objectives: {Y.tolist()}", log_path)
+            return Y
+
+        # Constraint values: worst case across conditions (ConstraintSet),
+        # returned as the (Y, C) tuple BayesianOptimiser expects.
+        per_point = [cset.evaluate(mpc) for mpc in per_design]
+        C = {}
+        for cons in cons_parsed:
+            name = cons["metric"]
+            vals = np.array([pp.get(name, np.nan) for pp in per_point], dtype=float)
+            direction = +1 if cons["sense"] == "<=" else -1
+            hist = bo.C.get(name, np.array([]))
+            if np.any(~np.isfinite(vals)):
+                # make sure an imputed value is on the infeasible side
+                pool = np.concatenate([np.asarray(hist, float).ravel(), vals[np.isfinite(vals)], [cons["limit"]]])
+                vals = _impute_nonfinite(vals, pool, direction, f"gen {gen_num} constraint {name}", logf)
+            C[name] = vals
+
+        for i, y in enumerate(Y):
+            desc = ", ".join(f"{k}={C[k][i]:.4g}" for k in C)
+            feas = all((C[c['metric']][i] <= c['limit']) if c['sense'] == '<=' else (C[c['metric']][i] >= c['limit'])
+                       for c in cons_parsed)
+            _log(f"[REMOTE-OPT] gen {gen_num} point {i + 1}: Y={y:.6g} | {desc} | feasible={feas}", log_path)
+        return Y, C
     
     # Run Bayesian Optimization
     _log("[REMOTE-OPT] Starting Bayesian Optimization...", log_path)

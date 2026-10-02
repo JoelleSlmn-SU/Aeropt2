@@ -463,7 +463,10 @@ class ClusterPipelineManager:
         bf.lines.append("  echo '{\"interval\":50,\"enabled\":true,\"monitors\":[]}' > \"$MON_JSON\"")
         bf.lines.append("fi")
 
-        bf.lines.append("rm -f SOLVER_DONE")
+        bf.lines.append("rm -f SOLVER_DONE SOLVER_EXITED")
+        # A job killed mid-post (walltime/scancel) leaves lockdir behind, after
+        # which every later post is skipped with "lock active" -> no PR/DC60.
+        bf.lines.append("rm -rf \"$LOCK_DIR\" \"$WORK_DIR\" 2>/dev/null || true")
 
         # Parse solver mode from the already-patched input file.
         bf.lines.append("")
@@ -603,7 +606,7 @@ class ClusterPipelineManager:
         bf.lines.append("      last_abs=\"$next\"")
         bf.lines.append("    fi")
 
-        bf.lines.append("    [ -f SOLVER_DONE ] && break")
+        bf.lines.append("    [ -f SOLVER_EXITED ] && break")
         bf.lines.append("    sleep \"$SLEEP_S\"")
         bf.lines.append("  done")
         bf.lines.append("}")
@@ -1025,23 +1028,47 @@ class ClusterPipelineManager:
         self._append_paraview_monitoring_section(bf, mach_for_post)
         
         # Run solver
+        # ORDER MATTERS: remoteOpt reads Monitors/monitors.csv as soon as
+        # SOLVER_DONE exists. Previously SOLVER_DONE was touched straight after
+        # mpirun, while the background monitor could still be mid-pvpython (or
+        # several intervals behind), so the "last" PR/DC60 row was stale or
+        # missing. Now: solver exits -> stop monitor loop -> one final post on
+        # the final solution -> combine -> SOLVER_DONE.
+        bf.lines.append("set +e")
         bf.lines.append(f"mpirun {self.solver_exe} < {self.base_name}_{self.n}.inp &> solver_output")
-        bf.lines.append("touch SOLVER_DONE")
-
+        bf.lines.append("SOLVER_RC=$?")
+        bf.lines.append("set -e")
+        bf.lines.append('echo "[SOL] solver exit code: $SOLVER_RC"')
+        bf.lines.append("touch SOLVER_EXITED")
         bf.lines.append("wait $PR_PID 2>/dev/null || true")
 
-        bf.lines.append(f"{self.combine_exe} <<INPUT1")
+        bf.lines.append('FINAL_IT=$(latest_local_iter_for_base "$(post_base_for_abs_iter 1)" 1)')
+        bf.lines.append('[ "${FINAL_IT:-0}" -gt 0 ] 2>/dev/null || FINAL_IT=1')
+        bf.lines.append('echo "[MON] final post-processing at iter $FINAL_IT (solver rc=$SOLVER_RC)" >> "$MON_LOG"')
+        bf.lines.append('run_post "$FINAL_IT" || echo "[MON][WARN] final post failed" >> "$MON_LOG"')
+
+        bf.lines.append(f"{self.combine_exe} <<INPUT1 || true")
         bf.lines.append("plotreg.reg")
         bf.lines.append(f"{self.base_name}_{self.n}.res")
         bf.lines.append(f"{self.base_name}_{self.n}.unk")
         bf.lines.append("F")
         bf.lines.append("T")
         bf.lines.append("INPUT1")
+        bf.lines.append("touch SOLVER_DONE")
         
         batch_path = os.path.join(sol_dir, f"batchfile_{batch_name}")
         with open(batch_path, "w") as f:
             f.write(str(bf))
         
+        for stale in ("SOLVER_DONE", "SOLVER_EXITED",
+                      os.path.join("Monitors", "monitors.csv"),
+                      os.path.join("Monitors", "state_abs_iter.txt")):
+            sp = os.path.join(sol_dir, stale)
+            if os.path.exists(sp):
+                os.remove(sp)
+                self._log(f"[CLUSTER] Removed stale {sp} before fresh solver submission")
+        shutil.rmtree(os.path.join(sol_dir, "Monitors", "lockdir"), ignore_errors=True)
+
         dep_id = self.job_ids.get("prepro")
         dep_arg = f"--dependency=afterany:{dep_id}" if dep_id else ""
         cmd = f"sbatch {dep_arg} {batch_path}"

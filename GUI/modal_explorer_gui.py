@@ -513,7 +513,17 @@ class ModalSliderExplorer(QMainWindow):
         self.cbar_range_label.setWordWrap(True)
         disp_form.addRow(self.cbar_range_label)
 
-        self.show_baseline_check = QCheckBox("Show baseline wireframe (T ∪ U)")
+        self.show_t_check = QCheckBox("Show T surfaces (deforming)")
+        self.show_t_check.setChecked(True)
+        self.show_t_check.stateChanged.connect(lambda _v: self.refresh_actor())
+        disp_form.addRow(self.show_t_check)
+
+        self.show_u_check = QCheckBox("Show U surfaces (deforming)")
+        self.show_u_check.setChecked(True)
+        self.show_u_check.stateChanged.connect(lambda _v: self.refresh_actor())
+        disp_form.addRow(self.show_u_check)
+
+        self.show_baseline_check = QCheckBox("Show baseline wireframe (visible T / U only)")
         self.show_baseline_check.setChecked(True)
         self.show_baseline_check.stateChanged.connect(lambda _v: self.refresh_actor())
         disp_form.addRow(self.show_baseline_check)
@@ -1148,8 +1158,15 @@ class ModalSliderExplorer(QMainWindow):
             # MorphModel.get_c_node_gids fallback: complement of T ∪ U minus farfield
             c_s = set(fro.get_surface_ids()) - d_s - set(getattr(fro, "farfield_ids", []) or [])
 
+        # T and U are displayed as separate parts so each can be toggled.
+        # A surface id listed in both T and U is shown under T only (no double draw).
+        t_only = set(self.model.t_surfaces)
+        u_only = set(self.model.u_surfaces) - t_only
+
         self.parts = {}
-        for role, sids in (("D", d_s), ("C", c_s)):
+        for role, sids in (("T", t_only), ("U", u_only), ("C", c_s)):
+            if not sids:
+                continue
             poly, ids = subset_polydata(nodes, tris, quads,
                                         np.isin(t_sid, list(sids)), np.isin(q_sid, list(sids)))
             if poly is not None:
@@ -1161,15 +1178,22 @@ class ModalSliderExplorer(QMainWindow):
             if poly is not None:
                 self.parts["O"] = {"poly": poly, "ids": ids, "base": np.asarray(poly.points).copy()}
 
-        # point normals on D from the .fro face orientation (for u·n colouring)
+        # Point normals from the .fro face orientation (for u·n colouring), computed on
+        # the whole of D = T ∪ U so seam nodes get the same averaged normal as before,
+        # then scattered into a global (node_count, 3) array indexed by node gid.
         self.d_normals = None
-        if "D" in self.parts:
+        if self.parts.get("T") is not None or self.parts.get("U") is not None:
             try:
-                nm = self.parts["D"]["poly"].compute_normals(
-                    point_normals=True, cell_normals=False, split_vertices=False,
-                    consistent_normals=False, auto_orient_normals=False,
-                )
-                self.d_normals = np.asarray(nm.point_data["Normals"], float)
+                d_poly, d_ids = subset_polydata(nodes, tris, quads,
+                                                np.isin(t_sid, list(d_s)), np.isin(q_sid, list(d_s)))
+                if d_poly is not None:
+                    nm = d_poly.compute_normals(
+                        point_normals=True, cell_normals=False, split_vertices=False,
+                        consistent_normals=False, auto_orient_normals=False,
+                    )
+                    g = np.full((len(nodes), 3), np.nan)
+                    g[np.asarray(d_ids, int)] = np.asarray(nm.point_data["Normals"], float)
+                    self.d_normals = g
             except Exception as exc:
                 print(f"[WARN] normal computation failed: {exc}")
 
@@ -1222,12 +1246,22 @@ class ModalSliderExplorer(QMainWindow):
         self.refresh_context_actors()
         self.refresh_control_node_actors()
 
-    def _mesh_scalar_field(self):
-        part = self.parts["D"]
-        u = self.current_node_disp[part["ids"]]
+    def _visible_deforming_roles(self):
+        """Deforming parts (T, U) that exist and are ticked in the Display box."""
+        roles = []
+        if "T" in self.parts and self.show_t_check.isChecked():
+            roles.append("T")
+        if "U" in self.parts and self.show_u_check.isChecked():
+            roles.append("U")
+        return roles
+
+    def _mesh_scalar_field(self, role: str):
+        part = self.parts[role]
+        ids = np.asarray(part["ids"], int)
+        u = self.current_node_disp[ids]
         mode = self.color_mode_combo.currentText()
         if mode.startswith("Normal displacement") and self.d_normals is not None:
-            return "u_dot_n", np.einsum("ij,ij->i", u, self.d_normals), "u·n"
+            return "u_dot_n", np.einsum("ij,ij->i", u, self.d_normals[ids]), "u·n"
         if mode.startswith("X displacement"):
             return "ux", u[:, 0], "ux"
         if mode.startswith("Y displacement"):
@@ -1237,33 +1271,48 @@ class ModalSliderExplorer(QMainWindow):
         return "disp_mag", np.linalg.norm(u, axis=1), "|u|"
 
     def refresh_actor(self, reset_camera: bool = False):
-        if "D" not in self.parts or self.plotter is None:
+        if self.plotter is None or not ("T" in self.parts or "U" in self.parts):
             return
-        for name in ["baseline_wire", "deformed_mesh"]:
+        for name in ("baseline_wire_T", "baseline_wire_U", "deformed_mesh_T", "deformed_mesh_U",
+                     "baseline_wire", "deformed_mesh"):
             try:
                 self.plotter.remove_actor(name)
             except Exception:
                 pass
+        self.mesh_actor = None
 
-        part = self.parts["D"]
-        if self.show_baseline_check.isChecked():
-            base = part["poly"].copy(deep=True)
-            base.points = part["base"].copy()
-            self.plotter.add_mesh(base, color="black", style="wireframe", opacity=0.18,
-                                  line_width=1.0, name="baseline_wire", show_scalar_bar=False)
+        roles = self._visible_deforming_roles()
+        if not roles:
+            self.cbar_range_label.setText("Data range: - (no T / U surfaces shown)")
+            for bar_title in list(getattr(self.plotter, "scalar_bars", {}).keys()):
+                try:
+                    self.plotter.remove_scalar_bar(bar_title)
+                except Exception:
+                    pass
+            if reset_camera:
+                self.plotter.reset_camera()
+            self.plotter.render()
+            return
 
-        scalar_name, vals, title = self._mesh_scalar_field()
-        mesh = part["poly"]
-        mesh.point_data[scalar_name] = vals
+        # Scalars per visible part; the colour range is shared across them so T and U
+        # are directly comparable, and it reflects only what is on screen.
+        fields = {}
+        title = ""
+        for role in roles:
+            scalar_name, vals, title = self._mesh_scalar_field(role)
+            self.parts[role]["poly"].point_data[scalar_name] = vals
+            fields[role] = (scalar_name, vals)
+        all_vals = np.concatenate([v for _, v in fields.values()])
+        all_vals = all_vals[np.isfinite(all_vals)]
 
         clim = None
         vmin_full = vmax_full = 0.0
         robust = self.robust_clim_check.isChecked()
-        if vals.size:
-            vmin_full = float(np.nanmin(vals))
-            vmax_full = float(np.nanmax(vals))
-            if robust and vals.size > 1:
-                vmin, vmax = (float(v) for v in np.nanpercentile(vals, [1.0, 99.0]))
+        if all_vals.size:
+            vmin_full = float(np.min(all_vals))
+            vmax_full = float(np.max(all_vals))
+            if robust and all_vals.size > 1:
+                vmin, vmax = (float(v) for v in np.percentile(all_vals, [1.0, 99.0]))
             else:
                 vmin, vmax = vmin_full, vmax_full
             if vmin < 0.0 < vmax:
@@ -1272,13 +1321,14 @@ class ModalSliderExplorer(QMainWindow):
             elif abs(vmax - vmin) > 1e-14:
                 clim = [vmin, vmax]
 
+        shown = " + ".join(roles)
         if robust and clim is not None and (abs(clim[0] - vmin_full) > 1e-12 or abs(clim[1] - vmax_full) > 1e-12):
             self.cbar_range_label.setText(
-                f"Data range: [{vmin_full:.3e}, {vmax_full:.3e}]\n"
+                f"Data range ({shown}): [{vmin_full:.3e}, {vmax_full:.3e}]\n"
                 f"Bar clipped to 1-99th pct: [{clim[0]:.3e}, {clim[1]:.3e}]"
             )
         else:
-            self.cbar_range_label.setText(f"Data range: [{vmin_full:.3e}, {vmax_full:.3e}]")
+            self.cbar_range_label.setText(f"Data range ({shown}): [{vmin_full:.3e}, {vmax_full:.3e}]")
 
         picture_view = self.picture_view_check.isChecked()
         scalar_bar_args = {
@@ -1288,21 +1338,36 @@ class ModalSliderExplorer(QMainWindow):
             "position_y": float(self.cbar_y_spin.value()),
             "vertical": bool(self.cbar_vertical_check.isChecked()),
         }
-        self.mesh_actor = self.plotter.add_mesh(
-            mesh, scalars=scalar_name, clim=clim, show_edges=self.edges_check.isChecked(),
-            smooth_shading=True, name="deformed_mesh",
-            scalar_bar_args=scalar_bar_args, show_scalar_bar=not picture_view,
-        )
+        show_edges = self.edges_check.isChecked()
+        for i, role in enumerate(roles):
+            part = self.parts[role]
+            if self.show_baseline_check.isChecked():
+                base = part["poly"].copy(deep=True)
+                base.points = part["base"].copy()
+                self.plotter.add_mesh(base, color="black", style="wireframe", opacity=0.18,
+                                      line_width=1.0, name=f"baseline_wire_{role}", show_scalar_bar=False)
+            scalar_name, _ = fields[role]
+            # Only the first visible part owns the scalar bar; the others share its clim.
+            actor = self.plotter.add_mesh(
+                part["poly"], scalars=scalar_name, clim=clim, show_edges=show_edges,
+                smooth_shading=True, name=f"deformed_mesh_{role}",
+                scalar_bar_args=scalar_bar_args if i == 0 else None,
+                show_scalar_bar=(i == 0) and not picture_view,
+            )
+            if i == 0:
+                self.mesh_actor = actor
+            if clim is not None:
+                try:
+                    actor.mapper.scalar_range = tuple(clim)
+                except Exception:
+                    pass
+
         # Re-assert the range (interactive scalar-bar widgets cache the first one)
-        if clim is not None:
+        if clim is not None and not picture_view:
             try:
                 self.plotter.update_scalar_bar_range(clim, name=title)
             except Exception:
-                try:
-                    if self.mesh_actor is not None:
-                        self.mesh_actor.mapper.scalar_range = tuple(clim)
-                except Exception:
-                    pass
+                pass
 
         if reset_camera:
             self.plotter.reset_camera()

@@ -17,7 +17,7 @@ from mpl_toolkits.mplot3d import Axes3D  # Needed for 3D plots
 for dir in ["FileRW", "ShapeParameterization", "MeshGeneration", "ConvertFileType", "Remote", "Local", "GUI"]:
     sys.path.append(os.path.dirname(dir))
 from ShapeParameterization.surfaceFitting import selectControlNodes, selectRegionControlNodes
-from MeshGeneration.meshFile import load_mesh
+from MeshGeneration.meshFile import load_mesh, mesh_dim
 from ShapeParameterization.controlNodeDisp import _surface_normals, _map_normals_to_control
 from Local.runSimLocal import *
 from ConvertFileType.convertToStep import *
@@ -141,12 +141,40 @@ class MeshViewer(QWidget):
         self.rbf_original = getattr(self.main_window, "rbf_original", None)
         self.rbf_current  = getattr(self.main_window, "rbf_current", None)
         
-        if hasattr(self, 'placeholder'):
-            self.main_layout.removeWidget(self.placeholder)
-            self.placeholder.deleteLater()
+        # Read the file BEFORE touching the UI. If it cannot be read, the
+        # viewer stays exactly as it was and the real error reaches the log
+        # (previously the placeholder was already deleted by then, so the next
+        # attempt failed with "QLabel has been deleted" and hid the cause).
+        new_mesh = load_mesh(filename)
+
+        # Loading over an existing mesh: tear the old UI down first (as New
+        # Project does), otherwise a second plotter + button set are stacked.
+        if getattr(self, "mesh_obj", None) is not None:
+            self.reset_viewer()
+
+        # The placeholder is deleted on the first load; drop the reference so a
+        # second load (or reset_viewer) does not touch the deleted QLabel.
+        ph = getattr(self, "placeholder", None)
+        if ph is not None:
+            try:
+                self.main_layout.removeWidget(ph)
+                ph.deleteLater()
+            except RuntimeError:
+                pass
+            self.placeholder = None
 
         self.plotter.clear()
-        self.mesh_obj = load_mesh(filename)
+        self.mesh_obj = new_mesh
+        self.mesh_dim = mesh_dim(self.mesh_obj)
+        if self.mesh_dim == 2:
+            src = getattr(self.mesh_obj, "label_source", "?")
+            self.log(f"[2D] Planar geometry detected: {self.mesh_obj.mesh2d.node_count} nodes, "
+                     f"{len(self.mesh_obj.mesh2d.triangles)} triangles, "
+                     f"{len(self.mesh_obj.get_surface_names())} boundary edges (labels from {src}).")
+            if not str(src).startswith("dat:"):
+                self.log("[2D][WARN] No matching .dat found next to the mesh "
+                         f"(expected {os.path.splitext(filename)[0]}.dat); edges were split at corners "
+                         "and have no bc codes.")
         self.surface_actors.clear()
         self.hidden_surfaces.clear()
 
@@ -205,6 +233,9 @@ class MeshViewer(QWidget):
         except Exception:
             pass
 
+        # parameter panel (3D control-node form or 2D edge-mode form)
+        self._clear_param_widgets()
+
         # clear dynamic widgets created during sessions
         for name in [
             "reset_btn","cam_btn","hide_btn","tc_btn","export_btn",
@@ -226,16 +257,22 @@ class MeshViewer(QWidget):
             pass
 
         # placeholder label
-        if not hasattr(self, "placeholder") or self.placeholder is None:
+        # (the QLabel may already be deleted on the Qt side while Python still
+        # holds a reference; touching it then raises RuntimeError)
+        try:
+            self.placeholder.setText("No mesh loaded")
+            self.placeholder.setVisible(True)
+        except (AttributeError, RuntimeError):
             self.placeholder = QLabel("No mesh loaded")
             self.placeholder.setAlignment(Qt.AlignCenter)
             self.main_layout.addWidget(self.placeholder)
-        else:
-            self.placeholder.setText("No mesh loaded")
-            self.placeholder.setVisible(True)
 
         # reset internal state
         self.mesh_obj = None
+        self.mesh_dim = 3
+        self._morph2d = None
+        self._morph2d_key = None
+        self._morph2d_limits = None
         self.surface_actors = {}
         self.hidden_surfaces = set()
         self.TSurfaces, self.USurfaces, self.CSurfaces = [], [], []
@@ -256,7 +293,7 @@ class MeshViewer(QWidget):
         names = self.mesh_obj.get_surface_names()
         table.setRowCount(len(names))
         table.setColumnCount(3)
-        table.setHorizontalHeaderLabels(["Surface", "Points", "Bounds"])
+        table.setHorizontalHeaderLabels([self._kind(False), "Points", "Bounds"])
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
 
@@ -268,7 +305,7 @@ class MeshViewer(QWidget):
             table.setItem(i, 1, QTableWidgetItem(str(len(pts))))
             table.setItem(i, 2, QTableWidgetItem(f"{bounds[0]:.1f}, {bounds[1]:.1f}, {bounds[2]:.1f}"))
 
-        dock = QDockWidget("Surface Summary", self)
+        dock = QDockWidget(f"{self._kind(False)} Summary", self)
         dock.setWidget(table)
 
         # keep refs so they don't get GC'd
@@ -330,7 +367,7 @@ class MeshViewer(QWidget):
         self.main_layout.addWidget(self.plotter)
         self.plotter.reset_camera()
         
-        self.reset_btn = QPushButton("Reset Surfaces")
+        self.reset_btn = QPushButton(f"Reset {self._kind()}")
         self.reset_btn.clicked.connect(self.reset_surfaces)
         self.main_layout.addWidget(self.reset_btn)
 
@@ -338,12 +375,12 @@ class MeshViewer(QWidget):
         self.cam_btn.clicked.connect(self.reset_camera)
         self.main_layout.addWidget(self.cam_btn)
         
-        self.hide_btn = QPushButton("Hide Surface")
+        self.hide_btn = QPushButton(f"Hide {self._kind(False)}")
         self.hide_btn.clicked.connect(self.toggle_hide_mode)
         self.main_layout.addWidget(self.hide_btn)
         self.hide_mode_enabled = False
 
-        self.tc_btn = QPushButton("Select T/U/C Surfaces")
+        self.tc_btn = QPushButton(f"Select T/U/C {self._kind()}")
         self.tc_btn.clicked.connect(self.tc_surfaces)
         self.main_layout.addWidget(self.tc_btn)
 
@@ -403,6 +440,8 @@ class MeshViewer(QWidget):
         self.scale_actor = actor
 
     def _add_mesh_to_plotter(self):
+        if self._is_2d():
+            return self._add_mesh_to_plotter_2d()
         self.plotter.clear()
         surface_names = self.mesh_obj.get_surface_names()
         cmap = cm.get_cmap("tab20")
@@ -665,6 +704,8 @@ class MeshViewer(QWidget):
 
     def reset_camera(self):
         self.plotter.reset_camera()
+        if self._is_2d():
+            self._focus_2d()
         self.plotter.render()
 
     def export_visible_mesh(self):
@@ -691,19 +732,19 @@ class MeshViewer(QWidget):
             btn.setVisible(False)
 
         # T/U/C selection buttons
-        self.T_btn = QPushButton("Select T Surfaces")
+        self.T_btn = QPushButton(f"Select T {self._kind()}")
         self.T_btn.clicked.connect(self.select_T_surfaces)
         self.main_layout.addWidget(self.T_btn)
 
-        self.C_btn = QPushButton("Select C Surfaces")
+        self.C_btn = QPushButton(f"Select C {self._kind()}")
         self.C_btn.clicked.connect(self.select_C_surfaces)
         self.main_layout.addWidget(self.C_btn)
 
-        self.U_btn = QPushButton("Select U Surfaces")
+        self.U_btn = QPushButton(f"Select U {self._kind()}")
         self.U_btn.clicked.connect(self.select_U_surfaces)
         self.main_layout.addWidget(self.U_btn)
         
-        self.edit_btn = QPushButton("Edit Surface Selections")
+        self.edit_btn = QPushButton(f"Edit {self._kind(False)} Selections")
         self.edit_btn.clicked.connect(self.open_edit_dialog)
         self.main_layout.addWidget(self.edit_btn)
 
@@ -1099,6 +1140,9 @@ class MeshViewer(QWidget):
             self.set_output_directory(default_dir)
             self.log(f"[Info] Output directory auto-set to: {default_dir}")
 
+        if self._is_2d():
+            return self._finish_selection_2d()
+
         # --- Helper: robust int list ---
         def _as_int_list(lst):
             out = []
@@ -1258,6 +1302,315 @@ class MeshViewer(QWidget):
             self.log(f"[ERROR] Unknown control-node selection mode: {mode}")
 
 
+    # ==================================================================
+    # 2D (edge) mode
+    # ==================================================================
+    def _is_2d(self):
+        return int(getattr(self, "mesh_dim", 3) or 3) == 2
+
+    def _kind(self, plural=True):
+        if self._is_2d():
+            return "Edges" if plural else "Edge"
+        return "Surfaces" if plural else "Surface"
+
+    def _setup_2d_camera(self):
+        try:
+            self.plotter.view_xy()
+            self.plotter.enable_parallel_projection()
+        except Exception:
+            pass
+        try:
+            self.plotter.enable_2d_style()      # left-drag pans, wheel zooms, no rotation
+        except Exception:
+            try:
+                self.plotter.enable_image_style()
+            except Exception:
+                pass
+
+    def _focus_2d(self):
+        """
+        Frame the walls, not the whole far field: with a 50-unit far field the
+        body is a few pixels wide and right-click picking would hit the
+        outflow edges instead. Walls = bc 4 edges when the .dat gives bc codes,
+        else edges shorter than 10% of the longest edge.
+        """
+        m2 = self.mesh_obj.mesh2d
+        edges = list(m2.edges.values())
+        walls = [e for e in edges if e.bc == 4]
+        if not walls:
+            Lmax = 0.0
+            lens = {}
+            for e in edges:
+                P = m2.nodes[e.nodes, :2]
+                lens[e.id] = float(np.linalg.norm(np.diff(P, axis=0), axis=1).sum())
+                Lmax = max(Lmax, lens[e.id])
+            walls = [e for e in edges if lens[e.id] < 0.1 * Lmax] or edges
+        P = np.vstack([m2.nodes[e.nodes, :2] for e in walls])
+        lo, hi = P.min(0), P.max(0)
+        c = 0.5 * (lo + hi)
+        half = 0.5 * max(hi[0] - lo[0], hi[1] - lo[1]) * 1.25 + 1e-12
+        z = float(m2.nodes[0, 2])
+        cam = self.plotter.camera
+        cam.focal_point = (c[0], c[1], z)
+        cam.position = (c[0], c[1], z + 10.0 * half)
+        cam.up = (0.0, 1.0, 0.0)
+        try:
+            self.plotter.enable_parallel_projection()
+        except Exception:
+            pass
+        cam.parallel_scale = half
+        self.plotter.render()
+
+    def _add_mesh_to_plotter_2d(self):
+        self.plotter.clear()
+        names = self.mesh_obj.get_surface_names()
+        try:
+            import matplotlib
+            cmap = matplotlib.colormaps["tab10"]          # matplotlib >= 3.5
+        except Exception:
+            cmap = cm.get_cmap("tab10")                    # removed in matplotlib 3.9
+        self.colors = [tuple(cmap(i % 10)[:3]) for i in range(len(names))]
+        try:
+            self.plotter.add_mesh(self.mesh_obj.domain_mesh(), color=(0.82, 0.82, 0.82),
+                                  style="wireframe", line_width=0.5, pickable=False, name="domain_2d")
+        except Exception as e:
+            self.log(f"[2D][WARN] Could not draw the domain mesh: {e}")
+
+        lab_pts, lab_txt = [], []
+        for i, name in enumerate(names):
+            try:
+                poly = self.mesh_obj.get_surface_mesh(name)
+                actor = self.plotter.add_mesh(poly, color=self.colors[i], line_width=7,
+                                              render_lines_as_tubes=True, pickable=True,
+                                              name=f"edge::{name}")
+                self.surface_actors[name] = actor
+                P = np.asarray(poly.points)
+                lab_pts.append(P[len(P) // 2])
+                lab_txt.append(f"{self.mesh_obj.get_surface_id(name)}: {name}")
+            except Exception as e:
+                self.log(f"[2D] Failed to plot edge '{name}': {e}")
+        if lab_pts:
+            try:
+                self.plotter.add_point_labels(np.asarray(lab_pts), lab_txt, font_size=12, point_size=1,
+                                              shape_opacity=0.6, always_visible=True, pickable=False,
+                                              name="edge_labels")
+            except Exception:
+                pass
+        self._setup_2d_camera()
+        self.plotter.reset_camera()
+        self._focus_2d()
+        self.plotter.setVisible(True)
+        self.plotter.render()
+
+    def _finish_selection_2d(self):
+        def ids(seq):
+            out = []
+            for x in seq or []:
+                try:
+                    out.append(int(self.mesh_obj.get_surface_id(x)))
+                except Exception:
+                    pass
+            return _dedup_preserve_order(out)
+
+        all_ids = ids(self.mesh_obj.get_surface_names())
+        T, U = ids(self.TSurfaces), ids(self.USurfaces)
+        if not T:
+            self.log("[2D][ERROR] Select at least one T edge.")
+            return
+        if set(T) & set(U):
+            self.log(f"[2D][ERROR] Edges {sorted(set(T) & set(U))} are marked both T and U.")
+            return
+        C = [e for e in all_ids if e not in set(T) | set(U)]
+        self.TSurfaces, self.USurfaces, self.CSurfaces = T, U, C
+        self.T_names = [self.mesh_obj.get_surface_name(e) for e in T]
+        self.U_names = [self.mesh_obj.get_surface_name(e) for e in U]
+        self.C_names = [self.mesh_obj.get_surface_name(e) for e in C]
+        self.log(f"[2D] T edges={T}  U edges={U}  C (fixed) edges={C}")
+
+        for wdg in [self.hide_btn, self.reset_btn, self.cam_btn, getattr(self, "T_btn", None),
+                    getattr(self, "C_btn", None), getattr(self, "U_btn", None),
+                    getattr(self, "edit_btn", None), getattr(self, "finish_btn", None),
+                    self.export_btn, self.debug_checkbox]:
+            try:
+                wdg.setVisible(False)
+            except Exception:
+                pass
+
+        self.parameterisation_method = "edge_modes_2d"
+        self._morph2d = None
+        self._morph2d_key = None
+        self._morph2d_limits = None
+        self._show_2d_param_panel()
+
+    def _show_2d_param_panel(self):
+        from ShapeParameterization.edgeModes2D import order_chain, arc_length, chain_normals
+        try:
+            self.plotter.close()
+        except Exception:
+            pass
+        self._clear_param_widgets()
+
+        self.plotter = QtInteractor(self)
+        self.main_layout.addWidget(self.plotter)
+        m2 = self.mesh_obj.mesh2d
+
+        try:
+            self.plotter.add_mesh(self.mesh_obj.domain_mesh(), color=(0.85, 0.85, 0.85),
+                                  style="wireframe", line_width=0.5, pickable=False)
+        except Exception:
+            pass
+        role = {e: ("T", "#d62728") for e in self.TSurfaces}
+        role.update({e: ("U", "#ff7f0e") for e in self.USurfaces})
+        for e in m2.edges:
+            r, col = role.get(e, ("C", "#555555"))
+            self.plotter.add_mesh(self.mesh_obj.get_surface_mesh(e), color=col,
+                                  line_width=8 if r == "T" else 5, render_lines_as_tubes=True)
+
+        k_max, ok = 1, True
+        try:
+            gids, closed = order_chain(m2, self.TSurfaces)
+            xy = m2.nodes[gids, :2]
+            s, seg = arc_length(xy, closed)
+            L = float(seg.sum())
+            k_max = max(1, int(np.floor(L / (4.0 * float(seg.max())))))
+            n = chain_normals(xy, closed)
+            step = max(1, len(gids) // 25)
+            cent = np.column_stack([xy[::step], np.zeros(len(xy[::step]))])
+            dirs = np.column_stack([n[::step], np.zeros(len(n[::step]))])
+            self.plotter.add_arrows(cent, dirs, mag=0.06 * L, color="black")
+            self.log(f"[2D] T chain: {len(gids)} nodes, length {L:.4g}, closed={closed}; "
+                     f"up to {k_max} modes resolved. Arrows = +coefficient direction (into the fluid).")
+        except ValueError as e:
+            ok = False
+            self.log(f"[2D][ERROR] {e}")
+
+        self._setup_2d_camera()
+        self.plotter.reset_camera()
+        self._focus_2d()
+
+        self.back_btn = QPushButton("Back")
+        self.back_btn.clicked.connect(self.back_to_surface_selection)
+        self.main_layout.addWidget(self.back_btn)
+        if not ok:
+            return
+
+        self.form = QFormLayout()
+        self.form_container = QWidget()
+        self.form_container.setLayout(self.form)
+        self.form.addRow("Parameterisation:", QLabel("Edge Laplacian modes (2D)"))
+
+        self.k_modes_spin = QSpinBox()
+        self.k_modes_spin.setRange(1, k_max)
+        self.k_modes_spin.setValue(min(int(getattr(self, "k_modes", 6) or 6), k_max))
+        self.form.addRow(f"Number of modes (max {k_max}):", self.k_modes_spin)
+
+        self.ends_combo = QComboBox()
+        self.ends_combo.addItems(["Fixed ends (no step at junctions)", "Free ends"])
+        self.ends_combo.setCurrentIndex(0 if getattr(self, "edge_ends", "fixed") == "fixed" else 1)
+        self.form.addRow("T end condition:", self.ends_combo)
+
+        self.support_frac_spin = QDoubleSpinBox()
+        self.support_frac_spin.setRange(0.05, 20.0)
+        self.support_frac_spin.setDecimals(3)
+        self.support_frac_spin.setSingleStep(0.1)
+        self.support_frac_spin.setValue(float(getattr(self, "support_frac", 1.0)))
+        self.form.addRow("RBF radius / T length:", self.support_frac_spin)
+
+        self.min_area_spin = QDoubleSpinBox()
+        self.min_area_spin.setRange(0.0, 0.9)
+        self.min_area_spin.setDecimals(3)
+        self.min_area_spin.setSingleStep(0.01)
+        self.min_area_spin.setValue(float(getattr(self, "min_area_ratio", 0.05)))
+        self.form.addRow("Min triangle area ratio:", self.min_area_spin)
+
+        self.bound_frac_spin = QDoubleSpinBox()
+        self.bound_frac_spin.setRange(0.01, 1.0)
+        self.bound_frac_spin.setDecimals(3)
+        self.bound_frac_spin.setSingleStep(0.05)
+        self.bound_frac_spin.setValue(float(getattr(self, "bound_frac", 0.5)))
+        self.form.addRow("BO bounds / validity limit:", self.bound_frac_spin)
+
+        self.main_layout.addWidget(self.form_container)
+
+        self.modal_explorer_btn = QPushButton("Explore Edge Modes")
+        self.modal_explorer_btn.clicked.connect(self.open_modal_explorer_2d)
+        self.main_layout.addWidget(self.modal_explorer_btn)
+
+        self.save_btn = QPushButton("Save 2D Basis")
+        self.save_btn.clicked.connect(self.save_basis_2d)
+        self.main_layout.addWidget(self.save_btn)
+
+    def _read_2d_form(self):
+        self.k_modes = int(self.k_modes_spin.value())
+        self.edge_ends = "fixed" if self.ends_combo.currentIndex() == 0 else "free"
+        self.support_frac = float(self.support_frac_spin.value())
+        self.min_area_ratio = float(self.min_area_spin.value())
+        self.bound_frac = float(self.bound_frac_spin.value())
+
+    def _build_morph2d(self):
+        """Morph2D for the current form values (cached). None on error."""
+        from MeshGeneration.Morph2D import Morph2D
+        self._read_2d_form()
+        key = (tuple(self.TSurfaces), tuple(self.USurfaces), self.k_modes, self.edge_ends,
+               self.support_frac, self.min_area_ratio)
+        if getattr(self, "_morph2d", None) is not None and self._morph2d_key == key:
+            return self._morph2d
+        try:
+            mo = Morph2D(self.mesh_obj.mesh2d, self.TSurfaces, self.USurfaces, n_modes=self.k_modes,
+                         ends=self.edge_ends, support_frac=self.support_frac,
+                         min_area_ratio=self.min_area_ratio)
+        except Exception as e:
+            self.log(f"[2D][ERROR] Could not set up the 2D morph: {e}")
+            return None
+        self._morph2d, self._morph2d_key, self._morph2d_limits = mo, key, None
+        self.log(f"[2D] Morph set up: {mo.n_modes} modes, R={mo.R:.4g}, "
+                 f"{len(mo.src_ids)} RBF sources, {len(mo.tgt_ids)} free nodes.")
+        return mo
+
+    def _mode_limits_2d(self, mo):
+        if getattr(self, "_morph2d_limits", None) is None:
+            self._morph2d_limits = [mo.max_safe_amplitude(k) for k in range(mo.n_modes)]
+            for k, (lo, hi) in enumerate(self._morph2d_limits):
+                self.log(f"[2D] mode {k + 1}: valid mesh for a in [{lo:.4g}, {hi:.4g}]")
+        return self._morph2d_limits
+
+    def open_modal_explorer_2d(self):
+        mo = self._build_morph2d()
+        if mo is None:
+            return
+        from GUI.modal_explorer_2d import ModalExplorer2D
+        base = os.path.splitext(os.path.basename(getattr(self, "input_filepath", "") or "mesh"))[0]
+        self.modal_explorer_window = ModalExplorer2D(
+            mo, self._mode_limits_2d(mo), output_dir=getattr(self, "output_dir", None),
+            base_name=base, logger=self.logger)
+        self.modal_explorer_window.show()
+
+    def save_basis_2d(self):
+        mo = self._build_morph2d()
+        if mo is None:
+            return
+        limits = self._mode_limits_2d(mo)
+        f = self.bound_frac
+        self.edge_mode_bounds = [(f * lo, f * hi) for lo, hi in limits]
+        self.control_nodes = None
+        try:
+            try:
+                from GUI.morph_basis_builder import build_morph_basis
+            except ImportError:
+                from morph_basis_builder import build_morph_basis
+            basis = build_morph_basis(self)
+            cn_dir = os.path.join(self.output_dir, "Control Nodes")
+            os.makedirs(cn_dir, exist_ok=True)
+            path = os.path.join(cn_dir, "morph_basis.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(basis, fh, indent=2)
+            mo.modes.save(os.path.join(cn_dir, "edge_modes_2d.json"))
+            self.log(f"[2D] Saved 2D morph basis -> {path}")
+        except Exception as e:
+            self.log(f"[2D][ERROR] Failed to save the 2D basis: {e}")
+            return
+        self.control_ready.emit()
+
     def open_edit_dialog(self):
         # Use stored name lists (fall back to empty if not set yet)
         T_names = getattr(self, "T_names", [])
@@ -1267,6 +1620,8 @@ class MeshViewer(QWidget):
         all_surface_names = list(self.mesh_obj.norm_label_to_id.keys())
         
         dlg = SurfaceEditDialog(all_surface_names, T_names, U_names, C_names, self)
+        if self._is_2d():
+            dlg.setWindowTitle("Edit Edge Selections")
         dlg.show()
         dlg.accepted.connect(lambda: self._apply_edit_results(dlg))
         
@@ -1567,6 +1922,7 @@ class MeshViewer(QWidget):
         try:
             # Remove control node widgets
             self.plotter.close()
+            self._clear_param_widgets()
             if hasattr(self, "form_widget"):
                 self.form_widget.setParent(None)
             if hasattr(self, "back_btn"):

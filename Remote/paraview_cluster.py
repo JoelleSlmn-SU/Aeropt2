@@ -1492,15 +1492,33 @@ def main():
 
         except Exception as e:
             print(f"[MON][WARN] Failed to compute {name}: {e}", flush=True)
-            results[name] = float("nan")
+            # Write NaN under the SAME column the successful path uses, so a
+            # failure (e.g. at an early iteration) cannot create a differently
+            # named column / shift the header of the appended CSV.
+            fail_key = {
+                "pressure_recovery": f"{name}_pressure_recovery",
+                "drag": f"{name}_over_q",
+            }.get(mtype, name)
+            results[fail_key] = float("nan")
             
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     write_header = not (args.append and os.path.isfile(args.out))
 
     fieldnames = ["iter"] + list(results.keys())
+    if not write_header:
+        # Appending: reuse the EXISTING header so values stay under the right
+        # column even if this call produced a different key set/order.
+        # Keys not in the header are dropped (reported), missing ones -> NaN.
+        with open(args.out, "r", newline="") as f:
+            existing = next(csv.reader(f), None)
+        if existing:
+            extra = [k for k in fieldnames if k not in existing]
+            if extra:
+                print(f"[MON][WARN] Columns {extra} not in existing header of {args.out}; dropped.", flush=True)
+            fieldnames = existing
 
     with open(args.out, "a" if args.append else "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = csv.DictWriter(f, fieldnames=fieldnames, restval="nan", extrasaction="ignore")
         if write_header:
             w.writeheader()
         row = {"iter": args.iter}

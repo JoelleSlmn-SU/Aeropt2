@@ -116,7 +116,43 @@ def _tolist(x):
     return None if x is None else np.asarray(x).tolist()
 
 
+def build_morph_basis_2d(mv) -> dict:
+    """morph_basis.json for a 2D (edge-mode) case. `dim: 2` is what every
+    downstream consumer (remoteOpt, pipeline_cluster_2d) dispatches on."""
+    mesh_obj = getattr(mv, "mesh_obj", None)
+    mo = getattr(mv, "_morph2d", None)
+    limits = getattr(mv, "_morph2d_limits", None)
+    return {
+        "dim": 2,
+        "parameterisation_method": "edge_modes_2d",
+        "TSurfaces": [int(s) for s in getattr(mv, "TSurfaces", [])],
+        "USurfaces": [int(s) for s in getattr(mv, "USurfaces", [])],
+        "CSurfaces": [int(s) for s in getattr(mv, "CSurfaces", [])],
+        "t_edges": [int(s) for s in getattr(mv, "TSurfaces", [])],
+        "u_edges": [int(s) for s in getattr(mv, "USurfaces", [])],
+        "k_modes": int(getattr(mv, "k_modes", 0) or 0),
+        "n_modes": int(getattr(mv, "k_modes", 0) or 0),
+        "ends": getattr(mv, "edge_ends", "fixed"),
+        "support_frac": float(getattr(mv, "support_frac", 1.0)),
+        "min_area_ratio": float(getattr(mv, "min_area_ratio", 0.05)),
+        "bound_frac": float(getattr(mv, "bound_frac", 0.5)),
+        "mode_validity_limits": None if limits is None else [list(map(float, x)) for x in limits],
+        "bounds": [list(map(float, b)) for b in (getattr(mv, "edge_mode_bounds", None) or [])],
+        "edge_label_source": getattr(mesh_obj, "label_source", None),
+        "dat_path": getattr(mesh_obj, "dat_path", None),
+        "baseline_mesh_path": getattr(mv, "input_filepath", None),
+        "t_gids": None if mo is None else mo.modes.gids.tolist(),
+        "t_length": None if mo is None else float(mo.modes.length),
+        "lam": None if mo is None else mo.modes.lam.tolist(),
+        # 3D keys some consumers read unconditionally
+        "control_nodes": [],
+        "control_normals": None,
+    }
+
+
 def build_morph_basis(mv) -> dict:
+    if int(getattr(mv, "mesh_dim", 3) or 3) == 2:
+        return build_morph_basis_2d(mv)
     return {
         "control_nodes": np.asarray(mv.control_nodes).tolist(),
         "control_normals": _tolist(getattr(mv, "control_normals", None)),
