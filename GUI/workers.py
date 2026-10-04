@@ -162,6 +162,57 @@ class SimulationWorker(QObject):
             self.failed.emit(str(e))
             
             
+class Simulation2DWorker(QObject):
+    """Runs the local FLITE 2D chain (PrePro.exe, then Solver.exe per flow condition)
+    for one design off the GUI thread. finished(list of metrics dicts, one per condition)."""
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    log = pyqtSignal(str)
+
+    def __init__(self, output_dir, base, prepro_options, control_text, conds, boundary_flags,
+                 time_limit_s, n=0, solver_dir=None, prepro_cmd=None, solver_cmd=None):
+        super().__init__()
+        self.output_dir, self.base, self.n = output_dir, base, int(n)
+        self.opts, self.control_text = prepro_options, control_text
+        self.conds = list(conds) if conds else [{}]
+        self.boundary_flags, self.time_limit_s = boundary_flags, time_limit_s
+        self.solver_dir, self.prepro_cmd, self.solver_cmd = solver_dir, prepro_cmd, solver_cmd
+        self._stop = False
+        self._discard = False
+        self.stopped = False              # True once a stop request has ended the run
+
+    def request_stop(self, discard=False):
+        """Called from the GUI thread; only sets flags (the worker thread polls them twice
+        a second). discard=True: the window is closing, so skip the pictures as well."""
+        self._discard = self._discard or bool(discard)
+        self._stop = True
+
+    def run(self):
+        from Local.flite2d_local import Flite2DCase, RunStopped
+        try:
+            case = Flite2DCase(self.output_dir, self.base, n=self.n, solver_dir=self.solver_dir,
+                               log=self._log, prepro_cmd=self.prepro_cmd, solver_cmd=self.solver_cmd)
+            self._case = case
+            results = case.run(self.opts, self.control_text, self.conds, self.boundary_flags,
+                               solver_time_limit_s=self.time_limit_s, should_stop=self._should_stop)
+            self.stopped = self._stop
+            self.finished.emit(results)
+        except RunStopped:
+            self.stopped = True
+            self.finished.emit([])
+        except Exception as e:
+            self.failed.emit(str(e))
+
+    def _should_stop(self):
+        if self._discard and getattr(self, "_case", None) is not None:
+            self._case.make_plots = False
+        return self._stop
+
+    def _log(self, msg):
+        if not self._discard:             # the window is closing: nothing left to log to
+            self.log.emit(msg)
+
+
 class OptimisationWorker(QObject):
     finished = pyqtSignal()
     failed = pyqtSignal(str)
@@ -178,4 +229,4 @@ class OptimisationWorker(QObject):
             self.log.emit(f"[OPT] Finished. Best X = {X_best}, Objective = {Y_best}")
             self.finished.emit()
         except Exception as e:
-            self.failed.emit(str(e))
+            self.failed.emit(str(e))

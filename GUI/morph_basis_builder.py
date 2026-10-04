@@ -133,9 +133,21 @@ def build_morph_basis_2d(mv) -> dict:
         "k_modes": int(getattr(mv, "k_modes", 0) or 0),
         "n_modes": int(getattr(mv, "k_modes", 0) or 0),
         "ends": getattr(mv, "edge_ends", "fixed"),
+        "corner_deg": float(getattr(mv, "corner_deg", 30.0)),
+        "min_radius_frac": float(getattr(mv, "min_radius_frac", 1e-3)),
+        "pin_junctions": bool(getattr(mv, "pin_junctions", False)),
+        "fixed_nodes": [int(g) for g in (getattr(mv, "fixed_gids_2d", None) or [])],
+        "fixed_type": getattr(mv, "fixed_type", "clamped"),
+        "fixed_xy": (None if getattr(getattr(mesh_obj, "mesh2d", None), "nodes", None) is None else
+                     [[float(v) for v in mesh_obj.mesh2d.nodes[int(g), :2]]
+                      for g in (getattr(mv, "fixed_gids_2d", None) or [])]),
         "support_frac": float(getattr(mv, "support_frac", 1.0)),
         "min_area_ratio": float(getattr(mv, "min_area_ratio", 0.05)),
         "bound_frac": float(getattr(mv, "bound_frac", 0.5)),
+        # FLITE 2D solver mesh (FileRW.FliteMesh2D): boundary flag per edge + length scale
+        "solver_bc_flags": {str(int(k)): int(v) for k, v in (getattr(mv, "solver_bc_flags", None) or {}).items()
+                            if v is not None},
+        "solver_mesh_scale": float(getattr(mv, "solver_mesh_scale", 1.0) or 1.0),
         "mode_validity_limits": None if limits is None else [list(map(float, x)) for x in limits],
         "bounds": [list(map(float, b)) for b in (getattr(mv, "edge_mode_bounds", None) or [])],
         "edge_label_source": getattr(mesh_obj, "label_source", None),
@@ -144,6 +156,10 @@ def build_morph_basis_2d(mv) -> dict:
         "t_gids": None if mo is None else mo.modes.gids.tolist(),
         "t_length": None if mo is None else float(mo.modes.length),
         "lam": None if mo is None else mo.modes.lam.tolist(),
+        "pinned_gids": None if mo is None else mo.modes.gids[mo.modes.pinned].tolist(),
+        "mode_labels": None if mo is None else [mo.modes.mode_label(k) for k in range(mo.modes.n_modes)],
+        # the modes themselves are in edge_modes_2d.json next to this file
+        "edge_modes_file": "edge_modes_2d.json",
         # 3D keys some consumers read unconditionally
         "control_nodes": [],
         "control_normals": None,
@@ -230,4 +246,4 @@ def build_morph_basis(mv) -> dict:
         "delaunay_cutoff_factor": float(getattr(mv, "delaunay_cutoff_factor", 2.5)),
 
         "rigid_translation": getattr(mv, "rigid_boundary_translation", True),
-    }
+    }

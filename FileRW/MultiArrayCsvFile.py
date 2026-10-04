@@ -39,7 +39,13 @@ class MultiArrayCsvFile:
                 f.write(f"{k}-{len(v)}:\n")
                 if len(v) > 0:
                     if type(v) == np.ndarray:
-                        f.write(f"{np.array2string(v, max_line_width=350)}\n")
+                        # Every value in full, at full precision, one row per line. With numpy's
+                        # defaults an array of more than 1000 values is abbreviated with "..."
+                        # (the file can then no longer be read), a row longer than the line
+                        # width is wrapped (misread as extra rows), and only 8 digits are kept.
+                        text = np.array2string(v, max_line_width=sys.maxsize, threshold=sys.maxsize,
+                                               precision=17, floatmode="maxprec")
+                        f.write(f"{text}\n")
                     else:
                         f.write(f"{v}\n")
 

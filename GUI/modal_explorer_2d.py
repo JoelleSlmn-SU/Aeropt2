@@ -30,12 +30,17 @@ _STEPS = 1000
 
 
 class ModalExplorer2D(QMainWindow):
-    def __init__(self, morpher, limits, output_dir=None, base_name="mesh", logger=None, parent=None):
+    def __init__(self, morpher, limits, output_dir=None, base_name="mesh", logger=None, parent=None,
+                 solver_flags=None, solver_scale=1.0):
         """
         morpher : MeshGeneration.Morph2D.Morph2D (already set up)
         limits  : list of (a_min, a_max) per mode (slider ranges)
+        solver_flags, solver_scale : boundary flag per edge and length scale used when the
+                  morphed mesh is exported as a FLITE 2D solver mesh (.dat)
         """
         super().__init__(parent)
+        self.solver_flags = dict(solver_flags or {})
+        self.solver_scale = float(solver_scale or 1.0)
         self.mo = morpher
         self.mesh = morpher.mesh
         self.limits = [(float(a), float(b)) for a, b in limits]
@@ -103,6 +108,7 @@ class ModalExplorer2D(QMainWindow):
         right = QVBoxLayout()
         info = QLabel(
             f"T length L = {self.mo.modes.length:.4g}, RBF radius R = {self.mo.R:.4g}\n"
+            f"Pinned T nodes (blue): {int(self.mo.modes.pinned.sum())}\n"
             f"Coefficient a_k = amplitude of mode k (mesh units).\n"
             f"Slider range = mesh-validity limit, not a design bound."
         )
@@ -113,7 +119,16 @@ class ModalExplorer2D(QMainWindow):
         self.sliders, self.boxes = [], []
         for k in range(self.mo.n_modes):
             lo, hi = self.limits[k]
-            grid.addWidget(QLabel(f"Mode {k + 1}  (λ={self.mo.modes.lam[k]:.3g})"), 2 * k, 0, 1, 2)
+            label = f"Mode {k + 1}  (λ={self.mo.modes.lam[k]:.3g})"
+            try:
+                where = self.mo.modes.mode_label(k)
+                if where:
+                    label += f"\n{where}"
+            except Exception:
+                pass
+            if hi - lo <= 0.0:
+                label += "\nno valid range: this mode cannot move"
+            grid.addWidget(QLabel(label), 2 * k, 0, 1, 2)
             sl = QSlider(Qt.Horizontal)
             sl.setRange(0, _STEPS)
             sl.setValue(self._to_slider(k, 0.0))
@@ -124,6 +139,9 @@ class ModalExplorer2D(QMainWindow):
             box.setValue(0.0)
             sl.valueChanged.connect(lambda v, i=k: self._slider_changed(i, v))
             box.valueChanged.connect(lambda v, i=k: self._box_changed(i, v))
+            if hi - lo <= 0.0:                 # nothing to explore: do not pretend the slider works
+                sl.setEnabled(False)
+                box.setEnabled(False)
             grid.addWidget(sl, 2 * k + 1, 0)
             grid.addWidget(box, 2 * k + 1, 1)
             self.sliders.append(sl)
@@ -204,8 +222,19 @@ class ModalExplorer2D(QMainWindow):
         for eid, nodes in self.edge_segs:
             ax.plot(P1[nodes, 0], P1[nodes, 1], "-", color="0.35", lw=1.5)
         t = self.mo.t_ids
-        ax.plot(P0[t, 0], P0[t, 1], "--", color="k", lw=1.2, label="baseline T")
-        ax.plot(P1[t, 0], P1[t, 1], "-", color="#d62728", lw=2.2, label="morphed T")
+        for c in self.mo.modes.chains:          # one line per chain, closed loops closed
+            g = t[c["start"]:c["stop"]]
+            if c["closed"]:
+                g = np.append(g, g[0])
+            first = c["start"] == 0
+            ax.plot(P0[g, 0], P0[g, 1], "--", color="k", lw=1.2, label="baseline T" if first else None)
+            ax.plot(P1[g, 0], P1[g, 1], "-", color="#d62728", lw=2.2, label="morphed T" if first else None)
+        user = np.isin(t, np.asarray(self.mo.modes.fixed_nodes, dtype=np.int64))
+        pins = t[self.mo.modes.pinned & ~user]
+        if len(pins):
+            ax.plot(P1[pins, 0], P1[pins, 1], "o", color="#1f77b4", ms=5, label="held (end / corner)")
+        if user.any():
+            ax.plot(P1[t[user], 0], P1[t[user], 1], "o", color="#2ca02c", ms=6, label="fixed by user")
         if len(self.mo.u_ids):
             u = self.mo.u_ids
             ax.plot(P1[u, 0], P1[u, 1], ".", color="#ff7f0e", ms=3, label="U nodes")
@@ -242,9 +271,21 @@ class ModalExplorer2D(QMainWindow):
             path, _ = QFileDialog.getSaveFileName(
                 self, "Export morphed mesh",
                 os.path.join(self._default_dir(), f"{self.base_name}_2d_morph.fro"),
-                "FLITE fro (*.fro);;VTK (*.vtu)")
+                "FLITE fro (*.fro);;VTK (*.vtu);;FLITE 2D solver mesh (*.dat)")
             if not path:
                 return None
+        if path.lower().endswith(".dat"):
+            from FileRW.FliteMesh2D import write_flite2d_mesh
+            if not self.last_report.ok:
+                self._log("[2D-EXPLORER][ERROR] Solver mesh not written: the morph is invalid.")
+                return None
+            try:
+                info = write_flite2d_mesh(self.last_mesh, path, self.solver_flags, scale=self.solver_scale)
+            except Exception as e:
+                self._log(f"[2D-EXPLORER][ERROR] Solver mesh not written: {e}")
+                return None
+            self._log(f"[2D-EXPLORER] Exported solver mesh -> {path}  ({info})")
+            return path
         if path.lower().endswith(".vtu"):
             self.last_mesh.write_vtk(path)
         else:
@@ -274,4 +315,4 @@ class ModalExplorer2D(QMainWindow):
         with open(path) as f:
             d = json.load(f)
         self.set_coeffs(d["coeffs"])
-        self._log(f"[2D-EXPLORER] Loaded design <- {path}")
+        self._log(f"[2D-EXPLORER] Loaded design <- {path}")

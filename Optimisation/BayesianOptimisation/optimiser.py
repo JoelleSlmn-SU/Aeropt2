@@ -89,6 +89,15 @@ class BayesianOptimiser:
         self.acquisition_function = settings.get("acquisition_function", EI)
         self.mll_maxfevals = settings.get("mll_maxfevals", 10000)
         self.af_maxfevals = settings.get("af_maxfevals", 10000)
+        # Optional extra points evaluated WITH the LHS sample in generation 0
+        # (e.g. the baseline design, x = 0). They are placed first, so
+        # Y[0] - the reference of the convergence plot - is the first of them.
+        # Default: none, i.e. exactly the previous behaviour.
+        raw_init = settings.get("initial_points", None)
+        self.initial_points = (np.zeros((0, self.n_dim)) if raw_init is None or len(raw_init) == 0
+                               else np.atleast_2d(np.asarray(raw_init, dtype=float)))
+        if self.initial_points.shape[1] != self.n_dim:
+            raise ValueError(f"initial_points must have {self.n_dim} columns, got {self.initial_points.shape[1]}")
 
         if raw_lb is None:
             self.lb = np.zeros(self.n_dim, dtype=float)
@@ -271,7 +280,7 @@ class BayesianOptimiser:
             vals = np.asarray(self.C.get(name, []), dtype=float)
             payload[f"C__{name}"] = vals.reshape([len(vals), 1]) if len(vals) else vals
         self.mac.write(payload)
-        self.convergence(self.n_samples, True)
+        self.convergence(self.n_samples + len(self.initial_points), True)
         self.visualise_generation()
 
     def load_data(self):
@@ -317,6 +326,8 @@ class BayesianOptimiser:
         else:
             self.logger.log("[INFO] Getting training data by sampling using LHS.")
             self.X_uneval = lhs(self.n_dim, samples=self.n_samples, lb=self.lb, ub=self.ub)
+            if len(self.initial_points):
+                self.X_uneval = np.vstack([self.initial_points, np.atleast_2d(self.X_uneval)])
             self.init_sample()
 
     def init_sample(self):
@@ -674,4 +685,4 @@ class BayesianOptimiser:
         plt.legend(prop={'size': 14})
         plt.savefig(f"{self.sim_dir}/bo_conv_hist_n_{training_data}_g_{self.gen_num}.png")
         plt.savefig(f"{self.sim_dir}/bo_conv_hist_n_{training_data}_g_{self.gen_num}.pdf")
-        plt.close("all")
+        plt.close("all")

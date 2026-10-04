@@ -532,7 +532,17 @@ def find_dat_for(filepath):
     """FLITE 2D geometry next to the mesh: <stem>.dat, else None."""
     stem = os.path.splitext(filepath)[0]
     cand = stem + ".dat"
-    return cand if os.path.exists(cand) else None
+    if not os.path.exists(cand):
+        return None
+    # <stem>.dat can also be a FLITE 2D SOLVER mesh (FileRW.FliteMesh2D); that is
+    # not a geometry file and must not be used to label the edges
+    try:
+        from FileRW.FliteMesh2D import is_flite2d_mesh
+        if is_flite2d_mesh(cand):
+            return None
+    except Exception:
+        pass
+    return cand
 
 
 class EdgeMeshView(Mesh):
@@ -670,4 +680,4 @@ def load_mesh(filepath, dat_path=None):
         return mesh2
 
     mesh.assign_global_ids_by_coordinates()
-    return mesh
+    return mesh

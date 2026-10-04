@@ -3,7 +3,9 @@ Morph2D.py
 
 Morph a 2D domain mesh (EdgeMesh2D) directly; no remeshing.
 
-  1. T nodes move by the edge Laplacian modes (edgeModes2D), exactly.
+  1. T nodes move by the edge modes (edgeModes2D), exactly. T may be several
+     chains with corners; edgeModes2D pins the corners and builds the modes
+     on the smooth segments between them.
   2. All other boundary nodes are FIXED, except U-edge nodes, which are free.
   3. The displacement is carried into the interior (and onto U) with an
      exact-interpolation compact Wendland C2 RBF whose sources are
@@ -95,11 +97,20 @@ class Morph2D:
     def __init__(self, mesh, t_edges: Iterable[int], u_edges: Iterable[int] = (),
                  n_modes: int = 8, ends: str = "fixed",
                  support_radius: Optional[float] = None, support_frac: float = 1.0,
-                 rbf_lambda: float = 1e-12, min_area_ratio: float = 0.05):
+                 rbf_lambda: float = 1e-12, min_area_ratio: float = 0.05,
+                 corner_deg: float = 30.0, min_radius_frac: float = 1e-3,
+                 pin_junctions: bool = False, fixed_nodes: Iterable[int] = (),
+                 fixed_type: str = "clamped", modes: Optional[EdgeModes2D] = None):
         """
         support_radius : RBF support radius in mesh units. Default
-                         support_frac * (length of the T chain).
+                         support_frac * (total length of the T chains).
         min_area_ratio : quality gate on min(A_new / A_old).
+        corner_deg, min_radius_frac, pin_junctions, fixed_nodes, fixed_type :
+                         where the T chains are held and cut into smooth
+                         segments (see edgeModes2D). fixed_nodes are mesh node
+                         ids chosen by the user.
+        modes          : a ready EdgeModes2D (e.g. EdgeModes2D.from_saved) to
+                         use instead of building one; its t_edges must match.
         """
         self.mesh = mesh
         self.t_edges = [int(e) for e in t_edges]
@@ -111,7 +122,15 @@ class Morph2D:
         if unknown:
             raise ValueError(f"Unknown edge ids {sorted(unknown)}; mesh has {sorted(mesh.edges)}.")
 
-        self.modes = EdgeModes2D.from_mesh(mesh, self.t_edges, n_modes=n_modes, ends=ends)
+        if modes is not None:
+            if [int(e) for e in modes.t_edges] != self.t_edges:
+                raise ValueError(f"modes were built for T edges {modes.t_edges}, not {self.t_edges}.")
+            self.modes = modes
+        else:
+            self.modes = EdgeModes2D.from_mesh(mesh, self.t_edges, n_modes=n_modes, ends=ends,
+                                               corner_deg=corner_deg, min_radius_frac=min_radius_frac,
+                                               pin_junctions=pin_junctions,
+                                               fixed_nodes=fixed_nodes, fixed_type=fixed_type)
         self.min_area_ratio = float(min_area_ratio)
 
         N = mesh.node_count
@@ -224,11 +243,24 @@ class Morph2D:
         rep = self.check(new_nodes, d)
         return self.mesh.with_nodes(new_nodes), rep
 
-    def max_safe_amplitude(self, k: int, a_max: Optional[float] = None, tol: float = 1e-3):
+    def max_safe_amplitude(self, k: int, a_max: Optional[float] = None, tol: float = 1e-3,
+                           floor: float = 1e-7):
         """
         Largest |a_k| (single mode k, others zero, both signs) that passes the
         quality gate. Bisection; returns (a_minus, a_plus) with a_minus <= 0.
         Useful for setting honest BO bounds per mode.
+
+        tol   : RELATIVE accuracy of the returned limit.
+        floor : limits below floor * a_max are reported as 0.
+
+        The tolerance used to be absolute (tol * a_max), so a mode whose real
+        limit was below 0.1% of the T length came back as exactly 0 and looked
+        dead. It now resolves down to `floor`; a limit that small still means
+        the mode is unusable (see `usable_range`), but the number is honest.
+
+        Assumes validity is monotone in |a| (valid below the limit, invalid
+        above), which holds for folding/inversion in practice but is not
+        guaranteed.
         """
         if a_max is None:
             a_max = self.modes.length
@@ -240,7 +272,7 @@ class Morph2D:
             if self.check(*self._nd(x)).ok:
                 out.append(sgn * hi)
                 continue
-            while hi - lo > tol * a_max:
+            while hi - lo > tol * hi and hi > floor * a_max:
                 mid = 0.5 * (lo + hi)
                 x[k] = sgn * mid
                 if self.check(*self._nd(x)).ok:
@@ -249,6 +281,21 @@ class Morph2D:
                     hi = mid
             out.append(sgn * lo)
         return out[0], out[1]
+
+    def usable_range(self, limits, min_frac: float = 1e-3):
+        """
+        For each (a_minus, a_plus) from max_safe_amplitude: True if the mode
+        has a usable range, i.e. max(|a_minus|, a_plus) >= min_frac * (length
+        of the segment the mode lives on). A False entry must not become a BO
+        variable: its bounds would be (almost) zero-width.
+        """
+        ok = []
+        for k, (lo, hi) in enumerate(limits):
+            Ls = self.modes.length
+            if self.modes.mode_segment is not None and len(self.modes.segments):
+                Ls = self.modes.segments[int(self.modes.mode_segment[k])].length
+            ok.append(max(abs(lo), abs(hi)) >= min_frac * Ls)
+        return ok
 
     def _nd(self, x):
         d = self.displacement_field(x)

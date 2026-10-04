@@ -52,6 +52,19 @@ class VtkRightClickFilter(QObject):
             return True  # consume
         return False
 
+def display_to_world_xy(renderer, xp, yp):
+    """
+    World (x, y) under display pixel (xp, yp) (VTK convention: origin bottom-left).
+    Exact for the 2D view (parallel projection looking down z), whatever the depth,
+    so it does not need the click to hit an actor.
+    """
+    renderer.SetDisplayPoint(float(xp), float(yp), 0.0)
+    renderer.DisplayToWorld()
+    w = renderer.GetWorldPoint()
+    k = w[3] if abs(w[3]) > 1e-300 else 1.0
+    return w[0] / k, w[1] / k
+
+
 class MeshViewer(QWidget):
     control_ready = pyqtSignal()
     log_signal = pyqtSignal(str)
@@ -273,6 +286,8 @@ class MeshViewer(QWidget):
         self._morph2d = None
         self._morph2d_key = None
         self._morph2d_limits = None
+        self.solver_bc_flags = {}      # per-edge solver flags belong to one mesh
+        self.fixed_gids_2d = []
         self.surface_actors = {}
         self.hidden_surfaces = set()
         self.TSurfaces, self.USurfaces, self.CSurfaces = [], [], []
@@ -1442,8 +1457,175 @@ class MeshViewer(QWidget):
         self._morph2d_limits = None
         self._show_2d_param_panel()
 
+    def _layout_2d(self):
+        """Chains, pinned nodes and smooth segments for the current settings (no modes)."""
+        from ShapeParameterization.edgeModes2D import EdgeModes2D
+        m2 = self.mesh_obj.mesh2d
+        t_nodes = set()
+        for e in self.TSurfaces:
+            t_nodes |= set(int(n) for n in m2.edges[int(e)].nodes)
+        # user-fixed points that are no longer on T (T selection changed) are dropped
+        self.fixed_gids_2d = [int(g) for g in getattr(self, "fixed_gids_2d", []) if int(g) in t_nodes]
+        return EdgeModes2D.from_mesh(
+            m2, self.TSurfaces, n_modes=0,
+            ends=getattr(self, "edge_ends", "fixed"),
+            corner_deg=float(getattr(self, "corner_deg", 30.0)),
+            min_radius_frac=float(getattr(self, "min_radius_frac", 1e-3)),
+            pin_junctions=bool(getattr(self, "pin_junctions", False)),
+            fixed_nodes=self.fixed_gids_2d,
+            fixed_type=getattr(self, "fixed_type", "clamped"))
+
+    def _layout_sig_2d(self, lay):
+        return (tuple(lay.gids[lay.pinned].tolist()), lay.k_max, len(lay.segments),
+                tuple(lay.fixed_nodes), lay.fixed_type, lay.ends)
+
+    def _draw_2d_layout(self, lay):
+        """Arrows = +coefficient direction on the free T nodes; blue points = nodes held
+        automatically (ends, corners); green points = points fixed by the user."""
+        z = float(self.mesh_obj.mesh2d.nodes[0, 2])
+        idx = np.flatnonzero(~lay.pinned)
+        idx = idx[::max(1, len(idx) // 25)]
+        cent = np.column_stack([lay.xy[idx], np.full(len(idx), z)])
+        dirs = np.column_stack([lay.normals[idx], np.zeros(len(idx))])
+        self.plotter.add_arrows(cent, dirs, mag=0.06 * lay.length, color="black", name="t_arrows")
+        user = np.isin(lay.gids, np.asarray(lay.fixed_nodes, dtype=np.int64))
+        for name, mask, colour, size in (("t_pins", lay.pinned & ~user, "#1f77b4", 14),
+                                         ("t_fixed", user, "#2ca02c", 18)):
+            pos = np.flatnonzero(mask)
+            if len(pos):
+                self.plotter.add_points(np.column_stack([lay.xy[pos], np.full(len(pos), z)]),
+                                        color=colour, point_size=size, render_points_as_spheres=True,
+                                        name=name, pickable=False)
+            else:
+                try:
+                    self.plotter.remove_actor(name)
+                except Exception:
+                    pass
+
+    def _log_2d_layout(self, lay):
+        for line in lay.describe():
+            self.log(f"[2D] {line}")
+        self._layout2d_sig = self._layout_sig_2d(lay)
+
+    def _refresh_2d_layout(self, *_):
+        """A pinning setting changed: recompute the layout, the mode limit and the preview."""
+        if not hasattr(self, "k_modes_spin"):
+            return
+        try:
+            self.edge_ends = ("fixed", "free", "clamped")[self.ends_combo.currentIndex()]
+            self.corner_deg = float(self.corner_deg_spin.value())
+            self.min_radius_frac = float(self.min_radius_spin.value())
+            self.pin_junctions = bool(self.pin_junctions_cb.isChecked())
+            self.fixed_type = ("clamped", "pinned")[self.fixed_type_combo.currentIndex()]
+            lay = self._layout_2d()
+        except ValueError as e:
+            self.log(f"[2D][ERROR] {e}")
+            return
+        except RuntimeError:          # widgets already deleted by Qt
+            return
+        self._layout2d = lay
+        k_max = max(1, lay.k_max)
+        self.k_modes_spin.setMaximum(k_max)
+        self.k_modes_label.setText(f"Number of modes (max {k_max}):")
+        self._update_fixed_list_2d()
+        if self._layout_sig_2d(lay) != getattr(self, "_layout2d_sig", None):
+            self._log_2d_layout(lay)
+        try:
+            self._draw_2d_layout(lay)
+            self.plotter.render()
+        except Exception:
+            pass
+
+    # ---- points fixed by the user ------------------------------------------
+    def _update_fixed_list_2d(self):
+        lw = getattr(self, "fixed_list", None)
+        if lw is None:
+            return
+        try:
+            lw.clear()
+            P = self.mesh_obj.mesh2d.nodes
+            for g in getattr(self, "fixed_gids_2d", []):
+                lw.addItem(f"({P[g, 0]:.6g}, {P[g, 1]:.6g})   node {g}")
+        except RuntimeError:
+            pass
+
+    def _fix_point_at_xy_2d(self, x, y, tol=None, toggle=True):
+        """
+        Fix the T node nearest to (x, y), or release it if the user had fixed it
+        (toggle). tol: largest accepted distance (None = always take the nearest).
+        Returns the node id, or None if nothing changed.
+        """
+        lay = getattr(self, "_layout2d", None)
+        if lay is None:
+            return None
+        d = np.hypot(lay.xy[:, 0] - x, lay.xy[:, 1] - y)
+        pos = int(np.argmin(d))
+        if tol is not None and d[pos] > tol:
+            self.log(f"[2D] No T node near ({x:.5g}, {y:.5g}); click closer to a T edge.")
+            return None
+        g = int(lay.gids[pos])
+        fixed = list(getattr(self, "fixed_gids_2d", []))
+        if g in fixed:
+            if not toggle:
+                return None
+            fixed.remove(g)
+            self.log(f"[2D] Released the fixed point at ({lay.xy[pos, 0]:.6g}, {lay.xy[pos, 1]:.6g}).")
+        elif lay.pinned[pos]:
+            self.log(f"[2D] ({lay.xy[pos, 0]:.6g}, {lay.xy[pos, 1]:.6g}) is already held: "
+                     f"{lay.pin_reason.get(pos, 'pinned')}. Nothing to do.")
+            return None
+        else:
+            fixed.append(g)
+            self.log(f"[2D] Fixed the T node at ({lay.xy[pos, 0]:.6g}, {lay.xy[pos, 1]:.6g}).")
+        self.fixed_gids_2d = fixed
+        self._refresh_2d_layout()
+        return g
+
+    def _on_right_click_2d(self, x, y):
+        """Qt right-click on the 2D view: fix / release the nearest T node."""
+        try:
+            try:
+                dpr = float(self.plotter.devicePixelRatioF())
+            except Exception:
+                dpr = 1.0
+            wx, wy = display_to_world_xy(self.plotter.renderer, x * dpr,
+                                         (self.plotter.height() - y) * dpr)
+            try:
+                tol = 0.03 * 2.0 * float(self.plotter.camera.parallel_scale)   # 3% of the view height
+            except Exception:
+                tol = None
+            self._fix_point_at_xy_2d(wx, wy, tol=tol)
+        except Exception as e:
+            self.log(f"[2D][WARN] Could not pick a point: {e}")
+
+    def _add_fixed_by_coords_2d(self):
+        text, ok = QInputDialog.getText(self, "Fix a point",
+                                        "x, y   (snaps to the nearest T node):")
+        if not ok or not text.strip():
+            return
+        try:
+            x, y = [float(v) for v in text.replace(";", ",").replace(" ", ",").split(",") if v != ""][:2]
+        except Exception:
+            self.log(f"[2D][ERROR] Could not read two numbers from '{text}'. Use e.g.  0.0, 0.0")
+            return
+        self._fix_point_at_xy_2d(x, y, tol=None, toggle=False)
+
+    def _remove_selected_fixed_2d(self):
+        rows = sorted({i.row() for i in self.fixed_list.selectedIndexes()}, reverse=True)
+        fixed = list(getattr(self, "fixed_gids_2d", []))
+        for r in rows:
+            if 0 <= r < len(fixed):
+                fixed.pop(r)
+        if rows:
+            self.fixed_gids_2d = fixed
+            self._refresh_2d_layout()
+
+    def _clear_fixed_2d(self):
+        if getattr(self, "fixed_gids_2d", []):
+            self.fixed_gids_2d = []
+            self._refresh_2d_layout()
+
     def _show_2d_param_panel(self):
-        from ShapeParameterization.edgeModes2D import order_chain, arc_length, chain_normals
         try:
             self.plotter.close()
         except Exception:
@@ -1468,18 +1650,14 @@ class MeshViewer(QWidget):
 
         k_max, ok = 1, True
         try:
-            gids, closed = order_chain(m2, self.TSurfaces)
-            xy = m2.nodes[gids, :2]
-            s, seg = arc_length(xy, closed)
-            L = float(seg.sum())
-            k_max = max(1, int(np.floor(L / (4.0 * float(seg.max())))))
-            n = chain_normals(xy, closed)
-            step = max(1, len(gids) // 25)
-            cent = np.column_stack([xy[::step], np.zeros(len(xy[::step]))])
-            dirs = np.column_stack([n[::step], np.zeros(len(n[::step]))])
-            self.plotter.add_arrows(cent, dirs, mag=0.06 * L, color="black")
-            self.log(f"[2D] T chain: {len(gids)} nodes, length {L:.4g}, closed={closed}; "
-                     f"up to {k_max} modes resolved. Arrows = +coefficient direction (into the fluid).")
+            lay = self._layout_2d()
+            self._layout2d = lay
+            k_max = max(1, lay.k_max)
+            self._draw_2d_layout(lay)
+            self._log_2d_layout(lay)
+            self.log("[2D] Arrows = +coefficient direction (into the fluid). Blue points = held "
+                     "automatically (ends, corners). Green points = fixed by you: RIGHT-click on a "
+                     "T edge to fix a point, right-click it again to release it.")
         except ValueError as e:
             ok = False
             self.log(f"[2D][ERROR] {e}")
@@ -1487,6 +1665,16 @@ class MeshViewer(QWidget):
         self._setup_2d_camera()
         self.plotter.reset_camera()
         self._focus_2d()
+
+        # right-click on the view = fix / release the nearest T node
+        try:
+            if getattr(self, "_vtk_rc_filter", None) is not None:
+                self.plotter.removeEventFilter(self._vtk_rc_filter)
+        except Exception:
+            pass
+        if ok:
+            self._vtk_rc_filter = VtkRightClickFilter(self.plotter, self._on_right_click_2d)
+            self.plotter.installEventFilter(self._vtk_rc_filter)
 
         self.back_btn = QPushButton("Back")
         self.back_btn.clicked.connect(self.back_to_surface_selection)
@@ -1497,17 +1685,81 @@ class MeshViewer(QWidget):
         self.form = QFormLayout()
         self.form_container = QWidget()
         self.form_container.setLayout(self.form)
-        self.form.addRow("Parameterisation:", QLabel("Edge Laplacian modes (2D)"))
+        self.form.addRow("Parameterisation:", QLabel("Edge modes on smooth segments (2D)"))
 
         self.k_modes_spin = QSpinBox()
         self.k_modes_spin.setRange(1, k_max)
         self.k_modes_spin.setValue(min(int(getattr(self, "k_modes", 6) or 6), k_max))
-        self.form.addRow(f"Number of modes (max {k_max}):", self.k_modes_spin)
+        self.k_modes_label = QLabel(f"Number of modes (max {k_max}):")
+        self.form.addRow(self.k_modes_label, self.k_modes_spin)
 
         self.ends_combo = QComboBox()
-        self.ends_combo.addItems(["Fixed ends (no step at junctions)", "Free ends"])
-        self.ends_combo.setCurrentIndex(0 if getattr(self, "edge_ends", "fixed") == "fixed" else 1)
+        self.ends_combo.addItems(["Fixed ends (no step at junctions)", "Free ends",
+                                  "Clamped ends (no step and no kink at junctions)"])
+        self.ends_combo.setCurrentIndex(
+            {"fixed": 0, "free": 1, "clamped": 2}.get(getattr(self, "edge_ends", "fixed"), 0))
+        self.ends_combo.setToolTip("Applies to the ends of open T chains. Corners inside T are always pinned.")
         self.form.addRow("T end condition:", self.ends_combo)
+
+        self.corner_deg_spin = QDoubleSpinBox()
+        self.corner_deg_spin.setRange(1.0, 180.0)
+        self.corner_deg_spin.setDecimals(1)
+        self.corner_deg_spin.setSingleStep(1.0)
+        self.corner_deg_spin.setValue(float(getattr(self, "corner_deg", 30.0)))
+        self.corner_deg_spin.setToolTip(
+            "A T node turning by more than this is a corner and is pinned (zero displacement),\n"
+            "unless it is part of a coarsely resolved smooth arc. Lower it to pin ramp kinks.")
+        self.form.addRow("Corner angle (deg):", self.corner_deg_spin)
+
+        self.min_radius_spin = QDoubleSpinBox()
+        self.min_radius_spin.setRange(0.0, 0.5)
+        self.min_radius_spin.setDecimals(5)
+        self.min_radius_spin.setSingleStep(0.0005)
+        self.min_radius_spin.setValue(float(getattr(self, "min_radius_frac", 1e-3)))
+        self.min_radius_spin.setToolTip(
+            "Also pin nodes whose local radius of curvature is below this fraction of the chain length\n"
+            "(sharp lips, small round caps): a normal offset larger than the radius folds the curve.")
+        self.form.addRow("Pin if radius / chain length <", self.min_radius_spin)
+
+        self.pin_junctions_cb = QCheckBox("Pin junctions between T edges")
+        self.pin_junctions_cb.setChecked(bool(getattr(self, "pin_junctions", False)))
+        self.pin_junctions_cb.setToolTip(
+            "Hold the points where two T edges meet (e.g. the leading edge, if the surface is split\n"
+            "there). Each side then gets its own modes.")
+        self.form.addRow("", self.pin_junctions_cb)
+
+        # ---- points fixed by the user ----
+        self.fixed_list = QListWidget()
+        self.fixed_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.fixed_list.setMaximumHeight(90)
+        self.fixed_list.setToolTip("Points on T that must not move. Right-click on a T edge in the view "
+                                   "to fix the nearest node; right-click it again to release it.")
+        self.form.addRow("Fixed points (right-click on T):", self.fixed_list)
+        fixed_btns = QWidget()
+        fb = QHBoxLayout(fixed_btns)
+        fb.setContentsMargins(0, 0, 0, 0)
+        for text, fn in (("Add by coordinates...", self._add_fixed_by_coords_2d),
+                         ("Remove selected", self._remove_selected_fixed_2d),
+                         ("Clear", self._clear_fixed_2d)):
+            btn = QPushButton(text)
+            btn.clicked.connect(fn)
+            fb.addWidget(btn)
+        self.form.addRow("", fixed_btns)
+
+        self.fixed_type_combo = QComboBox()
+        self.fixed_type_combo.addItems(["Position and slope (curve stays smooth)",
+                                        "Position only (hinge: a kink can form)"])
+        self.fixed_type_combo.setCurrentIndex(0 if getattr(self, "fixed_type", "clamped") == "clamped" else 1)
+        self.fixed_type_combo.setToolTip("Applies to the points you fix and to T-edge junctions. "
+                                         "Geometric corners are always hinges.")
+        self.form.addRow("Fixed points hold:", self.fixed_type_combo)
+        self.fixed_type_combo.currentIndexChanged.connect(self._refresh_2d_layout)
+        self._update_fixed_list_2d()
+
+        self.ends_combo.currentIndexChanged.connect(self._refresh_2d_layout)
+        self.corner_deg_spin.valueChanged.connect(self._refresh_2d_layout)
+        self.min_radius_spin.valueChanged.connect(self._refresh_2d_layout)
+        self.pin_junctions_cb.stateChanged.connect(self._refresh_2d_layout)
 
         self.support_frac_spin = QDoubleSpinBox()
         self.support_frac_spin.setRange(0.05, 20.0)
@@ -1530,6 +1782,34 @@ class MeshViewer(QWidget):
         self.bound_frac_spin.setValue(float(getattr(self, "bound_frac", 0.5)))
         self.form.addRow("BO bounds / validity limit:", self.bound_frac_spin)
 
+        # ---- FLITE 2D solver mesh: boundary type per edge + length scale ----
+        from FileRW.FliteMesh2D import default_edge_flags, flag_text, FLAG_LABELS
+        guess = default_edge_flags(m2)
+        saved = getattr(self, "solver_bc_flags", None) or {}
+        self.solver_bc_flags = {int(e): saved.get(int(e), guess.get(e)) for e in m2.edges}
+        self.bc_flag_combos = {}
+        for e in m2.edges.values():
+            cb = QComboBox()
+            cb.setEditable(True)                      # any other integer flag can be typed
+            cb.addItems([flag_text(f) for f in sorted(FLAG_LABELS)])
+            cur = self.solver_bc_flags.get(e.id)
+            cb.setCurrentText(flag_text(cur) if cur is not None else "")
+            cb.setToolTip("Boundary condition the FLITE 2D solver applies on this edge. "
+                          "Type another integer flag if the solver needs one that is not listed.")
+            r = role.get(e.id, ("C", ""))[0]
+            self.form.addRow(f"Solver boundary: {e.name} [{r}]", cb)
+            self.bc_flag_combos[e.id] = cb
+
+        self.solver_scale_spin = QDoubleSpinBox()
+        self.solver_scale_spin.setDecimals(8)
+        self.solver_scale_spin.setRange(1e-8, 1e8)
+        self.solver_scale_spin.setValue(float(getattr(self, "solver_mesh_scale", 1.0) or 1.0))
+        self.solver_scale_spin.setToolTip(
+            "Coordinates are multiplied by this when the solver mesh (.dat) is written.\n"
+            "The solver is non-dimensional: forces and the Reynolds number are per unit of ITS length,\n"
+            "so e.g. 0.001 turns a 1000-unit chord into a chord of 1.")
+        self.form.addRow("Solver mesh scale:", self.solver_scale_spin)
+
         self.main_layout.addWidget(self.form_container)
 
         self.modal_explorer_btn = QPushButton("Explore Edge Modes")
@@ -1542,36 +1822,102 @@ class MeshViewer(QWidget):
 
     def _read_2d_form(self):
         self.k_modes = int(self.k_modes_spin.value())
-        self.edge_ends = "fixed" if self.ends_combo.currentIndex() == 0 else "free"
+        self.edge_ends = ("fixed", "free", "clamped")[self.ends_combo.currentIndex()]
+        self.corner_deg = float(self.corner_deg_spin.value())
+        self.min_radius_frac = float(self.min_radius_spin.value())
+        self.pin_junctions = bool(self.pin_junctions_cb.isChecked())
+        self.fixed_type = ("clamped", "pinned")[self.fixed_type_combo.currentIndex()]
+        self.fixed_gids_2d = [int(g) for g in getattr(self, "fixed_gids_2d", [])]
         self.support_frac = float(self.support_frac_spin.value())
         self.min_area_ratio = float(self.min_area_spin.value())
         self.bound_frac = float(self.bound_frac_spin.value())
+        self._read_solver_mesh_form()
+
+    def _read_solver_mesh_form(self):
+        """Solver boundary flag per edge + mesh scale from the 2D form. Raises ValueError
+        with a readable message if a flag is missing or not an integer."""
+        from FileRW.FliteMesh2D import parse_flag
+        flags = {}
+        for eid, cb in getattr(self, "bc_flag_combos", {}).items():
+            text = cb.currentText().strip()
+            if not text:
+                raise ValueError(f"Edge {eid} has no solver boundary type.")
+            try:
+                flags[int(eid)] = parse_flag(text)
+            except ValueError:
+                raise ValueError(f"Edge {eid}: '{text}' is not a solver boundary flag (an integer).")
+        self.solver_bc_flags = flags
+        self.solver_mesh_scale = float(self.solver_scale_spin.value())
+
+    def write_solver_mesh_2d(self, mesh2d, n=0, write_map=False):
+        """
+        Write `mesh2d` (baseline or morphed EdgeMesh2D) as the FLITE 2D solver mesh
+        <output_dir>/volumes/n_<n>/<base>_<n>.dat with the flags and scale of the form.
+        Returns the FliteMesh2DInfo, or None on error (logged).
+        """
+        from FileRW.FliteMesh2D import write_flite2d_mesh
+        base = os.path.splitext(os.path.basename(getattr(self, "input_filepath", "") or "mesh"))[0]
+        out = os.path.join(self.output_dir, "volumes", f"n_{int(n)}", f"{base}_{int(n)}.dat")
+        try:
+            info = write_flite2d_mesh(mesh2d, out, self.solver_bc_flags,
+                                      scale=float(getattr(self, "solver_mesh_scale", 1.0) or 1.0),
+                                      write_map=write_map)
+        except Exception as e:
+            self.log(f"[2D][ERROR] Solver mesh NOT written ({out}): {e}")
+            return None
+        self.log(f"[2D] Solver mesh -> {out}  ({info})")
+        # picture of the wall and the mesh around it: surfaces/n_<n>/<base>_<n>.png
+        # (for n > 0 the baseline wall is drawn underneath). Never stops the save.
+        try:
+            from Local.flite2d_local import Flite2DCase
+            Flite2DCase(self.output_dir, base, n=int(n), log=self.log).save_mesh_image(force=True)
+        except Exception as e:
+            self.log(f"[2D][WARN] Surface-mesh picture not written: {e}")
+        return info
 
     def _build_morph2d(self):
         """Morph2D for the current form values (cached). None on error."""
         from MeshGeneration.Morph2D import Morph2D
-        self._read_2d_form()
+        try:
+            self._read_2d_form()
+        except ValueError as e:
+            self.log(f"[2D][ERROR] {e}")
+            return None
         key = (tuple(self.TSurfaces), tuple(self.USurfaces), self.k_modes, self.edge_ends,
-               self.support_frac, self.min_area_ratio)
+               self.support_frac, self.min_area_ratio,
+               self.corner_deg, self.min_radius_frac, self.pin_junctions,
+               tuple(self.fixed_gids_2d), self.fixed_type)
         if getattr(self, "_morph2d", None) is not None and self._morph2d_key == key:
             return self._morph2d
         try:
             mo = Morph2D(self.mesh_obj.mesh2d, self.TSurfaces, self.USurfaces, n_modes=self.k_modes,
                          ends=self.edge_ends, support_frac=self.support_frac,
-                         min_area_ratio=self.min_area_ratio)
+                         min_area_ratio=self.min_area_ratio, corner_deg=self.corner_deg,
+                         min_radius_frac=self.min_radius_frac, pin_junctions=self.pin_junctions,
+                         fixed_nodes=self.fixed_gids_2d, fixed_type=self.fixed_type)
         except Exception as e:
             self.log(f"[2D][ERROR] Could not set up the 2D morph: {e}")
             return None
         self._morph2d, self._morph2d_key, self._morph2d_limits = mo, key, None
         self.log(f"[2D] Morph set up: {mo.n_modes} modes, R={mo.R:.4g}, "
                  f"{len(mo.src_ids)} RBF sources, {len(mo.tgt_ids)} free nodes.")
+        for note in mo.modes.notes:
+            self.log(f"[2D] note: {note}")
         return mo
 
     def _mode_limits_2d(self, mo):
         if getattr(self, "_morph2d_limits", None) is None:
             self._morph2d_limits = [mo.max_safe_amplitude(k) for k in range(mo.n_modes)]
+            usable = mo.usable_range(self._morph2d_limits)
             for k, (lo, hi) in enumerate(self._morph2d_limits):
-                self.log(f"[2D] mode {k + 1}: valid mesh for a in [{lo:.4g}, {hi:.4g}]")
+                self.log(f"[2D] mode {k + 1} ({mo.modes.mode_label(k)}): "
+                         f"valid mesh for a in [{lo:.4g}, {hi:.4g}]"
+                         + ("" if usable[k] else "   <-- NO USABLE RANGE"))
+            dead = [k + 1 for k, u in enumerate(usable) if not u]
+            if dead:
+                self.log(f"[2D][WARN] Mode(s) {dead} cannot move without breaking the mesh. This means "
+                         "they displace a corner or a very tight curve that was not pinned: lower the "
+                         "corner angle / raise the radius limit, or check the pinned nodes in the log.")
         return self._morph2d_limits
 
     def open_modal_explorer_2d(self):
@@ -1582,7 +1928,8 @@ class MeshViewer(QWidget):
         base = os.path.splitext(os.path.basename(getattr(self, "input_filepath", "") or "mesh"))[0]
         self.modal_explorer_window = ModalExplorer2D(
             mo, self._mode_limits_2d(mo), output_dir=getattr(self, "output_dir", None),
-            base_name=base, logger=self.logger)
+            base_name=base, logger=self.logger,
+            solver_flags=dict(self.solver_bc_flags), solver_scale=self.solver_mesh_scale)
         self.modal_explorer_window.show()
 
     def save_basis_2d(self):
@@ -1590,6 +1937,14 @@ class MeshViewer(QWidget):
         if mo is None:
             return
         limits = self._mode_limits_2d(mo)
+        dead = [k + 1 for k, u in enumerate(mo.usable_range(limits)) if not u]
+        if dead:
+            # a zero-width bound is not a design variable: it would break the
+            # bound normalisation in the optimiser or waste a dimension
+            self.log(f"[2D][ERROR] Basis NOT saved: mode(s) {dead} have no usable amplitude range, so "
+                     "their optimisation bounds would be zero-width. Fix the pinning (see the warning "
+                     "above) or reduce the number of modes.")
+            return
         f = self.bound_frac
         self.edge_mode_bounds = [(f * lo, f * hi) for lo, hi in limits]
         self.control_nodes = None
@@ -1608,6 +1963,11 @@ class MeshViewer(QWidget):
             self.log(f"[2D] Saved 2D morph basis -> {path}")
         except Exception as e:
             self.log(f"[2D][ERROR] Failed to save the 2D basis: {e}")
+            return
+        # baseline solver mesh (n = 0) + the node map shared by every deformation
+        if self.write_solver_mesh_2d(mo.mesh, n=0, write_map=True) is None:
+            self.log("[2D][ERROR] The basis was saved, but the case cannot run until the solver mesh "
+                     "can be written. Fix the problem above and save again.")
             return
         self.control_ready.emit()
 
@@ -3085,4 +3445,4 @@ class GlobalModesDialog(QDialog):
                     "type": mode_combo.currentText(),
                     "direction": dir_combo.currentText()
                 })
-        return out
+        return out

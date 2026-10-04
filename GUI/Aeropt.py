@@ -10,6 +10,7 @@ from geometry_gui import GeometryPanel
 from SSHLoginDialog import SshLoginDialog
 import paramiko
 import os, sys
+import json
 
 sys.path.append(os.path.dirname("FileRW"))
 sys.path.append(os.path.dirname("Remote"))
@@ -530,6 +531,7 @@ class MainWindow(QMainWindow):
         
         self.input_directory_set = True
         self.create_pipeline()
+        self._refresh_solver_page_mode()
         
     def _ensure_output_home(self):
         """Make sure output_directory + subfolders and rbf_original exist, and sync to MeshViewer."""
@@ -828,6 +830,19 @@ class MainWindow(QMainWindow):
         self.run_sim_btn.pressed.connect(self.run_simulation)
         self.run_sim_btn.setEnabled(False)
         self.button_layout.addWidget(self.run_sim_btn)
+
+        # Stops a local 2D run (PrePro.exe / Solver.exe). Enabled only while one is running.
+        self.stop_sim_btn = QPushButton("Stop Simulation")
+        self.stop_sim_btn.pressed.connect(self.stop_simulation)
+        self.stop_sim_btn.setEnabled(False)
+        self.stop_sim_btn.setToolTip(
+            "Stop the local 2D run now (a simulation or an optimisation).\n"
+            "Simulation: the residual history up to this point and the flow field the solver last\n"
+            "wrote (one every ivd%writeToFileInterval iterations) are kept and plotted; flow\n"
+            "conditions that have not started are not run.\n"
+            "Optimisation: the design being computed is abandoned, every finished design is kept,\n"
+            "and 'Run Optimisation' continues from there.")
+        self.button_layout.addWidget(self.stop_sim_btn)
         
         self.run_opt_btn = QPushButton("Run Optimisation")
         self.run_opt_btn.pressed.connect(self.run_optimisation)
@@ -1000,7 +1015,7 @@ class MainWindow(QMainWindow):
             return
         
         if self._is_2d_case():
-            self._stage_before_hpc_run("SIM")   # logs why 2D cannot run yet
+            self._run_simulation_2d(conds)      # local PrePro.exe + Solver.exe
             return
 
         if getattr(self, "run_mode", "") == "HPC":
@@ -1030,6 +1045,159 @@ class MainWindow(QMainWindow):
         self.sim_thread.start()
         
     
+    def stop_simulation(self):
+        """Stop the running local 2D simulation or optimisation (the Stop Simulation button)."""
+        if getattr(self, "opt2d_proc", None) is not None:
+            self._stop_optimisation_2d()
+            return
+        worker = getattr(self, "sim2d_worker", None)
+        if worker is None or getattr(self, "sim2d_thread", None) is None:
+            self.logger.log("[SIM][2D] No local 2D simulation is running.")
+            return
+        worker.request_stop()                       # only sets a flag; the worker thread does the rest
+        self.stop_sim_btn.setEnabled(False)
+        self.logger.log("[SIM][2D] Stop requested - ending the running program and saving what was computed...")
+
+    def _run_simulation_2d(self, conds):
+        """Baseline 2D case (n = 0): Solver/PrePro.exe, then Solver/Solver.exe per flow condition."""
+        from PyQt5.QtCore import QThread
+        from GUI.workers import Simulation2DWorker
+        from Local.flite2d_local import Flite2DCase, apply_condition, check_control, find_executables
+        log = self.logger.log
+
+        if getattr(self, "sim2d_thread", None) is not None:
+            log("[SIM][2D] A 2D simulation is already running.")
+            return
+        if getattr(self, "opt2d_proc", None) is not None:
+            log("[SIM][2D] A 2D optimisation is running (it uses the same folders); stop it or wait for it.")
+            return
+        if not getattr(self, "output_directory", None):
+            log("[SIM][2D][ERROR] No output directory set.")
+            return
+        opts = getattr(self, "prepro2d_options", None)
+        if opts is None:
+            log("[SIM][2D][ERROR] Save the 2D PrePro input first (Solver Settings).")
+            return
+        base = self.get_project_basename()
+        control_path = os.path.join(self.output_directory, f"{base}.inp")
+        try:
+            with open(control_path, "r", encoding="utf-8", errors="ignore") as f:
+                control_text = f.read()
+        except OSError:
+            log(f"[SIM][2D][ERROR] Solver file not found: {control_path}. Press 'Save Solver Settings'.")
+            return
+        # flite2d_prepro_cmd / flite2d_solver_cmd: stand-in command lines (tests only)
+        cmds = (getattr(self, "flite2d_prepro_cmd", None), getattr(self, "flite2d_solver_cmd", None))
+        if not all(cmds):
+            try:
+                find_executables()
+            except (FileNotFoundError, RuntimeError) as e:
+                log(f"[SIM][2D][ERROR] {e}")
+                return
+
+        # solver mesh of the baseline: written by 'Save 2D Basis'; written here if the
+        # boundary types are already known but the basis has not been saved yet
+        case = Flite2DCase(self.output_directory, base, n=0, log=log)
+        mv = getattr(self, "mesh_viewer", None)
+        flags = dict(getattr(mv, "solver_bc_flags", None) or {})
+        if not os.path.isfile(case.mesh_path):
+            mesh2d = getattr(getattr(mv, "mesh_obj", None), "mesh2d", None)
+            if mesh2d is None or not flags or any(v is None for v in flags.values()):
+                log("[SIM][2D][ERROR] No solver mesh yet. In the mesh view select the T edges, check the "
+                    "'Solver boundary' type of every edge and press 'Save 2D Basis'.")
+                return
+            if mv.write_solver_mesh_2d(mesh2d, n=0, write_map=True) is None:
+                return
+        try:   # the flags the mesh on disk was written with
+            with open(os.path.join(self.output_directory, "Control Nodes", "morph_basis.json"),
+                      "r", encoding="utf-8") as f:
+                saved = json.load(f).get("solver_bc_flags") or {}
+            if saved:
+                flags = {int(k): int(v) for k, v in saved.items()}
+        except Exception:
+            pass
+        limit_min = int(getattr(self, "flite2d_time_limit_min", 60) or 0)
+        limit_s = 60.0 * limit_min if limit_min else None
+
+        # check every condition now, so mistakes show before PrePro starts
+        for i, cond in enumerate(conds, 1):
+            try:
+                text, notes = apply_condition(control_text, cond)
+            except Exception as e:
+                log(f"[SIM][2D][ERROR] cond {i}: {e}")
+                return
+            errors, warnings = check_control(text, opts.n_grids, flags.values() if flags else None, limit_s)
+            if errors:
+                log(f"[SIM][2D][ERROR] cond {i}: " + " ".join(errors))
+                return
+
+        self.sim2d_thread = QThread(self)
+        self.sim2d_worker = Simulation2DWorker(self.output_directory, base, opts, control_text, conds,
+                                               list(flags.values()) if flags else None, limit_s, n=0,
+                                               prepro_cmd=cmds[0], solver_cmd=cmds[1])
+        self.sim2d_worker.moveToThread(self.sim2d_thread)
+        # Bound methods of this window (a QObject), not lambdas: Qt then delivers them
+        # in the GUI thread. The logger writes to a text widget, which must not be
+        # touched from the worker thread.
+        self.sim2d_worker.log.connect(self._on_sim2d_log)
+        self.sim2d_worker.finished.connect(self._on_sim2d_finished)
+        self.sim2d_worker.failed.connect(self._on_sim2d_failed)
+        self.sim2d_thread.started.connect(self.sim2d_worker.run)
+        self.sim2d_thread.finished.connect(self._on_sim2d_thread_finished)
+
+        self.run_sim_btn.setEnabled(False)          # one 2D run at a time
+        self.stop_sim_btn.setEnabled(True)
+        log(f"[SIM][2D] Running locally: PrePro then Solver, {len(conds)} flow condition(s), "
+            f"time limit {str(limit_min) + ' min' if limit_min else 'none'} per condition.")
+        self.sim2d_thread.start()
+
+    @pyqtSlot(str)
+    def _on_sim2d_log(self, msg):
+        self.logger.log(msg)
+
+    @pyqtSlot(object)
+    def _on_sim2d_finished(self, results):
+        log = self.logger.log
+        stopped = bool(getattr(getattr(self, "sim2d_worker", None), "stopped", False))
+        for r in results or []:
+            if r.get("status") == "ok":
+                log(f"[SIM][2D] cond {r['cond']}: lift {r['CL']:.6g}  drag {r['CD']:.6g}  moment "
+                    f"{r['CM']:.6g}  ({r['iterations']} iterations, residual {r['residual']:.4g})")
+            elif r.get("status") in ("stopped", "timeout") and r.get("rows"):
+                # numbers of an unfinished run: shown, and marked as such
+                log(f"[SIM][2D][WARN] cond {r['cond']} {r['status'].upper()} at iteration {r['iterations']} "
+                    f"(residual {r['residual']:.4g}): lift {r['CL']:.6g}  drag {r['CD']:.6g}  moment "
+                    f"{r['CM']:.6g} - not converged to the stop criterion.")
+            else:
+                log(f"[SIM][2D][ERROR] cond {r.get('cond')}: {r.get('status')} - no usable result.")
+        n_plots = sum(len(r.get("plots") or []) for r in results or [])
+        where = os.path.join(self.output_directory, "solutions", "n_0")
+        if stopped and not results:
+            log("[SIM][2D] Stopped before the solver started; nothing was computed.")
+        else:
+            log(f"[SIM][2D] {'Stopped' if stopped else 'Finished'}. Results"
+                f"{' and ' + str(n_plots) + ' picture(s)' if n_plots else ''} in {where}; surface-mesh "
+                f"picture in {os.path.join(self.output_directory, 'surfaces', 'n_0')}")
+        self.sim2d_last_results = results
+        if getattr(self, "sim2d_thread", None) is not None:
+            self.sim2d_thread.quit()
+
+    @pyqtSlot(str)
+    def _on_sim2d_failed(self, msg):
+        self.logger.log(f"[SIM][2D][ERROR] {msg}")
+        self.sim2d_last_results = None
+        if getattr(self, "sim2d_thread", None) is not None:
+            self.sim2d_thread.quit()
+
+    @pyqtSlot()
+    def _on_sim2d_thread_finished(self):
+        if getattr(self, "sim2d_thread", None) is not None:
+            self.sim2d_thread.deleteLater()
+        self.sim2d_thread = None
+        self.sim2d_worker = None
+        self.stop_sim_btn.setEnabled(False)
+        self.check_run_sim_button_state()
+
     def _normalise_monitor_type_from_metric(self, metric: str) -> str:
         m = str(metric).strip().lower()
 
@@ -1577,6 +1745,10 @@ class MainWindow(QMainWindow):
             self.logger.log("[OPT] Please save optimisation settings first.")
             return
 
+        if self._is_2d_case():
+            self._run_optimisation_2d()         # local: Local/local2DOpt.py in its own process
+            return
+
         if self.run_mode != "HPC":
             self.logger.log("[OPT] Optimisation is currently only wired for HPC mode.")
             return
@@ -1709,6 +1881,210 @@ class MainWindow(QMainWindow):
         jid = out.split()[-1] if "Submitted batch job" in out else "?"
         self.logger.log(f"[OPT] Submitted headless optimisation job {jid}. You can now close the UI.")
         return
+
+    # ------------------------------------------------------------------
+    # 2D optimisation on this machine
+    # ------------------------------------------------------------------
+    def _run_optimisation_2d(self):
+        """
+        Bayesian optimisation of the 2D case, locally. Writes <output>/opt/bo_settings.json
+        and objective.json (the same two files the cluster run uses) and starts
+        Local/local2DOpt.py as a separate Python process: the optimiser's own search is
+        heavy pure-Python work that would freeze this window if it ran inside it. The
+        process is stopped through the Stop Simulation button and resumed by pressing
+        Run Optimisation again.
+        """
+        import time
+        log = self.logger.log
+        if getattr(self, "opt2d_proc", None) is not None:
+            log("[OPT][2D] An optimisation is already running.")
+            return
+        if getattr(self, "sim2d_thread", None) is not None:
+            log("[OPT][2D] A 2D simulation is running (it uses the same folders); wait for it or stop it.")
+            return
+        if getattr(sys, "frozen", False):
+            log("[OPT][2D][ERROR] The local optimisation needs a Python interpreter to start "
+                "Local/local2DOpt.py; it cannot be started from a packaged executable.")
+            return
+        if not getattr(self, "output_directory", None):
+            log("[OPT][2D][ERROR] No output directory set.")
+            return
+        opts = getattr(self, "prepro2d_options", None)
+        if opts is None:
+            log("[OPT][2D][ERROR] Save the 2D PrePro input first (Solver Settings).")
+            return
+        base = self.get_project_basename()
+        out = self.output_directory
+        control_path = os.path.join(out, f"{base}.inp")
+        basis_path = os.path.join(out, "Control Nodes", "morph_basis.json")
+        for path, what in ((control_path, "solver file; press 'Save Solver Settings'"),
+                           (basis_path, "morph basis; press 'Save 2D Basis'")):
+            if not os.path.isfile(path):
+                log(f"[OPT][2D][ERROR] Not found: {path} ({what}).")
+                return
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        script = os.path.join(repo, "Local", "local2DOpt.py")
+        if not os.path.isfile(script):
+            log(f"[OPT][2D][ERROR] Not found: {script}")
+            return
+
+        run_dir = os.path.join(out, "opt")
+        if os.path.isfile(os.path.join(run_dir, "bo_data.mcsv")):
+            n_done = 0
+            try:
+                with open(os.path.join(run_dir, "designs.json"), "r", encoding="utf-8") as f:
+                    n_done = sum(1 for d in json.load(f).get("designs", []) if d.get("done"))
+            except Exception:
+                pass
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle("Optimisation")
+            box.setText(f"There is already an optimisation in\n{run_dir}\n({n_done} design(s) computed).")
+            box.setInformativeText(
+                "Continue it: finished designs are kept and the run goes on from where it stopped. "
+                "This only works if the objective, flow conditions, solver settings and basis are unchanged.\n\n"
+                "Start new: the old folder is renamed (nothing is deleted) and a fresh optimisation starts.")
+            b_cont = box.addButton("Continue", QMessageBox.AcceptRole)
+            b_new = box.addButton("Start new", QMessageBox.DestructiveRole)
+            box.addButton(QMessageBox.Cancel)
+            box.exec_()
+            if box.clickedButton() is b_new:
+                old = run_dir + time.strftime("_%Y%m%d_%H%M%S")
+                try:
+                    os.rename(run_dir, old)
+                except OSError as e:
+                    log(f"[OPT][2D][ERROR] Could not rename {run_dir} ({e}). Close any file of it that is open.")
+                    return
+                log(f"[OPT][2D] Previous optimisation kept as {old}")
+            elif box.clickedButton() is not b_cont:
+                return
+        os.makedirs(run_dir, exist_ok=True)
+
+        s = dict(self.bayes_settings)
+        s["kernel"] = self.bo_kernel_combo.currentText()
+        s["acquisition_function"] = self.bo_acq_combo.currentText()
+        s["lb"] = [float(v) for v in s.get("lb", [])]
+        s["ub"] = [float(v) for v in s.get("ub", [])]
+        s["sim_dir"] = run_dir
+        s["base_name"] = base
+        s["output_dir"] = out
+        s["morph_basis_json"] = basis_path
+        s["solver_control_file"] = control_path
+        s["prepro"] = opts.to_dict()
+        s["solver_time_limit_min"] = int(getattr(self, "flite2d_time_limit_min", 60) or 0)
+        s["constraints"] = self.objective_config.get("constraints", [])
+        # flite2d_prepro_cmd / flite2d_solver_cmd: stand-in command lines (tests only)
+        if getattr(self, "flite2d_prepro_cmd", None) and getattr(self, "flite2d_solver_cmd", None):
+            s["prepro_cmd"], s["solver_cmd"] = list(self.flite2d_prepro_cmd), list(self.flite2d_solver_cmd)
+        for k, v in (getattr(self, "opt2d_extra_settings", None) or {}).items():
+            s[k] = v
+        try:
+            with open(os.path.join(run_dir, "bo_settings.json"), "w", encoding="utf-8") as f:
+                json.dump(s, f, indent=2)
+            with open(os.path.join(run_dir, "objective.json"), "w", encoding="utf-8") as f:
+                json.dump(self.objective_config, f, indent=2)
+        except (OSError, TypeError) as e:
+            log(f"[OPT][2D][ERROR] Could not write the optimisation settings: {e}")
+            return
+
+        proc = QProcess(self)
+        proc.setProcessChannelMode(QProcess.MergedChannels)
+        proc.setWorkingDirectory(repo)
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONIOENCODING", "utf-8")
+        env.insert("PYTHONUNBUFFERED", "1")
+        proc.setProcessEnvironment(env)
+        proc.readyReadStandardOutput.connect(self._on_opt2d_output)
+        proc.finished.connect(self._on_opt2d_finished)
+        proc.errorOccurred.connect(self._on_opt2d_error)
+        self.opt2d_proc, self.opt2d_run_dir, self._opt2d_buf = proc, run_dir, b""
+        self.opt2d_last_code = None
+        self.run_opt_btn.setEnabled(False)
+        self.run_sim_btn.setEnabled(False)
+        self.stop_sim_btn.setEnabled(True)
+        log(f"[OPT][2D] Starting the local optimisation: {s.get('n_samples')} initial sample(s) + baseline, "
+            f"{s.get('count_limit')} optimiser step(s). Run folder: {run_dir}")
+        proc.start(sys.executable, ["-u", script, run_dir])
+
+    def _opt2d_flush(self, final=False):
+        buf = getattr(self, "_opt2d_buf", b"")
+        lines = buf.split(b"\n")
+        self._opt2d_buf = b"" if final else lines.pop()
+        for raw in lines:
+            line = raw.decode("utf-8", errors="replace").rstrip("\r")
+            if line.strip():
+                self.logger.log(line)
+
+    @pyqtSlot()
+    def _on_opt2d_output(self):
+        proc = getattr(self, "opt2d_proc", None)
+        if proc is None:
+            return
+        self._opt2d_buf = getattr(self, "_opt2d_buf", b"") + bytes(proc.readAllStandardOutput())
+        self._opt2d_flush()
+
+    def _stop_optimisation_2d(self):
+        """Ask the optimisation to stop: it ends the running program itself and keeps what is finished."""
+        proc = getattr(self, "opt2d_proc", None)
+        if proc is None:
+            return
+        try:
+            with open(os.path.join(self.opt2d_run_dir, "STOP"), "w") as f:
+                f.write("stop requested from the GUI\n")
+        except OSError as e:
+            self.logger.log(f"[OPT][2D][ERROR] Could not write the STOP file ({e}); ending the process instead.")
+            proc.kill()
+            return
+        self.stop_sim_btn.setEnabled(False)
+        self.logger.log("[OPT][2D] Stop requested - the design being computed is abandoned; finished designs "
+                        "are kept. (If the optimiser is choosing the next design, this takes up to a minute.)")
+        # the script reacts within half a second while PrePro/Solver run; if it is still
+        # alive after a minute it is inside the optimiser's own search, where ending it is safe
+        QTimer.singleShot(60000, self._kill_optimisation_2d_if_running)
+
+    def _kill_optimisation_2d_if_running(self):
+        proc = getattr(self, "opt2d_proc", None)
+        if proc is not None and proc.state() != QProcess.NotRunning:
+            self.logger.log("[OPT][2D] Still running a minute after the stop request; ending the process.")
+            proc.kill()
+
+    @pyqtSlot(QProcess.ProcessError)
+    def _on_opt2d_error(self, err):
+        if err == QProcess.FailedToStart:
+            self.logger.log(f"[OPT][2D][ERROR] Could not start {sys.executable}.")
+            self._on_opt2d_finished(-1, QProcess.CrashExit)
+
+    @pyqtSlot(int, QProcess.ExitStatus)
+    def _on_opt2d_finished(self, code, status):
+        proc = getattr(self, "opt2d_proc", None)
+        if proc is None:
+            return
+        try:
+            self._opt2d_buf = getattr(self, "_opt2d_buf", b"") + bytes(proc.readAllStandardOutput())
+        except Exception:
+            pass
+        self._opt2d_flush(final=True)
+        log, run_dir = self.logger.log, getattr(self, "opt2d_run_dir", "")
+        self.opt2d_last_code = int(code)
+        if status == QProcess.NormalExit and code == 0:
+            log(f"[OPT][2D] Optimisation finished. Table of designs: {os.path.join(run_dir, 'designs.csv')}; "
+                f"history: {os.path.join(run_dir, 'history.png')}")
+        elif status == QProcess.NormalExit and code == 3:
+            log("[OPT][2D] Optimisation stopped. Press 'Run Optimisation' and choose 'Continue' to go on.")
+        elif status == QProcess.NormalExit and code == 1:
+            log("[OPT][2D][ERROR] The optimisation did not run to the end; see the message above.")
+        else:
+            log(f"[OPT][2D][ERROR] The optimisation process ended unexpectedly (code {code}). Finished designs "
+                f"are kept; details in {os.path.join(run_dir, 'local_opt.log')}.")
+        try:
+            os.remove(os.path.join(run_dir, "STOP"))
+        except OSError:
+            pass
+        self.opt2d_proc = None
+        proc.deleteLater()
+        self.stop_sim_btn.setEnabled(False)
+        self.check_run_sim_button_state()
+        self.check_run_opt_button_state()
 
     def open_geometry_window(self):
         if hasattr(self, "mesh_viewer") and self.mesh_viewer.mesh_obj:
@@ -2404,6 +2780,40 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(rung_grp)
         layout.addLayout(rg_btns)
+        self.rung_grp, self.save_rungen_btn = rung_grp, save_rungen_btn
+
+        # ---- 2D case: FLITE 2D preprocessor (Solver/PrePro.exe). Shown instead of
+        # the Rungen group when the loaded mesh is 2D (see _refresh_solver_page_mode).
+        self.pre2d_grp = QGroupBox("2D Preprocessor (PrePro.exe)")
+        p2 = QFormLayout(self.pre2d_grp)
+        self.p2_num_grids = QSpinBox(); self.p2_num_grids.setRange(1, 20); self.p2_num_grids.setValue(5)
+        self.p2_num_grids.setToolTip("Multigrid levels PrePro generates. ivd%numberOfGridsToUse in the solver "
+                                     "file must not be larger than this.")
+        self.p2_hybrid = QCheckBox(); self.p2_hybrid.setChecked(False)
+        self.p2_hybrid.setToolTip("Leave off: the 2D meshes written by AerOpt are all triangles.")
+        self.p2_direction = QLineEdit("0")
+        self.p2_direction.setToolTip("0 = no directional agglomeration (the usual setting).")
+        self.p2_ndir = QSpinBox(); self.p2_ndir.setRange(0, 100); self.p2_ndir.setValue(0)
+        self.p2_ndir.setToolTip("PrePro only asks for this when the directionality parameter is not 0.")
+        self.p2_time_limit = QSpinBox(); self.p2_time_limit.setRange(0, 100000); self.p2_time_limit.setValue(60)
+        self.p2_time_limit.setSuffix(" min"); self.p2_time_limit.setSpecialValueText("no limit")
+        self.p2_time_limit.setToolTip(
+            "The solver is stopped and the case marked 'timeout' after this long.\n"
+            "Needed when ivd%numberOfMGIterations is negative (run until converged): "
+            "a case that stalls would otherwise never end.")
+        self.p2_exe_label = QLabel("")
+        self.p2_exe_label.setWordWrap(True)
+        p2.addRow("Number of grids:", self.p2_num_grids)
+        p2.addRow("Hybrid mesh:", self.p2_hybrid)
+        p2.addRow("Directionality parameter:", self.p2_direction)
+        p2.addRow("Directional agglomerations:", self.p2_ndir)
+        p2.addRow("Solver time limit:", self.p2_time_limit)
+        p2.addRow("Executables:", self.p2_exe_label)
+        self.save_pre2d_btn = QPushButton("💾 Save 2D PrePro Input to Project")
+        self.save_pre2d_btn.clicked.connect(self.save_prepro2d_settings)
+        p2.addRow("", self.save_pre2d_btn)
+        layout.addWidget(self.pre2d_grp)
+        self.pre2d_grp.setVisible(False)
 
         self.prev_solution_cb = QCheckBox("Initialise from previous solution")
         self.prev_solution_cb.setChecked(False)
@@ -2495,6 +2905,88 @@ class MainWindow(QMainWindow):
         self.prepro_settings_saved = True
         self.check_run_sim_button_state()
 
+    # ------------------------------------------------------------------
+    # 2D solver settings (FLITE 2D PrePro.exe / Solver.exe, local only)
+    # ------------------------------------------------------------------
+    def _flite2d_template_path(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(root, "templates", "flite2d_solver.inp")
+
+    def _refresh_solver_page_mode(self):
+        """Show the Rungen (3D) or the 2D PrePro group, depending on the loaded mesh."""
+        if not hasattr(self, "pre2d_grp"):
+            return
+        is2d = self._is_2d_case()
+        for w, visible in ((self.rung_grp, not is2d), (self.save_rungen_btn, not is2d),
+                           (self.pre2d_grp, is2d),
+                           (self.prev_solution_cb, not is2d), (self.prev_solution_summary, not is2d)):
+            w.setVisible(visible)
+        if getattr(self, "_solver_page_is2d", None) not in (None, is2d):
+            # settings saved for the other kind of case do not apply to this one
+            self.prepro_settings_saved = False
+            self.solver_settings_saved = False
+            self.check_run_sim_button_state()
+        self._solver_page_is2d = is2d
+        if not is2d:
+            return
+        from Local.flite2d_local import default_solver_dir, is_control_file, unfixed_executables
+        d = default_solver_dir()
+        missing = [n for n in ("PrePro.exe", "Solver.exe") if not os.path.isfile(os.path.join(d, n))]
+        unfixed = unfixed_executables(d)
+        note = (f"   (MISSING: {', '.join(missing)})" if missing else
+                f"\n{' and '.join(unfixed)} not repaired yet: run  python Utilities/fix_flite2d_exes.py Solver"
+                if unfixed else "   (repaired)")
+        self.p2_exe_label.setText(d + note)
+        # start from the 2D template unless a 2D control file is already in the editor
+        if not is_control_file(self.solver_editor.toPlainText()):
+            saved = os.path.join(getattr(self, "output_directory", "") or "", f"{self.get_project_basename()}.inp")
+            for path in (saved, self._flite2d_template_path()):
+                try:
+                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                        text = f.read()
+                except OSError:
+                    continue
+                if is_control_file(text):
+                    self.solver_editor.setPlainText(text)
+                    self.solver_file = path
+                    self.logger.log(f"[Solver][2D] Loaded 2D solver file: {path}")
+                    break
+
+    def _read_prepro2d_form(self):
+        from Local.flite2d_local import PreProOptions
+        return PreProOptions(n_grids=int(self.p2_num_grids.value()), hybrid=bool(self.p2_hybrid.isChecked()),
+                             directionality=self.p2_direction.text(), n_directional=int(self.p2_ndir.value()))
+
+    def save_prepro2d_settings(self):
+        if not getattr(self, "output_directory", None):
+            QMessageBox.warning(self, "Error", "Please set an output directory first.")
+            return
+        from Local.flite2d_local import Flite2DCase
+        try:
+            opts = self._read_prepro2d_form()
+        except ValueError as e:
+            QMessageBox.warning(self, "2D PrePro settings", f"Invalid setting: {e}")
+            return
+        self.prepro2d_options = opts
+        self.flite2d_time_limit_min = int(self.p2_time_limit.value())
+        case = Flite2DCase(self.output_directory, self.get_project_basename(), n=0, log=self.logger.log)
+        try:
+            path = case.write_prepro_input(opts)
+            with open(os.path.join(self.output_directory, "flite2d_settings.json"), "w", encoding="utf-8") as f:
+                json.dump({"prepro": opts.to_dict(), "solver_time_limit_min": self.flite2d_time_limit_min},
+                          f, indent=2)
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed", f"Could not save the 2D PrePro input:\n{e}")
+            return
+        self.logger.log(f"[Solver][2D] Wrote PrePro input → {path}  "
+                        f"({opts.n_grids} grid(s), time limit "
+                        f"{self.flite2d_time_limit_min or 'none'}{' min' if self.flite2d_time_limit_min else ''})")
+        if not os.path.isfile(case.mesh_path):
+            self.logger.log("[Solver][2D] Note: the solver mesh does not exist yet. It is written when you "
+                            "press 'Save 2D Basis' (it needs the boundary type of every edge).")
+        self.prepro_settings_saved = True
+        self.check_run_sim_button_state()
+
     def load_solver_file(self):
         start_dir = os.path.join(os.getcwd(), "templates")
         path, _ = QFileDialog.getOpenFileName(self, "Open Solver File", start_dir, "Text files (*.inp *.txt *.cfg *.dat);;All files (*)")
@@ -2515,7 +3007,22 @@ class MainWindow(QMainWindow):
         self.base = self.get_project_basename()
         save_path = os.path.join(self.output_directory, f"{self.base}.inp")
         folder = os.path.dirname(save_path)
-        
+
+        if self._is_2d_case():
+            # a 3D solver file saved for a 2D case would only fail later, inside Solver.exe
+            from Local.flite2d_local import check_control
+            try:
+                n_grids = self._read_prepro2d_form().n_grids
+            except ValueError:
+                n_grids = None
+            errors, warnings = check_control(self.solver_editor.toPlainText(), n_grids,
+                                             time_limit_s=60.0 * int(self.p2_time_limit.value()) or None)
+            if errors and "not a FLITE 2D" in errors[0]:
+                QMessageBox.warning(self, "2D solver file", "Not saved: " + errors[0])
+                return
+            for msg in errors + warnings:
+                self.logger.log(f"[Solver][2D][WARN] {msg}")
+
         try:
             with open(save_path, "w", encoding="utf-8") as f:
                 f.write(self.solver_editor.toPlainText())
@@ -2626,9 +3133,29 @@ class MainWindow(QMainWindow):
 
     def activate_tab_3(self):
         self.stack_layout.setCurrentIndex(2)
+        self._refresh_solver_page_mode()
         
     def closeEvent(self, event):
         """Ensure sub-windows and plotters are cleaned up when closing the app."""
+        try:
+            worker, thread = getattr(self, "sim2d_worker", None), getattr(self, "sim2d_thread", None)
+            if worker is not None and thread is not None:
+                worker.request_stop(discard=True)   # kills the running PrePro/Solver process; no pictures
+                thread.quit()
+                thread.wait(15000)
+        except Exception as e:
+            print(f"[DEBUG] Error stopping the 2D simulation: {e}")
+        try:
+            proc = getattr(self, "opt2d_proc", None)
+            if proc is not None and proc.state() != QProcess.NotRunning:
+                # ask it to stop (it ends PrePro/Solver itself), then make sure it is gone
+                with open(os.path.join(self.opt2d_run_dir, "STOP"), "w") as f:
+                    f.write("the GUI was closed\n")
+                if not proc.waitForFinished(15000):
+                    proc.kill()
+                    proc.waitForFinished(5000)
+        except Exception as e:
+            print(f"[DEBUG] Error stopping the 2D optimisation: {e}")
         try:
             if hasattr(self, "geom_window") and self.geom_window is not None:
                 self.geom_window.close()
@@ -4077,4 +4604,4 @@ if __name__ == "__main__":
     if window.available_themes:
         window.apply_qss_theme(window.available_themes[-1])
 
-    sys.exit(app.exec())
+    sys.exit(app.exec())
