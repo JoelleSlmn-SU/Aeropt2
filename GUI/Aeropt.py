@@ -836,18 +836,30 @@ class MainWindow(QMainWindow):
         self.stop_sim_btn.pressed.connect(self.stop_simulation)
         self.stop_sim_btn.setEnabled(False)
         self.stop_sim_btn.setToolTip(
-            "Stop the local 2D run now (a simulation or an optimisation).\n"
-            "Simulation: the residual history up to this point and the flow field the solver last\n"
+            "End the local 2D simulation that is running now.\n"
+            "Run Simulation: the residual history up to this point and the flow field the solver last\n"
             "wrote (one every ivd%writeToFileInterval iterations) are kept and plotted; flow\n"
             "conditions that have not started are not run.\n"
-            "Optimisation: the design being computed is abandoned, every finished design is kept,\n"
-            "and 'Run Optimisation' continues from there.")
+            "Run Optimisation: only the design being computed is ended. It gets no result (the\n"
+            "optimiser is given the same penalty value as for a diverged design) and the\n"
+            "optimisation goes on with the next design. To end the optimisation itself use\n"
+            "'Stop Optimisation'.")
         self.button_layout.addWidget(self.stop_sim_btn)
         
         self.run_opt_btn = QPushButton("Run Optimisation")
         self.run_opt_btn.pressed.connect(self.run_optimisation)
         self.run_opt_btn.setEnabled(False)
         self.button_layout.addWidget(self.run_opt_btn)
+
+        # Ends a local 2D optimisation (Local/local2DOpt.py). Enabled only while one is running.
+        self.stop_opt_btn = QPushButton("Stop Optimisation")
+        self.stop_opt_btn.pressed.connect(self.stop_optimisation)
+        self.stop_opt_btn.setEnabled(False)
+        self.stop_opt_btn.setToolTip(
+            "End the local 2D optimisation now. The design being computed is abandoned (it is\n"
+            "computed again later), every finished design is kept, and 'Run Optimisation' >\n"
+            "'Continue' goes on from there.")
+        self.button_layout.addWidget(self.stop_opt_btn)
 
 
     def _on_toggle_use_pca_reduced(self, checked: bool):
@@ -1046,9 +1058,10 @@ class MainWindow(QMainWindow):
         
     
     def stop_simulation(self):
-        """Stop the running local 2D simulation or optimisation (the Stop Simulation button)."""
+        """The Stop Simulation button: end the local 2D simulation that is running. During an
+        optimisation that is the design being computed; the optimisation itself goes on."""
         if getattr(self, "opt2d_proc", None) is not None:
-            self._stop_optimisation_2d()
+            self._skip_design_2d()
             return
         worker = getattr(self, "sim2d_worker", None)
         if worker is None or getattr(self, "sim2d_thread", None) is None:
@@ -1134,7 +1147,8 @@ class MainWindow(QMainWindow):
         self.sim2d_thread = QThread(self)
         self.sim2d_worker = Simulation2DWorker(self.output_directory, base, opts, control_text, conds,
                                                list(flags.values()) if flags else None, limit_s, n=0,
-                                               prepro_cmd=cmds[0], solver_cmd=cmds[1])
+                                               prepro_cmd=cmds[0], solver_cmd=cmds[1],
+                                               force_check=getattr(self, "flite2d_force_check", None))
         self.sim2d_worker.moveToThread(self.sim2d_thread)
         # Bound methods of this window (a QObject), not lambdas: Qt then delivers them
         # in the GUI thread. The logger writes to a text widget, which must not be
@@ -1148,8 +1162,10 @@ class MainWindow(QMainWindow):
         self.run_sim_btn.setEnabled(False)          # one 2D run at a time
         self.stop_sim_btn.setEnabled(True)
         log(f"[SIM][2D] Running locally: PrePro then Solver, {len(conds)} flow condition(s), "
-            f"time limit {str(limit_min) + ' min' if limit_min else 'none'} per condition.")
+            f"time limit {str(limit_min) + ' min' if limit_min else 'none'} per condition. "
+            "Live residuals, geometry and pictures: the 'Solver' view.")
         self.sim2d_thread.start()
+        self._solver_view_notify(started=True)
 
     @pyqtSlot(str)
     def _on_sim2d_log(self, msg):
@@ -1161,8 +1177,10 @@ class MainWindow(QMainWindow):
         stopped = bool(getattr(getattr(self, "sim2d_worker", None), "stopped", False))
         for r in results or []:
             if r.get("status") == "ok":
+                how = (" - time limit reached, accepted because the forces had settled"
+                       if r.get("converged_by") == "forces" else "")
                 log(f"[SIM][2D] cond {r['cond']}: lift {r['CL']:.6g}  drag {r['CD']:.6g}  moment "
-                    f"{r['CM']:.6g}  ({r['iterations']} iterations, residual {r['residual']:.4g})")
+                    f"{r['CM']:.6g}  ({r['iterations']} iterations, residual {r['residual']:.4g}){how}")
             elif r.get("status") in ("stopped", "timeout") and r.get("rows"):
                 # numbers of an unfinished run: shown, and marked as such
                 log(f"[SIM][2D][WARN] cond {r['cond']} {r['status'].upper()} at iteration {r['iterations']} "
@@ -1197,6 +1215,7 @@ class MainWindow(QMainWindow):
         self.sim2d_worker = None
         self.stop_sim_btn.setEnabled(False)
         self.check_run_sim_button_state()
+        self._solver_view_notify(started=False)
 
     def _normalise_monitor_type_from_metric(self, metric: str) -> str:
         m = str(metric).strip().lower()
@@ -1972,6 +1991,8 @@ class MainWindow(QMainWindow):
         s["solver_control_file"] = control_path
         s["prepro"] = opts.to_dict()
         s["solver_time_limit_min"] = int(getattr(self, "flite2d_time_limit_min", 60) or 0)
+        from Local.flite2d_local import FORCE_CHECK_DEFAULT
+        s["force_check"] = dict(getattr(self, "flite2d_force_check", None) or FORCE_CHECK_DEFAULT)
         s["constraints"] = self.objective_config.get("constraints", [])
         # flite2d_prepro_cmd / flite2d_solver_cmd: stand-in command lines (tests only)
         if getattr(self, "flite2d_prepro_cmd", None) and getattr(self, "flite2d_solver_cmd", None):
@@ -1999,12 +2020,16 @@ class MainWindow(QMainWindow):
         proc.errorOccurred.connect(self._on_opt2d_error)
         self.opt2d_proc, self.opt2d_run_dir, self._opt2d_buf = proc, run_dir, b""
         self.opt2d_last_code = None
+        self._opt2d_stopping = False
         self.run_opt_btn.setEnabled(False)
         self.run_sim_btn.setEnabled(False)
         self.stop_sim_btn.setEnabled(True)
+        self.stop_opt_btn.setEnabled(True)
         log(f"[OPT][2D] Starting the local optimisation: {s.get('n_samples')} initial sample(s) + baseline, "
-            f"{s.get('count_limit')} optimiser step(s). Run folder: {run_dir}")
+            f"{s.get('count_limit')} optimiser step(s). Run folder: {run_dir}. "
+            "Each design as it runs (geometry, live residuals, pictures): the 'Solver' view.")
         proc.start(sys.executable, ["-u", script, run_dir])
+        self._solver_view_notify(started=True)
 
     def _opt2d_flush(self, final=False):
         buf = getattr(self, "_opt2d_buf", b"")
@@ -2023,6 +2048,39 @@ class MainWindow(QMainWindow):
         self._opt2d_buf = getattr(self, "_opt2d_buf", b"") + bytes(proc.readAllStandardOutput())
         self._opt2d_flush()
 
+    def stop_optimisation(self):
+        """The Stop Optimisation button."""
+        if getattr(self, "opt2d_proc", None) is None:
+            self.logger.log("[OPT][2D] No local 2D optimisation is running.")
+            return
+        self._stop_optimisation_2d()
+
+    def _skip_design_2d(self):
+        """
+        Ask the running optimisation to end the simulation of the design it is computing and to go
+        on with the next one (file <run folder>/SKIP, read by Local/local2DOpt.py twice a second).
+        """
+        proc = getattr(self, "opt2d_proc", None)
+        if proc is None:
+            return
+        try:
+            with open(os.path.join(self.opt2d_run_dir, "SKIP"), "w") as f:
+                f.write("end the simulation of the design in progress (Stop Simulation in the GUI)\n")
+        except OSError as e:
+            self.logger.log(f"[OPT][2D][ERROR] Could not write the SKIP file ({e}); nothing was stopped.")
+            return
+        self.logger.log("[OPT][2D] Stop Simulation: ending the simulation of the design being computed. It gets "
+                        "no result (the optimiser is given the penalty value) and the optimisation goes on with "
+                        "the next design. 'Stop Optimisation' ends the optimisation itself.")
+        # a second press within a few seconds would end the NEXT design as well
+        self.stop_sim_btn.setEnabled(False)
+        QTimer.singleShot(3000, self._reenable_stop_sim_2d)
+
+    def _reenable_stop_sim_2d(self):
+        running = getattr(self, "opt2d_proc", None) is not None or getattr(self, "sim2d_thread", None) is not None
+        stopping = getattr(self, "_opt2d_stopping", False)
+        self.stop_sim_btn.setEnabled(bool(running and not stopping))
+
     def _stop_optimisation_2d(self):
         """Ask the optimisation to stop: it ends the running program itself and keeps what is finished."""
         proc = getattr(self, "opt2d_proc", None)
@@ -2035,7 +2093,9 @@ class MainWindow(QMainWindow):
             self.logger.log(f"[OPT][2D][ERROR] Could not write the STOP file ({e}); ending the process instead.")
             proc.kill()
             return
+        self._opt2d_stopping = True
         self.stop_sim_btn.setEnabled(False)
+        self.stop_opt_btn.setEnabled(False)
         self.logger.log("[OPT][2D] Stop requested - the design being computed is abandoned; finished designs "
                         "are kept. (If the optimiser is choosing the next design, this takes up to a minute.)")
         # the script reacts within half a second while PrePro/Solver run; if it is still
@@ -2076,15 +2136,19 @@ class MainWindow(QMainWindow):
         else:
             log(f"[OPT][2D][ERROR] The optimisation process ended unexpectedly (code {code}). Finished designs "
                 f"are kept; details in {os.path.join(run_dir, 'local_opt.log')}.")
-        try:
-            os.remove(os.path.join(run_dir, "STOP"))
-        except OSError:
-            pass
+        for name in ("STOP", "SKIP"):
+            try:
+                os.remove(os.path.join(run_dir, name))
+            except OSError:
+                pass
         self.opt2d_proc = None
+        self._opt2d_stopping = False
         proc.deleteLater()
         self.stop_sim_btn.setEnabled(False)
+        self.stop_opt_btn.setEnabled(False)
         self.check_run_sim_button_state()
         self.check_run_opt_button_state()
+        self._solver_view_notify(started=False)
 
     def open_geometry_window(self):
         if hasattr(self, "mesh_viewer") and self.mesh_viewer.mesh_obj:
@@ -2801,6 +2865,31 @@ class MainWindow(QMainWindow):
             "The solver is stopped and the case marked 'timeout' after this long.\n"
             "Needed when ivd%numberOfMGIterations is negative (run until converged): "
             "a case that stalls would otherwise never end.")
+        # a timed-out run is accepted when its forces had settled (Local.flite2d_local.check_force_settling)
+        self.p2_fc_enable = QCheckBox("if the forces have settled")
+        self.p2_fc_enable.setChecked(True)
+        self.p2_fc_window = QSpinBox(); self.p2_fc_window.setRange(1, 1000000); self.p2_fc_window.setValue(500)
+        self.p2_fc_window.setSuffix(" cycles"); self.p2_fc_window.setPrefix("last ")
+        self.p2_fc_window.setMaximumWidth(150)
+        self.p2_fc_tol = QLineEdit("1e-4"); self.p2_fc_tol.setMaximumWidth(80)
+        fc_tip = ("When a run hits the time limit, it is accepted with the values of its last cycle if, over\n"
+                  "the last N cycles, the lift coefficient AND the drag coefficient each moved (max - min) by\n"
+                  "no more than the tolerance. Coefficient = force in the .rsd / x-extent of the wall.\n"
+                  "1e-4 is one drag count. The .rsd prints about 5 significant digits, so tolerances much\n"
+                  "below 1e-5 ask for the printed value not to change at all.\n"
+                  "Pick the tolerance well below the differences between designs the optimiser must tell apart.")
+        for w in (self.p2_fc_enable, self.p2_fc_window, self.p2_fc_tol):
+            w.setToolTip(fc_tip)
+        self.p2_fc_enable.toggled.connect(self.p2_fc_window.setEnabled)
+        self.p2_fc_enable.toggled.connect(self.p2_fc_tol.setEnabled)
+        fc_row = QWidget()
+        fc_lay = QHBoxLayout(fc_row)
+        fc_lay.setContentsMargins(0, 0, 0, 0)
+        fc_lay.addWidget(self.p2_fc_enable)
+        fc_lay.addWidget(self.p2_fc_window)
+        fc_lay.addWidget(QLabel("tol"))
+        fc_lay.addWidget(self.p2_fc_tol)
+        fc_lay.addStretch(1)
         self.p2_exe_label = QLabel("")
         self.p2_exe_label.setWordWrap(True)
         p2.addRow("Number of grids:", self.p2_num_grids)
@@ -2808,6 +2897,7 @@ class MainWindow(QMainWindow):
         p2.addRow("Directionality parameter:", self.p2_direction)
         p2.addRow("Directional agglomerations:", self.p2_ndir)
         p2.addRow("Solver time limit:", self.p2_time_limit)
+        p2.addRow("Accept a timed-out run:", fc_row)
         p2.addRow("Executables:", self.p2_exe_label)
         self.save_pre2d_btn = QPushButton("💾 Save 2D PrePro Input to Project")
         self.save_pre2d_btn.clicked.connect(self.save_prepro2d_settings)
@@ -2967,20 +3057,31 @@ class MainWindow(QMainWindow):
         except ValueError as e:
             QMessageBox.warning(self, "2D PrePro settings", f"Invalid setting: {e}")
             return
+        from Local.flite2d_local import force_check_settings
+        try:
+            fc = {"enabled": bool(self.p2_fc_enable.isChecked()), "window": int(self.p2_fc_window.value()),
+                  "tol": float(self.p2_fc_tol.text().strip())}
+            force_check_settings(fc)
+        except ValueError as e:
+            QMessageBox.warning(self, "2D PrePro settings", f"Invalid force-check tolerance: {e}")
+            return
         self.prepro2d_options = opts
+        self.flite2d_force_check = fc
         self.flite2d_time_limit_min = int(self.p2_time_limit.value())
         case = Flite2DCase(self.output_directory, self.get_project_basename(), n=0, log=self.logger.log)
         try:
             path = case.write_prepro_input(opts)
             with open(os.path.join(self.output_directory, "flite2d_settings.json"), "w", encoding="utf-8") as f:
-                json.dump({"prepro": opts.to_dict(), "solver_time_limit_min": self.flite2d_time_limit_min},
-                          f, indent=2)
+                json.dump({"prepro": opts.to_dict(), "solver_time_limit_min": self.flite2d_time_limit_min,
+                           "force_check": fc}, f, indent=2)
         except Exception as e:
             QMessageBox.critical(self, "Save failed", f"Could not save the 2D PrePro input:\n{e}")
             return
         self.logger.log(f"[Solver][2D] Wrote PrePro input → {path}  "
                         f"({opts.n_grids} grid(s), time limit "
-                        f"{self.flite2d_time_limit_min or 'none'}{' min' if self.flite2d_time_limit_min else ''})")
+                        f"{self.flite2d_time_limit_min or 'none'}{' min' if self.flite2d_time_limit_min else ''}; "
+                        + (f"a timed-out run is accepted if lift and drag coefficient moved <= {fc['tol']:g} over "
+                           f"its last {fc['window']} cycles)" if fc["enabled"] else "a timed-out run is rejected)"))
         if not os.path.isfile(case.mesh_path):
             self.logger.log("[Solver][2D] Note: the solver mesh does not exist yet. It is written when you "
                             "press 'Save 2D Basis' (it needs the boundary type of every edge).")
@@ -3120,10 +3221,36 @@ class MainWindow(QMainWindow):
             self.populate_bayes_bounds()
         
     def create_solv_page(self):
-        return SolverViewer(self)
+        self.solver_viewer = SolverViewer(self)
+        return self.solver_viewer
+
+    def _solver_view_notify(self, started: bool):
+        """Tell the Solver and Post-Processing views that a local 2D run has started / ended (they
+        follow the files of the run themselves; this only makes them switch to the new run and
+        show the end at once)."""
+        for name in ("solver_viewer", "post_viewer"):
+            view = getattr(self, name, None)
+            if view is None:
+                continue
+            try:
+                view.local_run_started() if started else view.local_run_finished()
+            except Exception as e:
+                self.logger.log(f"[2D][MONITOR][WARN] {name} not updated: {e}")
 
     def create_post_page(self):
-        return PostViewer(self)
+        self.post_viewer = PostViewer(self)
+        return self.post_viewer
+
+    def show_results_2d(self, n=None, cond=None):
+        """Open the Post-Processing view on the pictures of design n, flow condition cond."""
+        view = getattr(self, "post_viewer", None)
+        if view is None:
+            return
+        try:
+            view.show_run(n, cond)
+        except Exception as e:
+            self.logger.log(f"[2D][POST][WARN] Could not open the results of n={n}: {e}")
+        self.display_stack.setCurrentIndex(self.IDX_POST)
 
     def activate_tab_1(self):
         self.stack_layout.setCurrentIndex(0)

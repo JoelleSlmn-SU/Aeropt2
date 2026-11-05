@@ -1,0 +1,5 @@
+ifort -r8 -O -c Aggl2d_def.f90     
+ifort -r8 -O -c Aggl2d_Aggl.f90    
+ifort -r8 -O -c Aggl2d_main.f90  
+ifort -r8 -O  -o Aggl2d *.o
+

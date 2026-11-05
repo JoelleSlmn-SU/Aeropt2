@@ -60,16 +60,16 @@ from vtk.util import numpy_support as ns
 
 # ============================== CONFIG (case) ================================
 folder = [
-    "corner_optimisation"
+    "corner_optimisation_cd"
 ]
 
-x_case = 5
-gen = 0
+x_case = 1
+gen = 5
 base = Path(r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples")
 case_root = base / folder[0]
 
-CASE_FILE = str(case_root / "postprocessed" / f"n_{gen}" / "cond_2" / f"{str(x_case)}" / f"ENSIGHTcorner_{str(x_case)}.case")
-OUT_DIR   = str(case_root / "postprocessed" / f"n_{gen}" / "cond_2"/ f"{str(x_case)}" / f"x_sweep_out")
+CASE_FILE = str(case_root / "postprocessed" / f"n_{gen}" / f"{str(x_case)}" / f"ENSIGHTcorner_{str(x_case)}.case")
+OUT_DIR   = str(case_root / "postprocessed" / f"n_{gen}" / f"{str(x_case)}" / f"x_sweep_out")
 os.makedirs(OUT_DIR, exist_ok=True)
 OUT_DIR = os.path.abspath(OUT_DIR)
 
@@ -108,7 +108,7 @@ DROP_ZEROS = True
 # ========================= WHAT TO RUN (toggles) =============================
 PLOT_DENSITY = False
 PLOT_MACH    = False
-PLOT_ETA     = False
+PLOT_ETA     = True
 
 PLOT_AIP           = True   # generate AIP contour PNGs (velocity + whichever of PR/distortion/swirl are on)
 COMPUTE_PR         = True   # area-weighted pressure recovery on the AIP -> CSV

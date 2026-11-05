@@ -66,7 +66,24 @@ being asked to finish, so the process is killed. What is left behind:
     count of the .res is checked afterwards ("res_complete").
     The case is marked "stopped"; lift/drag are those of the last iteration
     reached, at whatever convergence that happened to be.
-The same applies to a run that hits the time limit ("timeout").
+The same applies to a run that hits the time limit ("timeout"), with one
+exception: a timed-out run whose lift and drag had stopped moving is accepted.
+
+Accepting a timed-out run whose forces have settled
+---------------------------------------------------
+With a negative `ivd%numberOfMGIterations` the solver stops on the residual,
+but the quantity the optimiser uses is the force. When the time limit ends a
+run, the .rsd is checked (see check_force_settling): over the last `window`
+multigrid cycles, the largest minus the smallest value of the lift and of the
+drag COEFFICIENT (force / reference length; the .rsd holds forces per q per
+unit of the solver's length) must both be <= `tol`. If so, the status becomes
+"ok", "converged_by" is "forces", and the numbers are those of the last cycle.
+The reference length is the x-extent of the walls of the solver mesh, unless
+one is given. The result of the check is kept in metrics.json under
+"force_check" for EVERY run (also those that reached the residual target), so
+how far the forces still moved is on record either way.
+A user stop is never turned into a result. Note that the flow field on disk is
+still that of "res_iteration", up to writeToFileInterval cycles earlier.
 
 The solver's `ivd%numberOfMGIterations` may be NEGATIVE, meaning "run until
 the residual has dropped by that many orders of magnitude". A case that never
@@ -84,6 +101,8 @@ import sys
 import time
 from dataclasses import dataclass, asdict
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
 
 VISCOUS_WALL_FLAG = 5
 _NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0      # CREATE_NO_WINDOW
@@ -323,6 +342,90 @@ def read_rsd(path: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# have the forces settled? (accepting a timed-out run, see the top of the file)
+# ---------------------------------------------------------------------------
+# 1e-4 in a coefficient is one drag count. The .rsd prints about five significant
+# digits, so with forces of order one per unit length a tolerance much below 1e-5
+# asks for the printed number not to change at all.
+FORCE_CHECK_DEFAULT = {"enabled": True, "window": 500, "tol": 1e-4}
+
+
+def force_check_settings(cfg=None) -> Optional[dict]:
+    """
+    The force check to apply, from a settings entry
+    {"enabled": bool, "window": cycles, "tol": coefficient, "ref_length": optional}:
+    returns {"window", "tol", "ref_length"} or None when the check is off.
+    None -> FORCE_CHECK_DEFAULT; False -> off. Raises ValueError on a bad entry.
+    """
+    if cfg is None:
+        cfg = FORCE_CHECK_DEFAULT
+    if cfg is False:
+        return None
+    if not isinstance(cfg, dict):
+        raise ValueError(f"force_check must be a dictionary, not {cfg!r}")
+    if not cfg.get("enabled", True):
+        return None
+    try:
+        window = int(cfg.get("window", FORCE_CHECK_DEFAULT["window"]))
+        tol = float(cfg.get("tol", FORCE_CHECK_DEFAULT["tol"]))
+        ref = cfg.get("ref_length")
+        ref = None if ref in (None, "", 0) else float(ref)
+    except (TypeError, ValueError):
+        raise ValueError(f"force_check: window must be a whole number of cycles and tol a number ({cfg!r})")
+    if window < 1:
+        raise ValueError(f"force_check: window must be at least 1 cycle (got {window})")
+    if not (math.isfinite(tol) and tol > 0):
+        raise ValueError(f"force_check: tol must be a positive number (got {tol})")
+    if ref is not None and not (math.isfinite(ref) and ref > 0):
+        raise ValueError(f"force_check: ref_length must be a positive number (got {ref})")
+    return {"window": window, "tol": tol, "ref_length": ref}
+
+
+def check_force_settling(history, window: int, tol: float, ref_length: float = 1.0) -> dict:
+    """
+    history: .rsd rows (iteration, residual, lift, drag, ...), see
+    Local.flite2d_post.read_rsd_history. Over the cycles last-window .. last,
+    the spread (max - min) of lift / ref_length and drag / ref_length.
+    Returns {"passed", "reason", "window", "tol", "ref_length", "first_iteration",
+    "last_iteration", "rows", "CL_spread", "CD_spread"}; "passed" is False with a
+    reason when the history is shorter than the window or holds a non-finite value.
+    """
+    out = {"passed": False, "reason": "", "window": int(window), "tol": float(tol),
+           "ref_length": float(ref_length), "first_iteration": None, "last_iteration": None, "rows": 0,
+           "CL_spread": None, "CD_spread": None}
+    H = np.asarray(history, float)
+    if H.ndim != 2 or H.shape[1] < 4 or len(H) < 2:
+        out["reason"] = "fewer than 2 rows in the residual file"
+        return out
+    it = H[:, 0]
+    last = it[-1]
+    if not math.isfinite(last):
+        out["reason"] = "the last iteration number is not a number"
+        return out
+    out["last_iteration"] = int(last)
+    if not (it[0] <= last - window):
+        out["reason"] = f"the run is shorter than the window ({int(last - it[0])} of {int(window)} cycles)"
+        return out
+    sel = np.isfinite(it) & (it >= last - window)
+    W = H[sel]
+    out["rows"], out["first_iteration"] = int(len(W)), int(W[0, 0])
+    if len(W) < 2:
+        out["reason"] = "fewer than 2 rows in the window"
+        return out
+    if not np.all(np.isfinite(W[:, 2:4])):
+        out["reason"] = "a lift or drag value in the window is not finite"
+        return out
+    L = float(ref_length) if ref_length and ref_length > 0 else 1.0
+    out["CL_spread"] = float(np.ptp(W[:, 2]) / L)
+    out["CD_spread"] = float(np.ptp(W[:, 3]) / L)
+    worst = max(out["CL_spread"], out["CD_spread"])
+    out["passed"] = bool(worst <= tol)
+    out["reason"] = ("settled" if out["passed"] else
+                     ("lift" if out["CL_spread"] > tol else "drag") + " still moving")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # running a process with piped answers, a log file and a time limit
 # ---------------------------------------------------------------------------
 def _run_piped(cmd: Sequence[str], cwd: str, answers_file: str, log_file: str,
@@ -459,6 +562,36 @@ class Flite2DCase:
             self._mesh = (mt, read_flite2d_mesh(self.mesh_path))
         return self._mesh[1]
 
+    def reference_length(self) -> Optional[float]:
+        """x-extent of the walls of the solver mesh (None if it cannot be read)."""
+        try:
+            from Local.flite2d_monitor import read_wall_outline
+            walls = read_wall_outline(self.mesh_path)
+            if not walls:
+                return None
+            x = np.concatenate([P[:, 0] for P, _ in walls])
+            L = float(np.ptp(x))
+            return L if math.isfinite(L) and L > 0 else None
+        except (OSError, ValueError, IndexError):
+            return None
+
+    def _force_check(self, rsd: str, settings: Optional[dict]) -> Optional[dict]:
+        """check_force_settling on the .rsd of a run (None when the check is off). Never raises."""
+        if not settings:
+            return None
+        try:
+            from Local.flite2d_post import read_rsd_history
+            L, where = settings.get("ref_length"), "given"
+            if not L:
+                L, where = self.reference_length(), "x-extent of the walls"
+            if not L:
+                L, where = 1.0, "1 (the wall could not be read from the mesh)"
+            out = check_force_settling(read_rsd_history(rsd), settings["window"], settings["tol"], L)
+            out["ref_length_from"] = where
+            return out
+        except Exception as e:                       # a diagnostic must never cost the run its result
+            return {"passed": False, "reason": f"check failed: {e}"}
+
     def mesh_node_count(self) -> Optional[int]:
         """Number of nodes from the header of the solver mesh (None if unreadable)."""
         try:
@@ -565,7 +698,10 @@ class Flite2DCase:
 
     def run_solver(self, control_text: str, nc: int = 1, time_limit_s: Optional[float] = 3600.0,
                    progress_every_s: float = 15.0,
-                   should_stop: Optional[Callable[[], bool]] = None) -> dict:
+                   should_stop: Optional[Callable[[], bool]] = None, force_check=None) -> dict:
+        """force_check: a settings entry for force_check_settings (None -> the default,
+        False -> off); decides whether a timed-out run whose forces had settled is accepted."""
+        fc_settings = force_check_settings(force_check)
         if not os.path.isfile(self.sol_path):
             raise FileNotFoundError(f"Preprocessor output not found: {self.sol_path}")
         _, cmd = self._commands()
@@ -619,16 +755,46 @@ class Flite2DCase:
                     m["res_complete"] = sum(1 for ln in fh if ln.strip()) == self.mesh_node_count()
             except OSError:
                 pass
-        if m["status"] == "ok":
+        # how far lift and drag still moved at the end; a timed-out run whose forces had
+        # settled is accepted with the numbers of its last cycle (see the top of the file)
+        fc = self._force_check(rsd, fc_settings) if m["status"] in ("ok", "timeout") and m["rows"] else None
+        m["force_check"] = fc
+        m["converged_by"] = "residual" if m["status"] == "ok" else None
+        if m["status"] == "timeout" and fc and fc.get("passed"):
+            m["status"], m["converged_by"] = "ok", "forces"
+
+        def moved():
+            if not fc or fc.get("CL_spread") is None:
+                return ""
+            return (f"over the last {fc['window']} cycles the lift coefficient moved {fc['CL_spread']:.3g} and "
+                    f"the drag coefficient {fc['CD_spread']:.3g} (tolerance {fc['tol']:.3g}, reference length "
+                    f"{fc['ref_length']:.6g})")
+        if m["converged_by"] == "forces":
+            field = (f"the flow field on disk is that of iteration {m['res_iteration']}" if m["res_complete"]
+                     else "no complete flow field on disk")
+            self.log(f"[2D][SOLVER] cond {nc}: time limit reached after {wall:.0f} s at iteration "
+                     f"{m['iterations']} (residual {m['residual']:.4g}, stop criterion NOT reached), but the "
+                     f"forces had settled: {moved()}. ACCEPTED with the values of iteration {m['iterations']}: "
+                     f"lift {m['CL']:.6g}, drag {m['CD']:.6g}, moment {m['CM']:.6g}; {field}.")
+        elif m["status"] == "ok":
             self.log(f"[2D][SOLVER] cond {nc} finished in {wall:.0f} s: {m['iterations']} iterations, residual "
-                     f"{m['residual']:.4g}, lift {m['CL']:.6g}, drag {m['CD']:.6g}, moment {m['CM']:.6g}")
+                     f"{m['residual']:.4g}, lift {m['CL']:.6g}, drag {m['CD']:.6g}, moment {m['CM']:.6g}"
+                     + (f"; {moved()}" if moved() else ""))
         elif m["status"] in ("stopped", "timeout") and m["rows"]:
             why = "stopped by the user" if m["status"] == "stopped" else "time limit reached"
             field = (f"flow field on disk is that of iteration {m['res_iteration']}" if m["res_complete"]
                      else "no complete flow field on disk")
+            forces = ""
+            if m["status"] == "timeout":
+                if fc is None:
+                    forces = " The force check is off."
+                elif fc.get("CL_spread") is not None:
+                    forces = f" Forces NOT settled: {moved()}."
+                else:
+                    forces = f" Forces not checked: {fc.get('reason')}."
             self.log(f"[2D][SOLVER] cond {nc}: {why} after {wall:.0f} s at iteration {m['iterations']}, residual "
                      f"{m['residual']:.4g}, lift {m['CL']:.6g}, drag {m['CD']:.6g} (NOT converged to the "
-                     f"stop criterion); {field}.")
+                     f"stop criterion); {field}.{forces}")
         else:
             tail = _tail(log_file)
             self.log(f"[2D][SOLVER][ERROR] cond {nc}: {m['status']} after {wall:.0f} s "
@@ -644,13 +810,15 @@ class Flite2DCase:
     # -- whole chain -------------------------------------------------------------
     def run(self, opts: PreProOptions, control_template: str, conds: Optional[List[dict]] = None,
             boundary_flags: Optional[Iterable[int]] = None, solver_time_limit_s: Optional[float] = 3600.0,
-            should_stop: Optional[Callable[[], bool]] = None) -> List[dict]:
+            should_stop: Optional[Callable[[], bool]] = None, force_check=None) -> List[dict]:
         """
         PrePro once, then the solver for each flow condition. Every control
         file is checked BEFORE anything is run. Returns one metrics dict per
         condition (see read_rsd; "status" tells whether the numbers are usable).
         Raises RunStopped if should_stop() turns True before the solver has started.
+        force_check: see run_solver (checked here, before anything runs).
         """
+        force_check_settings(force_check)              # a bad entry fails now, not after PrePro
         conds = list(conds) if conds else [{}]
         texts = []
         for i, cond in enumerate(conds, 1):
@@ -677,5 +845,6 @@ class Flite2DCase:
             if should_stop and should_stop():
                 self.log(f"[2D] Stopped: flow condition(s) {i} to {len(texts)} were not run.")
                 break
-            out.append(self.run_solver(text, nc=i, time_limit_s=solver_time_limit_s, should_stop=should_stop))
+            out.append(self.run_solver(text, nc=i, time_limit_s=solver_time_limit_s, should_stop=should_stop,
+                                       force_check=force_check))
         return out

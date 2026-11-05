@@ -625,14 +625,14 @@ if __name__ == "__main__":
     from pathlib import Path
     
     folder = [
-        "corner_optimisation_2"
+        "onera_m6"
     ]
 
     x_case = 2
-    gen = "x"
-    filename = "corner"
+    gen = "0"
+    filename = "onera_m6"
     ##
-    for x_case in range(8,9):
+    for x_case in range(1,6):
         base = Path(r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples")
         case_root = base / folder[0]
 

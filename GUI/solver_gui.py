@@ -72,10 +72,27 @@ def parse_rsd_bytes(data: bytes):
     return X, Ys
 
 class SolverViewer(QWidget):
+    """
+    The Solver view. Two pages, chosen by the kind of case that is loaded:
+      - a 3D case: the cluster job browser below (.rsd of a job, fetched over SFTP);
+      - a 2D case: GUI/solver_monitor_2d.py, which follows the local FLITE 2D run
+        (geometry of each design, live residuals, a clock for the run). The pictures written
+        after a run are in the Post-Processing view.
+    """
     def __init__(self, main_window):
         super().__init__()
         self.mw = main_window
-        self.setLayout(QVBoxLayout())
+        self._pages = QStackedLayout(self)
+        self._pages.setContentsMargins(0, 0, 0, 0)
+        self.hpc_page = QWidget()
+        hpc_layout = QVBoxLayout(self.hpc_page)
+        self._pages.addWidget(self.hpc_page)
+        try:
+            from GUI.solver_monitor_2d import Solver2DMonitor
+        except ImportError:
+            from solver_monitor_2d import Solver2DMonitor
+        self.monitor2d = Solver2DMonitor(main_window)
+        self._pages.addWidget(self.monitor2d)
 
         # Top: controls
         top = QHBoxLayout()
@@ -93,20 +110,44 @@ class SolverViewer(QWidget):
         top.addWidget(self.load_hist_btn)  # put it near Refresh/Load buttons
         self.load_hist_btn.clicked.connect(self.load_history_into_list)
         
-        self.layout().addLayout(top)
+        hpc_layout.addLayout(top)
         
         # Job list
         self.jobs = QListWidget()
         self.jobs.setFixedHeight(100)
-        self.layout().addWidget(self.jobs)
+        hpc_layout.addWidget(self.jobs)
 
         # Plot
         self.canvas = MplCanvas()
-        self.layout().addWidget(self.canvas)
+        hpc_layout.addWidget(self.canvas)
         self.canvas.ax.set_xlabel("Iteration")
         
         self.refresh_btn.clicked.connect(self.refresh_jobs)
         self.load_btn.clicked.connect(self.load_and_plot)
+
+    # ---- which page ----------------------------------------------------------
+    def sync_mode(self):
+        """Show the local 2D monitor for a 2D case, the cluster job browser otherwise."""
+        try:
+            is2d = bool(self.mw._is_2d_case())
+        except Exception:
+            is2d = False
+        page = self.monitor2d if is2d else self.hpc_page
+        if self._pages.currentWidget() is not page:
+            self._pages.setCurrentWidget(page)
+        return is2d
+
+    def showEvent(self, event):
+        self.sync_mode()
+        super().showEvent(event)
+
+    def local_run_started(self):
+        """A local 2D simulation or optimisation has started: follow it."""
+        self.sync_mode()
+        self.monitor2d.run_started()
+
+    def local_run_finished(self):
+        self.monitor2d.run_finished()
 
     def _jobs_log_path(self):
         return os.path.join(os.getcwd(), "jobs_log.json")

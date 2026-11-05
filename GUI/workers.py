@@ -170,13 +170,14 @@ class Simulation2DWorker(QObject):
     log = pyqtSignal(str)
 
     def __init__(self, output_dir, base, prepro_options, control_text, conds, boundary_flags,
-                 time_limit_s, n=0, solver_dir=None, prepro_cmd=None, solver_cmd=None):
+                 time_limit_s, n=0, solver_dir=None, prepro_cmd=None, solver_cmd=None, force_check=None):
         super().__init__()
         self.output_dir, self.base, self.n = output_dir, base, int(n)
         self.opts, self.control_text = prepro_options, control_text
         self.conds = list(conds) if conds else [{}]
         self.boundary_flags, self.time_limit_s = boundary_flags, time_limit_s
         self.solver_dir, self.prepro_cmd, self.solver_cmd = solver_dir, prepro_cmd, solver_cmd
+        self.force_check = force_check    # see Local.flite2d_local.force_check_settings
         self._stop = False
         self._discard = False
         self.stopped = False              # True once a stop request has ended the run
@@ -194,7 +195,8 @@ class Simulation2DWorker(QObject):
                                log=self._log, prepro_cmd=self.prepro_cmd, solver_cmd=self.solver_cmd)
             self._case = case
             results = case.run(self.opts, self.control_text, self.conds, self.boundary_flags,
-                               solver_time_limit_s=self.time_limit_s, should_stop=self._should_stop)
+                               solver_time_limit_s=self.time_limit_s, should_stop=self._should_stop,
+                               force_check=self.force_check)
             self.stopped = self._stop
             self.finished.emit(results)
         except RunStopped:

@@ -220,7 +220,7 @@ def plot_convergence_history(
     # ------------------------------------------------------------
     # Plot
     # ------------------------------------------------------------
-    count_limit = 5
+    count_limit = 51
     if count_limit is None:
         count_limit = max(xs)
 
@@ -655,12 +655,12 @@ def plot_design_variables_case_by_case(
     return saved_paths
 
 
-mcsv_file = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation_mo\bo_data.mcsv"
-out_dir = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\corner_optimisation_mo\dv_case_plots"
+mcsv_file = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\2d_naca0012\opt\bo_data.mcsv"
+out_dir = r"C:\Users\joell\OneDrive - Swansea University\Desktop\PhD Documents\01-Codes\Aeropt2\examples\2d_naca0012\opt"
 
-training_data = 34          # number of initial LHS samples
-objective = "Multi-Objective -w1*Cd+w2*PR"          # "max" for pressure recovery♀
-variable_name = "fitness"
+training_data = 5          # number of initial LHS samples
+objective = "min"          # "max" for pressure recovery♀
+variable_name = "L/D"
 
 # ------------------------------------------------------------------
 # Load BO data

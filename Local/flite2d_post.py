@@ -349,26 +349,42 @@ def save_mesh_image(mesh_dat: str, png_path: str, title: Optional[str] = None,
 # ---------------------------------------------------------------------------
 # convergence
 # ---------------------------------------------------------------------------
-def plot_convergence(history: np.ndarray, path: str, title: str = "Convergence",
-                     subtitle: Optional[str] = None, target_orders: Optional[float] = None) -> str:
+def draw_convergence(fig, history: np.ndarray, title: str = "Convergence",
+                     subtitle: Optional[str] = None, target_orders: Optional[float] = None,
+                     compact: Optional[bool] = None):
     """
     Residual, lift, drag and moment against iteration, one panel each (the four
-    have unrelated scales). The force panels are scaled to the last 80 % of the
-    run so the start-up transient does not flatten the part that matters.
+    have unrelated scales), drawn on `fig` (cleared first). The force panels are
+    scaled to the last 80 % of the run so the start-up transient does not
+    flatten the part that matters.
+
+    `fig` is any matplotlib Figure: the picture written after a run
+    (plot_convergence) and the live view in the GUI (GUI/solver_monitor_2d.py)
+    are this one drawing. Margins are set in inches, so a figure of another
+    size keeps room for its titles. compact: short panel headings; by default
+    on a figure narrower than 8 inches, where the long heading of the residual
+    panel would run into the heading of the panel beside it.
     """
     H = np.asarray(history, float)
+    if H.ndim != 2 or not len(H):
+        H = np.zeros((0, 8))
     it = H[:, 0]
-    fig = _figure(10.0, 6.4)
+    fig.clear()
     axes = fig.subplots(2, 2, sharex=True)
-    fig.subplots_adjust(left=0.085, right=0.985, top=0.86, bottom=0.085, hspace=0.3, wspace=0.24)
-    panels = [(1, "residual  (log10 of residual / first residual)"), (2, "lift"), (3, "drag"), (4, "moment")]
+    w, h = fig.get_figwidth(), fig.get_figheight()
+    fig.subplots_adjust(left=min(0.85 / w, 0.3), right=1.0 - min(0.15 / w, 0.1),
+                        top=1.0 - min(0.896 / h, 0.45), bottom=min(0.544 / h, 0.3), hspace=0.3, wspace=0.24)
+    if compact is None:
+        compact = w < 8.0
+    panels = [(1, "log10 residual" if compact else "residual  (log10 of residual / first residual)"),
+              (2, "lift"), (3, "drag"), (4, "moment")]
     for ax, (col, name) in zip(axes.ravel(), panels):
         _style(ax)
         y = H[:, col]
         ax.plot(it, y, color=SERIES[0], linewidth=1.4)
         last = y[-1] if len(y) else math.nan
-        ax.set_title(f"{name}:  {last:.6g}" if math.isfinite(last) else f"{name}:  not a number",
-                     loc="left", fontsize=9, color=INK)
+        ax.set_title((f"{name}:  {last:.6g}" if math.isfinite(last) else f"{name}:  not a number") if len(y)
+                     else name, loc="left", fontsize=9, color=INK)
         ok = np.isfinite(y)
         if col == 1:
             if target_orders:
@@ -386,7 +402,68 @@ def plot_convergence(history: np.ndarray, path: str, title: str = "Convergence",
     for ax in axes[1]:
         ax.set_xlabel("multigrid cycle")
     _titles(fig, title, subtitle)
+    return axes
+
+
+def plot_convergence(history: np.ndarray, path: str, title: str = "Convergence",
+                     subtitle: Optional[str] = None, target_orders: Optional[float] = None) -> str:
+    """convergence.png of a run: see draw_convergence."""
+    fig = _figure(10.0, 6.4)
+    draw_convergence(fig, history, title=title, subtitle=subtitle, target_orders=target_orders)
     return _save(fig, path)
+
+
+# ---------------------------------------------------------------------------
+# wall outline of a design (live view in the GUI)
+# ---------------------------------------------------------------------------
+def draw_wall_outline(fig, walls, baseline_walls=None, title: str = "Geometry", subtitle: Optional[str] = None):
+    """
+    The walls of one design on `fig` (cleared first), equal axes. `walls` and
+    `baseline_walls` are lists of (points (k, 2), closed), e.g. from
+    Local.flite2d_monitor.read_wall_outline. With a baseline given, it is drawn
+    dashed underneath so the change of shape can be seen. Returns the axes.
+    """
+    from matplotlib.lines import Line2D
+    fig.clear()
+    w, h = fig.get_figwidth(), fig.get_figheight()
+    ax = fig.add_axes([min(0.75 / w, 0.3), min(0.45 / h, 0.3),
+                       1.0 - min(0.75 / w, 0.3) - min(0.15 / w, 0.1),
+                       max(1.0 - min(0.45 / h, 0.3) - min(0.62 / h, 0.45), 0.2)])
+    _style(ax, grid=True)
+    handles, pts = [], []
+    for P, closed in baseline_walls or []:
+        Q = np.vstack([P, P[:1]]) if closed else P
+        ax.plot(Q[:, 0], Q[:, 1], color=SERIES[1], linewidth=1.1, linestyle=(0, (4, 2)), zorder=5)
+        pts.append(P)
+    if baseline_walls:
+        handles.append(Line2D([], [], color=SERIES[1], linewidth=1.1, linestyle=(0, (4, 2)), label="baseline"))
+    for P, closed in walls or []:
+        if closed:
+            ax.fill(P[:, 0], P[:, 1], color=BODY, linewidth=0, zorder=3, alpha=0.7)
+        Q = np.vstack([P, P[:1]]) if closed else P
+        ax.plot(Q[:, 0], Q[:, 1], color=INK, linewidth=1.0, zorder=4, solid_joinstyle="round")
+        pts.append(P)
+    if walls and baseline_walls:
+        handles.insert(0, Line2D([], [], color=INK, linewidth=1.0, label="this design"))
+    # limits are left to matplotlib (with a margin): with equal scales it then widens
+    # whichever direction has room, so a thin body in a wide panel is not squeezed
+    ax.margins(x=0.06, y=0.15)
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    if handles:
+        ax.legend(handles=handles, loc="upper right", fontsize=8, frameon=True, framealpha=0.9,
+                  edgecolor=GRID, labelcolor=MUTED)
+    _titles(fig, title, subtitle)
+    return ax
+
+
+def draw_message(fig, text: str, title: Optional[str] = None, subtitle: Optional[str] = None):
+    """`fig` cleared, with the usual titles and one line of text in the middle (nothing to plot yet)."""
+    fig.clear()
+    if title:
+        _titles(fig, title, subtitle)
+    fig.text(0.5, 0.5, text, ha="center", va="center", fontsize=9.5, color=MUTED, wrap=True)
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +591,8 @@ def write_run_plots(cond_dir: str, stem: str, mesh: dict, metrics: dict, gamma: 
     cond = ", ".join(s for s in (f"Mach {mach_inf:g}" if mach_inf is not None else "",
                                  f"alpha {alpha:g} deg" if alpha is not None else "") if s)
     state = "" if status == "ok" else f"   [{status.upper()} - not a finished run]"
+    if status == "ok" and metrics.get("converged_by") == "forces":
+        state = "   [time limit; forces settled]"
 
     def attempt(what, fn):
         try:

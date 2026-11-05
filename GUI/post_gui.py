@@ -71,6 +71,12 @@ def _append_or_replace(arrdict, name, data):
 
 # ---------- Main widget ----------
 class PostViewer(QWidget):
+    """
+    The Post-Processing view. Two pages, chosen by the kind of case that is loaded:
+      - a 3D case: the viewer below (EnSight results of a cluster job, fetched over SFTP);
+      - a 2D case: GUI/post_view_2d.py, the pictures of a local FLITE 2D run for the design
+        (generation) and flow condition chosen there.
+    """
     def __init__(self, main_window):
         super().__init__()
         self.mw = main_window
@@ -83,7 +89,17 @@ class PostViewer(QWidget):
         self._gamma = _GAMMA_DEFAULT
 
         # ---------- UI ----------
-        root = QVBoxLayout(self)
+        self._pages = QStackedLayout(self)
+        self._pages.setContentsMargins(0, 0, 0, 0)
+        self.hpc_page = QWidget()
+        root = QVBoxLayout(self.hpc_page)        # everything below is the 3D page, as before
+        self._pages.addWidget(self.hpc_page)
+        try:
+            from GUI.post_view_2d import Post2DViewer
+        except ImportError:
+            from post_view_2d import Post2DViewer
+        self.view2d = Post2DViewer(main_window)
+        self._pages.addWidget(self.view2d)
 
         # Row 1: HPC file controls + variable chooser
         row1 = QHBoxLayout()
@@ -159,6 +175,35 @@ class PostViewer(QWidget):
         self.clear_clip_btn.clicked.connect(self._clear_clips)
 
         self._hide_mode = False
+
+    # ---------- which page ----------
+    def sync_mode(self):
+        """Show the 2D pictures page for a 2D case, the 3D viewer otherwise."""
+        try:
+            is2d = bool(self.mw._is_2d_case())
+        except Exception:
+            is2d = False
+        page = self.view2d if is2d else self.hpc_page
+        if self._pages.currentWidget() is not page:
+            self._pages.setCurrentWidget(page)
+        return is2d
+
+    def showEvent(self, event):
+        self.sync_mode()
+        super().showEvent(event)
+
+    def local_run_started(self):
+        """A local 2D simulation or optimisation has started: show each run as it ends."""
+        self.sync_mode()
+        self.view2d.run_started()
+
+    def local_run_finished(self):
+        self.view2d.run_finished()
+
+    def show_run(self, n, cond=None):
+        """Open the 2D page on design n, flow condition cond (the 'Pictures' button of the Solver view)."""
+        self.sync_mode()
+        self.view2d.select(n, cond)
 
     # ---------- HPC postprocessed root ----------
     def _post_root(self):

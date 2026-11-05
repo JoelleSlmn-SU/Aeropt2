@@ -49,6 +49,20 @@ command again continues from bo_data.mcsv, and every design that had finished
 is taken from designs.json instead of being computed again. The design that
 was running when the stop came is computed again from the start.
 
+Stopping one design only
+------------------------
+Creating the file <run_dir>/SKIP (the GUI's "Stop Simulation" button during an
+optimisation) ends the simulation of the design that is being computed and
+nothing else: the optimisation goes on with the next design. The stopped
+design is final, with status "skipped": it has no result, so the optimiser is
+given the same deliberately bad value as for a diverged or timed-out design,
+and it is NOT computed again when the run is resumed. (Its residual history up
+to the stop stays in solutions/n_<n>. Listing "skipped" in "accept_statuses"
+makes the numbers at the moment of the stop count as the result instead; they
+are then whatever the solver had reached, converged or not.) A SKIP that
+arrives while no simulation is running is ignored. Skipping the baseline ends
+the optimisation: every design is compared with it.
+
 A resumed run must be the SAME problem. The objective, constraints, flow
 conditions, solver control file, preprocessor options and morph basis are
 fingerprinted when the run starts; if any of them has changed since, the run
@@ -64,6 +78,11 @@ Extra keys read from bo_settings.json (all optional)
     prepro                 {"n_grids": .., "hybrid": .., "directionality": .., "n_directional": ..}
                            (default: <output_dir>/flite2d_settings.json, else PrePro defaults)
     solver_time_limit_min  per flow condition (default: flite2d_settings.json, else 60)
+    force_check            {"enabled": true, "window": 500, "tol": 1e-4, "ref_length": null}
+                           a run that hits the time limit is accepted (status "ok",
+                           converged_by "forces") when lift and drag coefficient moved
+                           by at most tol over its last `window` cycles; see
+                           Local.flite2d_local (default: flite2d_settings.json, else on)
     solver_dir             folder of PrePro.exe / Solver.exe (default <repo>/Solver)
     include_baseline       true
     accept_statuses        ["ok"]
@@ -95,12 +114,14 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from Local.flite2d_local import (Flite2DCase, PreProOptions, RunStopped, apply_condition,      # noqa: E402
-                                 check_control, find_executables, get_namelist_value, _as_float)
+                                 check_control, find_executables, force_check_settings, get_namelist_value,
+                                 _as_float)
 
 STOP_FILE = "STOP"
+SKIP_FILE = "SKIP"                       # end the simulation of the design in progress, then go on
 # what a 2D run can deliver to an objective or constraint expression
 SYMBOLS_2D = ("CL", "CD", "CM", "CL_over_CD", "min_area_ratio", "max_wall_displacement")
-FINAL_STATUSES = ("ok", "diverged", "crashed", "failed", "timeout", "invalid_mesh", "prepro_failed")
+FINAL_STATUSES = ("ok", "diverged", "crashed", "failed", "timeout", "invalid_mesh", "prepro_failed", "skipped")
 NAN = float("nan")
 
 
@@ -295,16 +316,24 @@ class Local2DTestManager:
                  solver_dir: Optional[str] = None, log: Callable[[str], None] = print,
                  should_stop: Optional[Callable[[], bool]] = None, accept_statuses: Sequence[str] = ("ok",),
                  make_plots: bool = True, keep_sol: bool = False, prepro_cmd=None, solver_cmd=None,
-                 fingerprint: str = "", x_tol=None):
+                 fingerprint: str = "", x_tol=None, should_skip: Optional[Callable[[], bool]] = None,
+                 force_check=None):
         """x_tol: per-variable tolerance when a design is recognised again after a resume
-        (the optimiser's data file keeps 8 decimals). Default 1e-4 of |x| + 1e-7."""
+        (the optimiser's data file keeps 8 decimals). Default 1e-4 of |x| + 1e-7.
+        should_skip: called while a design is being computed; returns True ONCE per request to
+        end that design's simulation and go on with the next design (see SKIP_FILE).
+        force_check: settings entry of Local.flite2d_local.force_check_settings (None: default)."""
         self.output_dir = os.path.abspath(output_dir)
         self.base_name, self.builder = str(base_name), builder
         self.control_text, self.opts = control_text, prepro_options
         self.run_dir = os.path.abspath(run_dir)
         self.time_limit_s, self.solver_dir = solver_time_limit_s, solver_dir
         self.log, self.should_stop = log, (should_stop or (lambda: False))
+        self.should_skip = should_skip or (lambda: False)
+        self._skip = False                # the design in progress was asked to end (latched per design)
         self.accept = tuple(accept_statuses)
+        force_check_settings(force_check)            # a bad entry fails here, before any design runs
+        self.force_check = force_check
         self.make_plots, self.keep_sol = bool(make_plots), bool(keep_sol)
         self.prepro_cmd, self.solver_cmd = prepro_cmd, solver_cmd
         self.x_tol = None if x_tol is None else np.asarray(x_tol, float)
@@ -373,6 +402,7 @@ class Local2DTestManager:
         usable = r.get("status") in self.accept
         H = read_rsd_history(os.path.join(case.cond_dir(r["cond"]), case.stem + ".rsd"))
         cl, cd, cm = (float(r.get(k, NAN)) for k in ("CL", "CD", "CM"))
+        fc = r.get("force_check") or {}
         return {
             "CL": cl if usable else NAN, "CD": cd if usable else NAN, "CM": cm if usable else NAN,
             "CL_over_CD": (cl / cd) if (usable and _finite(cl) and _finite(cd) and cd != 0.0) else NAN,
@@ -383,6 +413,10 @@ class Local2DTestManager:
             "CL_tail_range": tail_range(H[:, 2]) if len(H) else NAN,
             "CD_tail_range": tail_range(H[:, 3]) if len(H) else NAN,
             "min_area_ratio": float(rep.min_area_ratio), "max_wall_displacement": float(wall_disp),
+            # "residual": reached the stop criterion; "forces": hit the time limit with settled forces
+            "converged_by": r.get("converged_by"),
+            "force_check": ({k: fc.get(k) for k in ("passed", "window", "tol", "ref_length", "CL_spread",
+                                                    "CD_spread", "reason")} if fc else None),
         }
 
     def _case_log(self, msg: str):
@@ -417,10 +451,30 @@ class Local2DTestManager:
         except ValueError as e:
             self.log(f"[LOCAL-OPT][WARN] n={n}: the solver mesh could not be written ({e}). Nothing is run.")
             return self._nan_metrics("invalid_mesh", rep, len(conds))
+        self._skip = False
+        if self.should_skip():                       # asked for while nothing was running
+            self.log("[LOCAL-OPT] A 'Stop Simulation' request arrived while no simulation was running; "
+                     "it is ignored.")
+
+        def stop_now():
+            """Polled by the runner twice a second: the whole optimisation is being stopped, or this
+            design was asked to end (then every remaining flow condition of it is left out as well)."""
+            if self.should_stop():
+                return True
+            if not self._skip and self.should_skip():
+                self._skip = True
+                self.log(f"[LOCAL-OPT] n={n}: 'Stop Simulation' - ending the simulation of this design; "
+                         "the optimisation goes on with the next one.")
+            return self._skip
+
         try:
             results = case.run(self.opts, self.control_text, conds, self.builder.flags.values(),
-                               solver_time_limit_s=self.time_limit_s, should_stop=self.should_stop)
+                               solver_time_limit_s=self.time_limit_s, should_stop=stop_now,
+                               force_check=self.force_check)
         except RunStopped:
+            if self._skip and not self.should_stop():
+                self.log(f"[LOCAL-OPT] n={n}: stopped before the solver had started; the design gets no result.")
+                return self._nan_metrics("skipped", rep, len(conds))
             raise
         except RuntimeError as e:                    # PrePro crashed, wrote nothing or timed out
             self.log(f"[LOCAL-OPT][WARN] n={n}: preprocessor failed; the design gets no result.\n{e}")
@@ -431,7 +485,22 @@ class Local2DTestManager:
                     os.remove(case.sol_path)
                 except OSError:
                     pass
-        if len(results) < len(conds) or any(r.get("status") == "stopped" for r in results) or self.should_stop():
+        if self.should_stop():
+            raise RunStopped(f"stopped while design n={n} was running.")
+        if self._skip:
+            # ended by the user: the condition that was running, and those never started, are
+            # "skipped"; a condition that had already finished keeps what it computed
+            done = {int(r["cond"]): r for r in results}
+            metrics = []
+            for i in range(1, len(conds) + 1):
+                r = done.get(i)
+                if r is None:
+                    metrics.extend(dict(m, cond=i) for m in self._nan_metrics("skipped", rep, 1))
+                else:
+                    r = dict(r, status="skipped") if r.get("status") == "stopped" else r
+                    metrics.append(self._cond_metrics(case, r, rep, wall_disp))
+            return metrics
+        if len(results) < len(conds) or any(r.get("status") == "stopped" for r in results):
             raise RunStopped(f"stopped while design n={n} was running.")
         return [self._cond_metrics(case, r, rep, wall_disp) for r in results]
 
@@ -458,6 +527,12 @@ class Local2DTestManager:
                                next(s for s in statuses if s not in self.accept)))
             self._save()
             out.append(metrics)
+            if rec.get("baseline") and rec["status"] == "skipped":
+                rec["done"] = False                   # not a result of the baseline: compute it next time
+                self._save()
+                raise OptAbort("the baseline (n=0) was ended with 'Stop Simulation', so it has no result, and "
+                               "every other design is compared with it. Run the optimisation again and let "
+                               "the baseline finish (finished designs are kept).")
             if rec.get("baseline") and rec["status"] != "ok":
                 # if the unmodified geometry cannot be computed, the set-up is wrong;
                 # running fifty more designs would only produce fifty penalties
@@ -499,7 +574,7 @@ class Local2DTestManager:
                 + ["max_wall_displacement", "min_area_ratio", "wall_time_s"])
         for c in range(1, n_c + 1):
             head += [f"cond{c}_{k}" for k in ("status", "CL", "CD", "CM", "iterations", "residual",
-                                                "CL_tail_range", "CD_tail_range")]
+                                                "CL_tail_range", "CD_tail_range", "converged_by")]
         def num(v):                                   # blank for "no value", 8 significant digits otherwise
             return f"{float(v):.8g}" if _finite(v) else ""
         tmp = self.csv_path + ".tmp"
@@ -522,6 +597,7 @@ class Local2DTestManager:
                         row += [m.get("status", "")] + [num(m.get(k)) for k in ("CL", "CD", "CM")]
                         row += [m.get("iterations", "")] + [num(m.get(k)) for k in ("residual", "CL_tail_range",
                                                                                      "CD_tail_range")]
+                        row += [m.get("converged_by") or ""]
                     w.writerow(row)
             os.replace(tmp, self.csv_path)
         except OSError as e:                          # e.g. the table is open in Excel
@@ -573,6 +649,8 @@ class Setup:
         self.opts = PreProOptions.from_dict(s.get("prepro") or case_cfg.get("prepro"))
         limit_min = s.get("solver_time_limit_min", case_cfg.get("solver_time_limit_min", 60))
         self.time_limit_s = 60.0 * float(limit_min) if limit_min else None
+        self.force_check = s["force_check"] if "force_check" in s else case_cfg.get("force_check")
+        self.force_check_used = force_check_settings(self.force_check)     # raises ValueError on a bad entry
         control = s.get("solver_control_file") or os.path.join(self.output_dir, f"{self.base_name}.inp")
         if not os.path.isfile(control):
             raise FileNotFoundError(f"solver control file not found: {control} (press 'Save Solver Settings').")
@@ -620,10 +698,13 @@ class Setup:
             self.warnings += [f"flow condition {i}: {w}" for w in dict.fromkeys(notes + warns)]
         its = _as_float(get_namelist_value(self.control_text, "numberOfMGIterations"))
         if its is not None and its < 0 and "timeout" not in self.accept:
+            fc = self.force_check_used
+            unless = (f" unless its lift and drag coefficient moved by at most {fc['tol']:g} over its last "
+                      f"{fc['window']} cycles" if fc else "")
             self.warnings.append(
                 f"ivd%numberOfMGIterations = {int(its)}: a design that does not reach {int(-its)} orders within "
-                "the time limit is REJECTED (status 'timeout') and gets the penalty value. If some designs "
-                "converge and others do not, the surrogate is fitted to penalties, not physics. A fixed, "
+                f"the time limit is REJECTED (status 'timeout') and gets the penalty value{unless}. If some "
+                "designs converge and others do not, the surrogate is fitted to penalties, not physics. A fixed, "
                 "positive number of cycles gives every design a result at the same cost.")
         if not (self.prepro_cmd and self.solver_cmd):
             find_executables(self.solver_dir)
@@ -655,10 +736,28 @@ def run(run_dir: str, check_only: bool = False, mesh=None, echo: Optional[Callab
     os.makedirs(run_dir, exist_ok=True)
     log = OptLog(run_dir, echo)
     stop_file = os.path.join(run_dir, STOP_FILE)
-    try:
-        os.remove(stop_file)                       # a STOP left over from the last run must not stop this one
-    except OSError:
-        pass
+    skip_file = os.path.join(run_dir, SKIP_FILE)
+    for leftover in (stop_file, skip_file):        # a request left over from the last run must not act on this one
+        try:
+            os.remove(leftover)
+        except OSError:
+            pass
+    seen_skip = {"stamp": None}
+
+    def take_skip() -> bool:
+        """True once for every SKIP file written (the file is removed; if it cannot be removed, the
+        same file is not counted twice)."""
+        try:
+            stamp = os.stat(skip_file).st_mtime_ns
+        except OSError:
+            return False
+        try:
+            os.remove(skip_file)
+        except OSError:
+            if stamp == seen_skip["stamp"]:
+                return False
+        seen_skip["stamp"] = stamp
+        return True
     log(f"[LOCAL-OPT] {'Checking' if check_only else 'Starting'} in {run_dir}")
     try:
         from Remote.remoteOpt import _build_objective_callable, _impute_nonfinite
@@ -680,6 +779,13 @@ def run(run_dir: str, check_only: bool = False, mesh=None, echo: Optional[Callab
     log(f"[LOCAL-OPT] Case folder: {setup.output_dir}  (base name '{setup.base_name}')")
     log(f"[LOCAL-OPT] Objective (minimised): {obj_expr}")
     log(f"[LOCAL-OPT] Constraints: {setup.constraints if setup.constraints else 'none'}")
+    fc = setup.force_check_used
+    if fc and setup.time_limit_s:
+        ref = f"reference length {fc['ref_length']:g}" if fc["ref_length"] else "reference length = wall x-extent"
+        log(f"[LOCAL-OPT] A run that hits the time limit is ACCEPTED if its lift and drag coefficient moved by at "
+            f"most {fc['tol']:g} over its last {fc['window']} cycles ({ref}).")
+    elif setup.time_limit_s:
+        log("[LOCAL-OPT] A run that hits the time limit is rejected (the force check is off).")
     for i, c in enumerate(conds, 1):
         log(f"[LOCAL-OPT] Flow condition {i}: {c if c else 'as in the solver control file'}")
     for w in setup.warnings:
@@ -712,7 +818,8 @@ def run(run_dir: str, check_only: bool = False, mesh=None, echo: Optional[Callab
                                 accept_statuses=setup.accept, make_plots=bool(s.get("make_plots", True)),
                                 keep_sol=bool(s.get("keep_sol", False)), prepro_cmd=setup.prepro_cmd,
                                 solver_cmd=setup.solver_cmd, fingerprint=setup.fingerprint(),
-                                x_tol=1e-4 * (setup.ub - setup.lb))
+                                x_tol=1e-4 * (setup.ub - setup.lb), should_skip=take_skip,
+                                force_check=setup.force_check)
     except ValueError as e:
         log(f"[LOCAL-OPT][ERROR] {e}")
         return 1
@@ -720,6 +827,10 @@ def run(run_dir: str, check_only: bool = False, mesh=None, echo: Optional[Callab
         log("[LOCAL-OPT][ERROR] designs.json exists but bo_data.mcsv does not: the run folder is incomplete. "
             "Start a new optimisation.")
         return 1
+    old_timeouts = [d["n"] for d in tm.designs if d.get("done") and d.get("status") == "timeout"]
+    if old_timeouts:
+        log(f"[LOCAL-OPT] Resumed: design(s) {old_timeouts} ended on the time limit earlier and keep that "
+            "status; the force check (if on) applies to designs computed from now on.")
 
     kern_map = {"RBFKernel": RBFKernel, "Squared Exponential Kernel": SquaredExponentialKernel,
                 "Exponential Kernel": ExponentialKernel, "Mat12Kern": Mat12Kern, "Mat32Kern": Mat32Kern,

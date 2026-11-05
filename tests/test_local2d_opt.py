@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 import numpy as np
 
@@ -147,6 +148,100 @@ def test_stop_and_resume_recomputes_nothing_that_was_finished():
         assert not any("---- design" in ln for ln in logs3)
 
 
+def test_stop_simulation_ends_one_design_and_the_optimisation_goes_on():
+    """SKIP (the GUI's Stop Simulation during an optimisation): the design being computed ends
+    without a result, its remaining flow conditions are not run, everything else carries on."""
+    logs = []
+    with tempfile.TemporaryDirectory() as d:
+        # condition 1 takes two seconds in the stand-in solver (Mach 3.33), condition 2 is immediate
+        case, run_dir = make_case(d, n_samples=2, count_limit=1,
+                                  conditions=({"AoA": 2.0, "Mach": 3.33, "Re": 0.0, "Weight": 1.0},
+                                              {"AoA": 1.0, "Mach": 0.5, "Re": 0.0, "Weight": 1.0}))
+        skip = os.path.join(run_dir, "SKIP")
+
+        def echo(msg):
+            logs.append(msg)
+            if "[2D][SOLVER] n=1 cond 1" in msg:           # the solver of design 1 is about to start
+                open(skip, "w").close()
+            if "---- design n=2 " in msg:                  # nothing is running at this moment
+                open(skip, "w").close()
+        t0 = time.time()
+        assert run(run_dir, echo=echo) == 0, "\n".join(logs[-15:])
+        D = designs(run_dir)
+        assert [r["n"] for r in D] == [0, 1, 2, 3] and all(r["done"] for r in D)
+        assert [r["status"] for r in D] == ["ok", "skipped", "ok", "ok"]
+        assert [m["status"] for m in D[1]["metrics"]] == ["skipped", "skipped"]
+        assert D[1]["objective"] is None and all(r["objective"] is not None for r in (D[0], D[2], D[3]))
+        # it is given the penalty: worse than every design that has a result
+        assert D[1]["objective_used"] > max(r["objective"] for r in (D[0], D[2], D[3]))
+        # what the run left behind: the solver was killed part-way, condition 2 was never started
+        with open(os.path.join(case, "solutions", "n_1", "cond_1", "metrics.json")) as fh:
+            m = json.load(fh)
+        assert m["status"] == "stopped" and 0 < m["rows"] < 40
+        assert not os.path.exists(os.path.join(case, "solutions", "n_1", "cond_2"))
+        assert os.path.isfile(os.path.join(case, "solutions", "n_2", "cond_2", "metrics.json"))
+        assert D[1]["metrics"][0]["iterations"] == m["iterations"]         # where it was stopped is on record
+        assert not os.path.exists(skip)
+        assert sum("'Stop Simulation' - ending the simulation of this design" in ln for ln in logs) == 1
+        assert sum("arrived while no simulation was running" in ln for ln in logs) == 1
+        assert any("n=1: objective = none (skipped)" in ln for ln in logs)
+        assert D[1]["wall_time_s"] < 2.0 < min(D[2]["wall_time_s"], D[3]["wall_time_s"])   # it really was cut short
+        # a skipped design is final: nothing is computed again when the run is started again
+        logs2 = []
+        assert run(run_dir, echo=logs2.append) == 0
+        assert not any("---- design" in ln for ln in logs2) and designs(run_dir)[1]["status"] == "skipped"
+
+
+def test_stop_simulation_during_the_preprocessor_and_on_the_baseline():
+    import Local.local2DOpt as L
+    real_run = L.Flite2DCase.run
+    with tempfile.TemporaryDirectory() as d:
+        case, run_dir = make_case(d, n_samples=2, count_limit=1)
+        skip = os.path.join(run_dir, "SKIP")
+
+        def run_with_a_hanging_preprocessor(self, opts, control, conds=None, flags=None,
+                                            solver_time_limit_s=3600.0, should_stop=None, force_check=None):
+            if self.n != 2:
+                return real_run(self, opts, control, conds, flags, solver_time_limit_s=solver_time_limit_s,
+                                should_stop=should_stop, force_check=force_check)
+            open(skip, "w").close()                         # pressed while "the preprocessor" runs
+            t0 = time.time()
+            while not should_stop() and time.time() - t0 < 20.0:
+                time.sleep(0.02)
+            raise L.RunStopped("stopped while the preprocessor was running; nothing was computed.")
+        L.Flite2DCase.run = run_with_a_hanging_preprocessor
+        logs = []
+        try:
+            assert run(run_dir, echo=logs.append) == 0, "\n".join(logs[-15:])
+        finally:
+            L.Flite2DCase.run = real_run
+        D = designs(run_dir)
+        assert [r["status"] for r in D] == ["ok", "ok", "skipped", "ok"]
+        assert [m["status"] for m in D[2]["metrics"]] == ["skipped"] and D[2]["objective"] is None
+        assert any("n=2: stopped before the solver had started" in ln for ln in logs)
+
+    # the baseline: without it there is nothing to compare with, so the run ends, and the next
+    # start computes the baseline again instead of reusing "skipped"
+    with tempfile.TemporaryDirectory() as d:
+        case, run_dir = make_case(d, n_samples=2, count_limit=1,
+                                  conditions=({"AoA": 2.0, "Mach": 3.33, "Re": 0.0, "Weight": 1.0},))
+        logs = []
+
+        def echo(msg):
+            logs.append(msg)
+            if "[2D][SOLVER] n=0 cond 1" in msg:
+                open(os.path.join(run_dir, "SKIP"), "w").close()
+        assert run(run_dir, echo=echo) == 1
+        assert any("baseline (n=0) was ended with 'Stop Simulation'" in ln for ln in logs)
+        D = designs(run_dir)
+        assert D[0]["status"] == "skipped" and not D[0]["done"]
+        logs2 = []
+        assert run(run_dir, echo=logs2.append) == 0, "\n".join(logs2[-15:])
+        D2 = designs(run_dir)
+        assert any("---- design n=0 " in ln for ln in logs2)
+        assert [r["status"] for r in D2] == ["ok"] * 4 and all(r["done"] for r in D2)
+
+
 def test_a_changed_problem_is_not_resumed():
     with tempfile.TemporaryDirectory() as d:
         case, run_dir = make_case(d, count_limit=1, n_samples=2)
@@ -180,6 +275,39 @@ def test_designs_without_a_result_are_penalised_not_counted():
         assert res["n_without_result"] == len(bad) and res["best_design_n"] in [g["n"] for g in good]
         assert any("of the box gives an invalid mesh" in ln and "[WARN]" in ln for ln in logs)   # said before any CFD
         assert any("the morph gives an invalid mesh" in ln for ln in logs)
+
+
+def test_timed_out_designs_with_settled_forces_are_accepted():
+    """Mach 8.88: the stand-in never finishes, with constant lift and drag. With the force check,
+    every design hits the time limit and is accepted; without it, the baseline has no result."""
+    with tempfile.TemporaryDirectory() as d:
+        logs = []
+        case, run_dir = make_case(d, n_samples=2, count_limit=1, conditions=({"AoA": 2.0, "Mach": 8.88, "Re": 0.0},),
+                                  solver_time_limit_min=0.02, force_check={"enabled": True, "window": 5, "tol": 1e-4})
+        assert run(run_dir, echo=logs.append) == 0, "\n".join(logs[-15:])
+        D = [r for r in designs(run_dir) if r["done"]]
+        assert D and all(r["status"] == "ok" and r["objective"] is not None for r in D)
+        for r in D:
+            m = r["metrics"][0]
+            assert m["converged_by"] == "forces" and m["force_check"]["passed"]
+            assert m["force_check"]["CL_spread"] == 0.0 and m["force_check"]["window"] == 5
+        assert any("time limit is ACCEPTED" in ln for ln in logs)
+        assert any("forces had settled" in ln and "ACCEPTED" in ln for ln in logs)
+        with open(os.path.join(run_dir, "designs.csv")) as fh:
+            rows = list(csv.DictReader(fh))
+        assert rows and all(row["cond1_converged_by"] == "forces" for row in rows if row["status"] == "ok")
+    with tempfile.TemporaryDirectory() as d:
+        logs = []
+        case, run_dir = make_case(d, n_samples=2, count_limit=1, conditions=({"AoA": 2.0, "Mach": 8.88, "Re": 0.0},),
+                                  solver_time_limit_min=0.02, force_check={"enabled": False})
+        assert run(run_dir, echo=logs.append) == 1
+        assert designs(run_dir)[0]["status"] == "timeout"
+        assert any("force check is off" in ln for ln in logs)
+    with tempfile.TemporaryDirectory() as d:
+        logs = []
+        case, run_dir = make_case(d, force_check={"enabled": True, "tol": -1})
+        assert run(run_dir, echo=logs.append) == 1
+        assert any("tol must be a positive number" in ln and "[ERROR]" in ln for ln in logs)
 
 
 def test_a_failing_baseline_stops_the_run_at_once():

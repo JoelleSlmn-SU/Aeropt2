@@ -1,6 +1,8 @@
 """Stand-in for Solver.exe in the tests. The Mach number selects the behaviour:
-   9.99 -> NaN from the first iteration, 8.88 -> never finishes, 7.77 -> stops without output,
-   6.66 -> one iteration, then a Fortran run-time error.
+   9.99 -> NaN from the first iteration, 8.88 -> never finishes (lift and drag constant),
+   8.77 -> never finishes, lift alternating by 0.01 from one iteration to the next, 7.77 -> stops without output,
+   6.66 -> one iteration, then a Fortran run-time error, 3.33 -> a normal run that takes two
+   seconds (40 iterations, one every 0.05 s).
    Like the real solver it rewrites the result file every ivd%writeToFileInterval iterations
    and once more at the end, one row per mesh node, the node number in a 5-character field.
    Started with the extra argument --geometry, lift and drag also depend on the wall shape the
@@ -54,7 +56,7 @@ with open(rsd, "w") as fh:
     if mach == 9.99:
         fh.write("      1           NaN           NaN           NaN           NaN           NaN           NaN   0.00000E+00\n")
     else:
-        n = 10 ** 9 if mach == 8.88 else 5
+        n = 10 ** 9 if mach in (8.88, 8.77) else 40 if mach == 3.33 else 5
         if mach == 6.66:                 # a few good iterations, then a run-time error
             fh.write("      1  -0.10000E+00   0.10000E+00   0.10000E-01   0.00000E+00\n")
             fh.flush()
@@ -64,12 +66,13 @@ with open(rsd, "w") as fh:
         i = 0
         while i < n:
             i += 1
-            fh.write(f"{i:7d} {-0.5 * i:13.5E} {lift:13.5E} {drag:13.5E} {0.0:13.5E} "
+            li = lift + (0.01 * (i % 2) if mach == 8.77 else 0.0)
+            fh.write(f"{i:7d} {-0.5 * i:13.5E} {li:13.5E} {drag:13.5E} {0.0:13.5E} "
                      f"{0.0:13.5E} {0.0:13.5E} {0.0:13.5E}\n")
             fh.flush()
             if interval > 0 and i % interval == 0:
                 write_res(i)
-            if mach == 8.88:
+            if mach in (8.88, 8.77, 3.33):
                 time.sleep(0.05)
 write_res(0, nan=(mach == 9.99))
 print("Final residual")

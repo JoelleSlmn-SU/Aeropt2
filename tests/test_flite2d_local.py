@@ -21,8 +21,8 @@ sys.path.insert(0, os.path.dirname(HERE))
 from test_edge_modes_2d import naca0012, o_mesh                                  # noqa: E402
 from FileRW.FliteMesh2D import default_edge_flags, write_flite2d_mesh            # noqa: E402
 from Local.flite2d_local import (Flite2DCase, PreProOptions, RunStopped, apply_condition,    # noqa: E402
-                                 check_control, get_namelist_value, is_control_file, read_rsd,
-                                 set_namelist_value)
+                                 check_control, check_force_settling, force_check_settings,
+                                 get_namelist_value, is_control_file, read_rsd, set_namelist_value)
 
 PREPRO = [sys.executable, os.path.join(HERE, "standins", "fake_prepro.py")]
 SOLVER = [sys.executable, os.path.join(HERE, "standins", "fake_solver.py")]
@@ -269,6 +269,94 @@ def test_pictures_can_be_switched_off_and_never_stop_a_run():
         made = case.write_plots(1, m, TEMPLATE)
         assert [os.path.basename(f) for f in made] == ["convergence.png"]
         assert any("stopped while it was writing" in ln for ln in logs)
+
+
+def test_force_settling_check():
+    import numpy as np
+    it = np.arange(1, 101, dtype=float)
+    H = np.zeros((100, 8))
+    H[:, 0] = it
+    H[:, 2] = 300.0 + 50.0 * np.exp(-it / 10.0)       # lift settles; per 1000 of length = coefficient
+    H[:, 3] = 20.0
+    ok = check_force_settling(H, window=20, tol=1e-4, ref_length=1000.0)
+    assert ok["passed"] and ok["first_iteration"] == 80 and ok["last_iteration"] == 100 and ok["rows"] == 21
+    assert ok["CL_spread"] < 1e-4 and ok["CD_spread"] == 0.0
+    early = check_force_settling(H[:30], window=20, tol=1e-4, ref_length=1000.0)   # still moving at 30
+    assert not early["passed"] and early["reason"] == "lift still moving" and early["CL_spread"] > 1e-4
+    # the same forces in a mesh of length 1 are 1000 times larger coefficients
+    assert not check_force_settling(H, window=20, tol=1e-4, ref_length=1.0)["passed"]
+    short = check_force_settling(H, window=200, tol=1.0)
+    assert not short["passed"] and "shorter than the window" in short["reason"] and short["CL_spread"] is None
+    Hn = H.copy()
+    Hn[-3, 3] = np.nan
+    assert "not finite" in check_force_settling(Hn, window=20, tol=1.0)["reason"]
+    assert not check_force_settling(H[:1], window=1, tol=1.0)["passed"]
+    # oscillation: the spread is max - min, not the change of the last row
+    Ho = H.copy()
+    Ho[:, 3] = 20.0 + 0.5 * (it % 2)
+    o = check_force_settling(Ho, window=20, tol=1e-4, ref_length=1000.0)
+    assert not o["passed"] and o["reason"] == "drag still moving" and abs(o["CD_spread"] - 5e-4) < 1e-12
+    # settings
+    assert force_check_settings(None) == {"window": 500, "tol": 1e-4, "ref_length": None}
+    assert force_check_settings(False) is None and force_check_settings({"enabled": False}) is None
+    assert force_check_settings({"window": "50", "tol": "2e-5", "ref_length": 2}) == \
+        {"window": 50, "tol": 2e-5, "ref_length": 2.0}
+    for bad in ({"tol": 0}, {"tol": "x"}, {"window": 0}, {"ref_length": -1}, "yes"):
+        try:
+            force_check_settings(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad!r}")
+
+
+def test_timed_out_run_is_accepted_only_if_its_forces_settled():
+    logs = []
+    with tempfile.TemporaryDirectory() as d:
+        case = _case(d, logs)
+        case.make_plots = False
+        case.run_prepro(PreProOptions(n_grids=5))
+        L = case.reference_length()
+        assert L is not None and 0.9 < L < 1.1                  # the NACA 0012 of the tests has chord 1
+        fc = {"enabled": True, "window": 5, "tol": 1e-4}
+        flat = set_namelist_value(set_namelist_value(TEMPLATE, "MachNumber", 8.88), "writeToFileInterval", 7)
+        m = case.run_solver(flat, nc=1, time_limit_s=1.5, force_check=fc)
+        assert m["status"] == "ok" and m["converged_by"] == "forces", m
+        assert m["force_check"]["passed"] and m["force_check"]["ref_length_from"] == "x-extent of the walls"
+        assert m["iterations"] > 5 and m["CL"] == read_rsd(os.path.join(case.cond_dir(1), "naca_0.rsd"))["CL"]
+        assert m["res_iteration"] == m["iterations"] // 7 * 7     # the flow field is still that of the last write
+        with open(os.path.join(case.cond_dir(1), "metrics.json")) as fh:
+            assert json.load(fh)["converged_by"] == "forces"
+        assert any("forces had settled" in ln and "ACCEPTED" in ln for ln in logs)
+        # the same run, check off: a timeout as before
+        off = case.run_solver(flat, nc=2, time_limit_s=1.5, force_check=False)
+        assert off["status"] == "timeout" and off["converged_by"] is None and off["force_check"] is None
+        assert any("The force check is off" in ln for ln in logs)
+        # lift alternating by 0.01: not settled
+        wobble = set_namelist_value(TEMPLATE, "MachNumber", 8.77)
+        w = case.run_solver(wobble, nc=3, time_limit_s=1.5, force_check=fc)
+        assert w["status"] == "timeout" and not w["force_check"]["passed"]
+        assert abs(w["force_check"]["CL_spread"] - 0.01 / L) < 1e-6
+        assert any("Forces NOT settled" in ln for ln in logs)
+        # ... but with a tolerance above that, it is accepted
+        w2 = case.run_solver(wobble, nc=3, time_limit_s=1.5, force_check=dict(fc, tol=0.02))
+        assert w2["status"] == "ok" and w2["converged_by"] == "forces"
+        # default window (500 cycles) is longer than this run: not checked, stays a timeout
+        dflt = case.run_solver(flat, nc=4, time_limit_s=1.5)
+        assert dflt["status"] == "timeout" and "shorter than the window" in dflt["force_check"]["reason"]
+        # a user stop is never turned into a result
+        t0 = time.time()
+        st = case.run_solver(flat, nc=5, time_limit_s=60, force_check=fc, should_stop=lambda: time.time() - t0 > 1.5)
+        assert st["status"] == "stopped" and st["force_check"] is None
+        # a run that reached its criterion records how much the forces still moved
+        good = case.run_solver(TEMPLATE, nc=6, time_limit_s=60, force_check={"window": 3, "tol": 1e-4})
+        assert good["status"] == "ok" and good["converged_by"] == "residual" and good["force_check"]["passed"]
+        # a bad entry fails before PrePro runs
+        try:
+            case.run(PreProOptions(n_grids=5), TEMPLATE, boundary_flags=[1, 3], force_check={"tol": -1})
+        except ValueError as e:
+            assert "tol" in str(e)
+        else:
+            raise AssertionError("a negative tolerance was accepted")
 
 
 if __name__ == "__main__":

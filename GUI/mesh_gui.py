@@ -1053,7 +1053,7 @@ class MeshViewer(QWidget):
             "back_btn", "save_btn", "modal_explorer_btn",
             "advanced_modal_btn", "pca_settings_btn", "global_modes_settings_btn", "protection_settings_btn",
             "direct_mode_combo", "direct_amp_alpha_spin", "direct_rigid_translation_cb",
-            "form_container"
+            "form_container", "basis_bar"
         ]:
             try:
                 w = getattr(self, attr, None)
@@ -1061,6 +1061,8 @@ class MeshViewer(QWidget):
                     w.setParent(None)
             except Exception:
                 pass
+        self.basis_bar = None
+        self._basis_collapsed = False
 
         try:
             if hasattr(self, "form_container") and self.form_container is not None:
@@ -1583,6 +1585,11 @@ class MeshViewer(QWidget):
 
     def _on_right_click_2d(self, x, y):
         """Qt right-click on the 2D view: fix / release the nearest T node."""
+        if getattr(self, "_basis_collapsed", False):
+            # the options are closed after 'Save 2D Basis': a click must not change the
+            # fixed points behind the user's back (the saved basis would no longer match)
+            self.log("[2D] The basis options are closed. Press 'Edit basis options' to fix or release points.")
+            return
         try:
             try:
                 dpr = float(self.plotter.devicePixelRatioF())
@@ -1969,7 +1976,63 @@ class MeshViewer(QWidget):
             self.log("[2D][ERROR] The basis was saved, but the case cannot run until the solver mesh "
                      "can be written. Fix the problem above and save again.")
             return
+        import time
+        self._collapse_basis_panel_2d(f"2D basis saved at {time.strftime('%H:%M:%S')}: {mo.n_modes} mode(s), "
+                                      f"solver mesh written (volumes/n_0).")
         self.control_ready.emit()
+
+    # ---- after saving: only the view, with a way back to the options ----------
+    def _basis_option_widgets_2d(self):
+        """The widgets of the 2D basis panel below the view (those that exist)."""
+        out = []
+        for attr in ("back_btn", "form_container", "modal_explorer_btn", "save_btn"):
+            w = getattr(self, attr, None)
+            if w is not None:
+                out.append(w)
+        return out
+
+    def _collapse_basis_panel_2d(self, summary=""):
+        """
+        Hide the basis options so that the view has the whole page; a one-line bar
+        under the view says what was saved and brings the options back. Nothing is
+        deleted: every setting is still in its widget when the options are reopened.
+        """
+        try:
+            for w in self._basis_option_widgets_2d():
+                w.setVisible(False)
+            bar = getattr(self, "basis_bar", None)
+            if bar is None:
+                bar = QWidget()
+                row = QHBoxLayout(bar)
+                row.setContentsMargins(0, 0, 0, 0)
+                self.basis_bar_label = QLabel()
+                self.basis_bar_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+                row.addWidget(self.basis_bar_label, 1)
+                self.edit_basis_btn = QPushButton("Edit basis options")
+                self.edit_basis_btn.setToolTip("Show the basis options again (number of modes, pinning, "
+                                               "fixed points, solver boundaries, mesh scale).\n"
+                                               "Changes take effect when you press 'Save 2D Basis' again.")
+                self.edit_basis_btn.clicked.connect(self._expand_basis_panel_2d)
+                row.addWidget(self.edit_basis_btn)
+                self.main_layout.insertWidget(self.main_layout.indexOf(self.plotter) + 1, bar)
+                self.basis_bar = bar
+            self.basis_bar_label.setText(summary)
+            self.basis_bar_label.setToolTip(summary)
+            bar.setVisible(True)
+            self._basis_collapsed = True
+        except RuntimeError:              # widgets already deleted by Qt (viewer being reset)
+            self._basis_collapsed = False
+
+    def _expand_basis_panel_2d(self):
+        """Back to the basis options (the 'Edit basis options' button)."""
+        try:
+            for w in self._basis_option_widgets_2d():
+                w.setVisible(True)
+            if getattr(self, "basis_bar", None) is not None:
+                self.basis_bar.setVisible(False)
+        except RuntimeError:
+            pass
+        self._basis_collapsed = False
 
     def open_edit_dialog(self):
         # Use stored name lists (fall back to empty if not set yet)
