@@ -16,6 +16,7 @@ for subdir in ["", "Optimisation", "FileRW", "Remote", "MeshGeneration"]:
 
 
 from pipeline_cluster import ClusterPipelineManager
+from Remote.cluster_config import executables_from_config, load_cluster_config
 
 
 def _log(msg, log_path):
@@ -723,22 +724,11 @@ def main():
     cad_units = settings_json.get("units", "mm")
     previous_solution = settings_json.get("previous_solution", {}) or {}
     
-    # Executable paths (customize for your cluster)
-    executables = {
-        "parallel_domains": settings_json.get("parallel_domains", 1),
-        "surface_mesher": "/home/s.o.hassan/XieZ/work/Meshers/volume/src/a.Surf3D",
-        "volume_mesher": "/home/s.o.hassan/XieZ/work/Meshers/volume/src/a.Mesh3D",
-        "prepro_exe": "/home/s.engevabj/codes/PrePro_uns/Gen3d",
-        "solver_exe": "/home/s.engevabj/codes/FLITE_uns/UnsMgnsg3d",
-        "combine_exe": "/home/s.engevabj/codes/utilities/makeplot2",
-        "ensight_exe": "/home/s.engevabj/codes/utilities/engen_tet",
-        "splitplot_exe": "/home/s.engevabj/codes/utilities/splitplot2",
-        "makeplot_exe": "/home/s.engevabj/codes/utilities/makeplot2",
-        "intel_module": "module load compiler/intel/2020/0",
-        "gnu_module": "module load compiler/gnu/12/1.0",
-        "mpi_intel_module": "module load mpi/intel/2020/0",
-        "interpu_script": "$HOME/aeropt/Scripts/Utilities/interpu.py",
-    }
+    # Executable paths / modules: Remote/cluster_config.py
+    # (+ ~/aeropt/cluster_config.json on the cluster). Edit there, not here.
+    executables = executables_from_config()
+    executables["parallel_domains"] = settings_json.get("parallel_domains", 1)
+    executables["interpu_script"] = f"{load_cluster_config()['scripts_root']}/Utilities/interpu.py"
     
     # Create test manager (uses ClusterPipelineManager internally)
     tm = ClusterTestManager(

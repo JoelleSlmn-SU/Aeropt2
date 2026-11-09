@@ -13,6 +13,7 @@ import os, posixpath, shutil, re, textwrap
 from Remote.runSimRemote import runSurfMorph, runCadMorph
 from ConvertFileType.convertVtmtoFro import vtm_to_fro
 from ConvertFileType.convertEnGeoToFro import engeo_to_fro
+from Remote.cluster_config import load_cluster_config, env_setup_lines
 
 class Batchfile:
     def __init__(self, name: str):
@@ -30,11 +31,10 @@ class Batchfile:
         hdr = ["#!/bin/bash -l", "#SBATCH --export=NONE"]
         for k, v in self.sbatch_params.items():
             hdr.append(f"#SBATCH --{k}={v}")
-        return "\n".join(['module load anaconda/2024.06',
-            'source activate',
-            'conda activate aeropt-hpc',
-            'set -euo pipefail',
-        ] + self.lines + [""])
+        # GUI side: uses the defaults in Remote/cluster_config.py (the
+        # cluster-side JSON override is not visible from here).
+        return "\n".join(hdr + env_setup_lines(load_cluster_config(read_overrides=False))
+                         + self.lines + [""])
 
 class HPCPipelineManager:
     def __init__(self, main_window, n=0):
@@ -46,22 +46,25 @@ class HPCPipelineManager:
         # cluster handles (adapt to your app wiring)
         self.ssh_client    = getattr(main_window, "ssh_client", None)
         self.remote_output = getattr(main_window, "remote_output_dir", None)
-        self.intel_module  = getattr(self, "intel_module", "module load compiler/intel/2020/0")
-        self.gnu_module    = getattr(self, "gnu_module",   "module load compiler/gnu/12/1.0")
-        self.mpi_module    = getattr(self, "mpi_module",   "module load mpi/mpich/3.2.1")
-        self.mpi_intel_module    = getattr(self, "mpi_intel_module",   "module load mpi/intel/2020/0")
+        # Cluster-specific modules / executables: Remote/cluster_config.py
+        cc = load_cluster_config(read_overrides=False)
+        self.cluster_cfg = cc
+        self.intel_module     = cc["intel_module"]
+        self.gnu_module       = cc["gnu_module"]
+        self.mpi_module       = cc["mpi_module"]
+        self.mpi_intel_module = cc["mpi_intel_module"]
 
         # executables / wrappers
-        self.morph_cmd       = getattr(self, "morph_cmd",       "remoteMorph.py")  # Python entrypoint on cluster PATH
-        self.surface_mesher  = getattr(self, "surface_mesher",  "/home/s.o.hassan/XieZ/work/Meshers/volume/src/a.Surf3D")
-        self.volume_mesher   = getattr(self, "volume_mesher",   "/home/s.o.hassan/XieZ/work/Meshers/volume/src/a.Mesh3D")
-        self.prepro_exe      = getattr(self, "prepro_exe",      "/home/s.o.hassan/bin/Gen3d_jj")
-        self.solver_exe      = getattr(self, "solver_exe",      "/home/s.o.hassan/bin/UnsMgnsg3d")
-        self.combine_exe     = getattr(self, "combine_exe",     "/home/s.engevabj/codes/utilities/makeplot2")
-        self.ensight_exe     = getattr(self, "ensight_exe",     "/home/s.engevabj/codes/utilities/engen_tet")
-        
-        self.splitplot_exe = getattr(self, "splitplot_exe", "/home/s.engevabj/codes/utilities/splitplot2")
-        self.makeplot_exe  = getattr(self, "makeplot_exe",  "/home/s.engevabj/codes/utilities/makeplot2")
+        self.morph_cmd       = "remoteMorph.py"  # Python entrypoint in <scripts_root>/Remote
+        self.surface_mesher  = cc["surface_mesher"]
+        self.volume_mesher   = cc["volume_mesher"]
+        self.prepro_exe      = cc["prepro_exe"]
+        self.solver_exe      = cc["solver_exe"]
+        self.combine_exe     = cc["combine_exe"]
+        self.ensight_exe     = cc["ensight_exe"]
+        self.splitplot_exe   = cc["splitplot_exe"]
+        self.makeplot_exe    = cc["makeplot_exe"]
+        self.hyb_plt_converter = cc["hyb_plt_converter"]
 
         # paths
         self.input_path = getattr(self.main_window, "input_file_path", "")
@@ -832,7 +835,7 @@ class HPCPipelineManager:
         bf.lines.append(self.intel_module)
         bf.lines.append("")
         bf.lines.append("")
-        bf.lines.append(f"/home/s.engevabj/codes/utilities/hyb_plt_converter <<INPUT1")
+        bf.lines.append(f"{self.hyb_plt_converter} <<INPUT1")
         bf.lines.append(f"corner")
         bf.lines.append(f"INPUT1")
         bf.lines.append("")

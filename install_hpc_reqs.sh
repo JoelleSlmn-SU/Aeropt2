@@ -1,5 +1,17 @@
-#!/bin/bash
-set -euo pipefail
-source ~/.bashrc
-"/lustrehome/home/s.2268086/scratch/s.2268086/mamba-root/envs/aeropt-py310/bin/python" -m pip install -U pip==23.2.1 wheel setuptools
-"/lustrehome/home/s.2268086/scratch/s.2268086/mamba-root/envs/aeropt-py310/bin/python" -m pip install -r "/lustrehome/home/s.2268086/aeropt/Scripts/requirements_hpc.txt" --upgrade --no-cache-dir
+#!/bin/bash -l
+# (Re)create the aeropt-hpc env on the cluster from environment.yml.
+# Run on a LOGIN node (needs internet). Safe to re-run: updates in place.
+set -eo pipefail
+unset PYTHONHOME
+module purge
+module load miniconda3/26.5.3-2          # keep in sync with Remote/cluster_config.py
+eval "$(conda shell.bash hook)"
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if conda env list | awk '{print $1}' | grep -qx aeropt-hpc; then
+    conda env update -n aeropt-hpc -f "$HERE/environment.yml" --prune
+else
+    conda env create -n aeropt-hpc -f "$HERE/environment.yml"
+fi
+conda activate aeropt-hpc
+python -c "import numpy, scipy, vtk, pyvista, geomdl; print('aeropt-hpc OK:', __import__('sys').executable)"

@@ -17,6 +17,7 @@ sys.path.append(os.path.dirname("Remote"))
 sys.path.append(os.path.dirname("Local"))
 from FileRW.logger import GuiLogger
 from Remote.pipeline_remote import HPCPipelineManager
+from Remote.cluster_config import load_cluster_config, env_setup_lines
 from Local.pipeline_local import PipelineManager
 from FileRW.RungenInpFile import RungenInpFile
 
@@ -968,11 +969,9 @@ class MainWindow(QMainWindow):
             "#SBATCH --time=1-00:00",
             "#SBATCH --nodes=1",
             "#SBATCH --ntasks=1",
-            "source ~/.bashrc",
-            "set -euo pipefail",
+            *env_setup_lines(load_cluster_config(read_overrides=False)),
             f"cd \"{remote_run}\"",
-            f"/home/{self.ssh_creds['username']}/.conda/envs/aeropt-hpc/bin/python "
-            f"/home/{self.ssh_creds['username']}/aeropt/Scripts/Remote/pipelineMorph.py \"{remote_run}\"",
+            f"python \"{load_cluster_config(read_overrides=False)['scripts_root']}/Remote/pipelineMorph.py\" \"{remote_run}\"",
         ])
 
         local_batch = os.path.join(local_tmp, "batchfile_morph_orchestrator")
@@ -1671,9 +1670,9 @@ class MainWindow(QMainWindow):
         prelim_run = posixpath.join(remote_run, "prelim")
         user = self.ssh_creds["username"]
 
-        py = f"/home/{user}/.conda/envs/aeropt-hpc/bin/python"
+        py = "python"  # from the conda env activated by env_setup_lines()
         script = (
-            f"/home/{user}/aeropt/Scripts/Remote/"
+            f"{load_cluster_config(read_overrides=False)['scripts_root']}/Remote/"
             f"prelimResponseSurface.py"
         )
 
@@ -1703,8 +1702,7 @@ class MainWindow(QMainWindow):
             "#SBATCH --time=3-00:00",
             "#SBATCH --nodes=1",
             "#SBATCH --ntasks=1",
-            "source ~/.bashrc",
-            "set -euo pipefail",
+            *env_setup_lines(load_cluster_config(read_overrides=False)),
             f'cd "{prelim_run}"',
             (
                 f'{py} "{script}" '
@@ -1859,11 +1857,9 @@ class MainWindow(QMainWindow):
             "#SBATCH --time=3-00:00",
             "#SBATCH --nodes=1",
             "#SBATCH --ntasks=1",
-            "source ~/.bashrc",
-            "set -euo pipefail",
+            *env_setup_lines(load_cluster_config(read_overrides=False)),
             f"cd \"{remote_run}\"",
-            f"/home/{self.ssh_creds['username']}/.conda/envs/aeropt-hpc/bin/python "
-            f"/home/{self.ssh_creds['username']}/aeropt/Scripts/Remote/remoteOpt.py \"{remote_run}\"",
+            f"python \"{load_cluster_config(read_overrides=False)['scripts_root']}/Remote/remoteOpt.py\" \"{remote_run}\"",
         ])
 
         local_batch = os.path.join(local_tmp, "batchfile_opt_orchestrator")
@@ -2227,9 +2223,9 @@ class MainWindow(QMainWindow):
 
         # Submit the sweep driver (submit_sweep.py) which will call run_case.py (which calls the pipeline)
         user = self.ssh_creds["username"]
-        py = f"/home/{user}/.conda/envs/aeropt-hpc/bin/python"
+        py = "python"  # from the conda env activated by env_setup_lines()
         # NOTE: these scripts will live alongside other remote scripts (we'll create them next)
-        submit_sweep = f"/home/{user}/aeropt/Scripts/MeshFailureClassifier/sweep/submit_sweep.py"
+        submit_sweep = f"{load_cluster_config(read_overrides=False)['scripts_root']}/MeshFailureClassifier/sweep/submit_sweep.py"
 
         batch_lines = [
             "#!/bin/bash -l",
@@ -2239,8 +2235,7 @@ class MainWindow(QMainWindow):
             "#SBATCH --time=3-00:00",
             "#SBATCH --nodes=1",
             "#SBATCH --ntasks=1",
-            "set -euo pipefail",
-            "source ~/.bashrc",
+            *env_setup_lines(load_cluster_config(read_overrides=False)),
             f'cd "{remote_run}"',
             f'{py} "{submit_sweep}" "{remote_run}"',
         ]

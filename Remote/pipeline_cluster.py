@@ -34,6 +34,7 @@ else:
 
 from ShapeParameterization.controlNodeDisp import estimate_normals, getDisplacements
 from ShapeParameterization.designDisplacement import control_displacements_from_basis
+from Remote.cluster_config import load_cluster_config, env_setup_lines
 
 class Batchfile:
     def __init__(self, name: str):
@@ -51,11 +52,7 @@ class Batchfile:
         hdr = ["#!/bin/bash -l", "#SBATCH --export=NONE"]
         for k, v in self.sbatch_params.items():
             hdr.append(f"#SBATCH --{k}={v}")
-        return "\n".join(hdr + ['module load anaconda/2024.06',
-            'source activate',
-            'conda activate aeropt-hpc',
-            'set -euo pipefail',
-        ] + self.lines + [""])
+        return "\n".join(hdr + env_setup_lines(load_cluster_config()) + self.lines + [""])
 
 class ClusterPipelineManager:
     """
@@ -78,27 +75,33 @@ class ClusterPipelineManager:
         self.remote_output = config_dict["remote_output"]
         self.input_dir = config_dict.get("input_dir", "")
         
-        # Executables
-        self.morph_script = config_dict.get("morph_script", "$HOME/aeropt/Scripts/Remote/remoteMorph.py")
-        self.paraview_script = "$HOME/aeropt/Scripts/Remote/paraview_cluster.py"
-        self.surface_mesher = config_dict.get("surface_mesher", "/home/s.o.hassan/XieZ/work/Meshers/surface/src/a.Surf3D")
-        self.volume_mesher = config_dict.get("volume_mesher", "/home/s.o.hassan/XieZ/work/Meshers/volume/src/a.Mesh3D")
-        self.prepro_exe = config_dict.get("prepro_exe", "/home/s.engevabj/codes/PrePro_uns/Gen3d")
-        self.solver_exe = config_dict.get("solver_exe", "/home/s.engevabj/codes/FLITE_uns/UnsMgnsg3d")
-        self.combine_exe = config_dict.get("combine_exe", "/home/s.engevabj/codes/utilities/makeplot2")
-        self.ensight_exe = config_dict.get("ensight_exe", "/home/s.engevabj/codes/utilities/engen_tet")
-        self.splitplot_exe = config_dict.get("splitplot_exe", "/home/s.engevabj/codes/utilities/splitplot2")
-        self.makeplot_exe = config_dict.get("makeplot_exe", "/home/s.engevabj/codes/utilities/makeplot2")
+        # Executables / modules: config_dict (from remoteOpt / prelim) wins,
+        # otherwise Remote/cluster_config.py (+ ~/aeropt/cluster_config.json).
+        cc = load_cluster_config()
+        self.cluster_cfg = cc
+        scripts_root = cc["scripts_root"]
+        self.morph_script = config_dict.get("morph_script", f"{scripts_root}/Remote/remoteMorph.py")
+        self.paraview_script = f"{scripts_root}/Remote/paraview_cluster.py"
+        self.surface_mesher = config_dict.get("surface_mesher", cc["surface_mesher"])
+        self.volume_mesher = config_dict.get("volume_mesher", cc["volume_mesher"])
+        self.prepro_exe = config_dict.get("prepro_exe", cc["prepro_exe"])
+        self.solver_exe = config_dict.get("solver_exe", cc["solver_exe"])
+        self.combine_exe = config_dict.get("combine_exe", cc["combine_exe"])
+        self.ensight_exe = config_dict.get("ensight_exe", cc["ensight_exe"])
+        self.splitplot_exe = config_dict.get("splitplot_exe", cc["splitplot_exe"])
+        self.makeplot_exe = config_dict.get("makeplot_exe", cc["makeplot_exe"])
         
         self.orig_dir = os.path.join(self.remote_output, "orig")
         
         # Modules
-        self.python_module = "/home/s.2268086/.conda/envs/aeropt-hpc/bin/python"
-        self.intel_module = config_dict.get("intel_module", "module load compiler/intel/2020/0")
-        self.gnu_module = config_dict.get("gnu_module", "module load compiler/gnu/12/1.0")
-        self.mpi_module = config_dict.get("mpi_module", "module load mpi/mpich/3.2.1")
-        self.mpi_intel_module = config_dict.get("mpi_intel_module", "module load mpi/intel/2020/0")
-        self.hyb_plt_converter = config_dict.get("hyb_plt_converter", "/home/s.engevabj/codes/utilities/hyb_plt_converter")
+        self.python_module = "python"  # resolved by the conda env activated in every batch header
+        self.intel_module = config_dict.get("intel_module", cc["intel_module"])
+        self.gnu_module = config_dict.get("gnu_module", cc["gnu_module"])
+        self.mpi_module = config_dict.get("mpi_module", cc["mpi_module"])
+        self.mpi_intel_module = config_dict.get("mpi_intel_module", cc["mpi_intel_module"])
+        self.hyb_plt_converter = config_dict.get("hyb_plt_converter", cc["hyb_plt_converter"])
+        self.paraview_setup = config_dict.get("paraview_setup", cc.get("paraview_setup", ""))
+        self.pvpython = config_dict.get("pvpython", cc.get("pvpython", "pvpython"))
         # Design parameters
         self.modal_coeffs = config_dict.get("modal_coeffs", [])
         self.morph_basis_json = config_dict.get("morph_basis_json", "")
@@ -111,7 +114,7 @@ class ClusterPipelineManager:
         self.restart_from_previous = bool(self.previous_solution.get("enabled", False))
         self.interpu_script = config_dict.get(
             "interpu_script",
-            "$HOME/aeropt/Scripts/Utilities/interpu.py"
+            f"{scripts_root}/Utilities/interpu.py"
         )
         
         self.job_ids = {}
@@ -435,7 +438,12 @@ class ClusterPipelineManager:
         """
         bf.lines.append("")
         bf.lines.append("# ---------------- Pressure-recovery / monitors ----------------")
-        bf.lines.append("module load paraview/2019 || true")
+        if self.paraview_setup:
+            bf.lines.append(f"{self.paraview_setup} || true")
+        bf.lines.append(f'PVPYTHON="{self.pvpython}"')
+        bf.lines.append('if ! command -v "$PVPYTHON" >/dev/null 2>&1; then')
+        bf.lines.append('  echo "[MON][WARN] pvpython not found at $PVPYTHON - monitors.csv will NOT be written" >&2')
+        bf.lines.append('fi')
 
         bf.lines.append(f"BASE='{self.base_name}_{self.n}'")
         bf.lines.append(f"INTERVAL={int(self.monitor_interval)}")
@@ -576,7 +584,7 @@ class ClusterPipelineManager:
         bf.lines.append("  if [ ! -f \"$case_path\" ]; then echo \"[MON][WARN] missing case for abs_it=$abs_it\" >> \"$MON_LOG_ABS\"; popd >/dev/null || true; return 0; fi")
 
         bf.lines.append("  set +e")
-        bf.lines.append("  pvpython --force-offscreen-rendering \"../paraview_cluster.py\" \\")
+        bf.lines.append("  \"$PVPYTHON\" --force-offscreen-rendering \"../paraview_cluster.py\" \\")
         bf.lines.append("    --case \"$case_path\" \\")
         bf.lines.append("    --iter \"$abs_it\" \\")
         bf.lines.append(f"    --mach {mach_for_post:.8f} \\")

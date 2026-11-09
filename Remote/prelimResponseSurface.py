@@ -47,6 +47,7 @@ for subdir in ["", "Optimisation", "FileRW", "Remote", "MeshGeneration", "ShapeP
 
 from remoteOpt import ClusterTestManager, _build_objective_callable
 from pipeline_cluster import ClusterPipelineManager
+from Remote.cluster_config import executables_from_config
 try:
     from ShapeParameterization.controlNodeDisp import _surface_normals, _map_normals_to_control
 except ImportError:
@@ -475,20 +476,12 @@ def main():
         cad_units = settings.get("units", "mm")
         parallel = settings.get("parallel", 80)
 
-        executables = {
-            "parallel_domains": settings.get("parallel_domains", 1),
-            "surface_mesher": settings.get("surface_mesher", "/home/s.o.hassan/XieZ/work/Meshers/volume/src/a.Surf3D"),
-            "volume_mesher": settings.get("volume_mesher", "/home/s.o.hassan/XieZ/work/Meshers/volume/src/a.Mesh3D"),
-            "prepro_exe": settings.get("prepro_exe", "/home/s.o.hassan/bin/Gen3d_jj"),
-            "solver_exe": settings.get("solver_exe", "/home/s.o.hassan/bin/UnsMgnsg3d"),
-            "combine_exe": settings.get("combine_exe", "/home/s.engevabj/codes/utilities/makeplot2"),
-            "ensight_exe": settings.get("ensight_exe", "/home/s.engevabj/codes/utilities/engen_tet"),
-            "splitplot_exe": settings.get("splitplot_exe", "/home/s.engevabj/codes/utilities/splitplot2"),
-            "makeplot_exe": settings.get("makeplot_exe", "/home/s.engevabj/codes/utilities/makeplot2"),
-            "intel_module": settings.get("intel_module", "module load compiler/intel/2020/0"),
-            "gnu_module": settings.get("gnu_module", "module load compiler/gnu/12/1.0"),
-            "mpi_intel_module": settings.get("mpi_intel_module", "module load mpi/intel/2020/0"),
-        }
+        # Executables / modules: Remote/cluster_config.py. GUI settings still win
+        # if they explicitly set a path. NOTE: previously this fell back to
+        # s.o.hassan/bin/Gen3d_jj + UnsMgnsg3d, while remoteOpt used the
+        # s.engevabj builds. Both now use the same (cluster_config) binaries.
+        executables = executables_from_config(overrides=settings)
+        executables["parallel_domains"] = settings.get("parallel_domains", 1)
 
         tm = ClusterTestManager(
             remote_root=prelim_run,
