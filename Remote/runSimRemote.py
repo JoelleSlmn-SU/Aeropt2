@@ -23,7 +23,6 @@ from ShapeParameterization.controlNodeDisp import (
 from MeshGeneration.MorphModel import MorphModel
 from FileRW.FroFile import FroFile
 from FileRW.BatchFile import Batchfile
-from Remote.cluster_config import load_cluster_config, env_setup_lines, env_setup_inline
 
 import tarfile, pathlib, re
 
@@ -100,8 +99,6 @@ class RemoteClient:
         finally:
             sftp.close()
 
-        # Kept for reference only; jobs now activate the conda env and call `python`
-        # (see Remote/cluster_config.py) instead of relying on the env's path.
         self.python_local = posixpath.join(self.remote_home, ".conda/envs/aeropt-hpc/bin/python")
         self.server = posixpath.join(self.remote_home, "aeropt", "Scripts")
 
@@ -151,7 +148,9 @@ def _ensure_remote_dirs_and_upload_mesh(viewer, remoteCli, n, logger):
     if not hasattr(viewer.main_window, "remote_output_dir"):
         from datetime import datetime
         run_id = datetime.now().strftime("auto_%Y%m%d_%H%M%S")
-        viewer.main_window.remote_output_dir = f"$HOME/aeropt/aeropt_out/{run_id}"
+        # Project scratch, same place the GUI's "Set Output Directory" uses
+        viewer.main_window.remote_output_dir = posixpath.join(
+            viewer.main_window.hpc_scratch_root(), run_id)
 
     out_dir  = viewer.main_window.remote_output_dir          # may include $HOME
     rdir_sh  = posixpath.join(out_dir, "surfaces", f"n_{n}") # shell path (keeps $HOME)
@@ -349,15 +348,13 @@ def _submit_batch(viewer, ssh, remoteCli, rdir_sh, vtk_upload_name, remote_json_
     bf.sbatch_params["output"]        = "batch_%j.out"
     bf.sbatch_params["error"]         = "batch_%j.err"
 
-    cc = load_cluster_config(read_overrides=False)
-    project_root = cc["scripts_root"]
+    project_root = "$HOME/aeropt/Scripts"
     fro_target   = posixpath.join(rdir_sh, os.path.splitext(vtk_upload_name)[0] + ".fro")
 
-    bf.lines.extend(env_setup_lines(cc))
     bf.lines.append('export PYTHONPATH="' + project_root + ':${PYTHONPATH:-}"')
 
     bf.lines.append('cd "' + project_root + '/Remote"')
-    bf.lines.append('python remoteMorph.py "' + fro_target + '" "' + remote_json_shell + '"')
+    bf.lines.append('"' + remoteCli.python_local + '" remoteMorph.py "' + fro_target + '" "' + remote_json_shell + '"')
 
     # write locally and upload
     batch_name = f"batchfile_{job_name}"
@@ -427,15 +424,15 @@ def runSurfMorph(viewer, n=0, debug=True, run_as_batch=False):
 
     morph_cmd = (
         "bash -lc '"
-        f"{env_setup_inline()}; "
+        "source ~/.bashrc; "
         "export SSL_CERT_FILE=/etc/pki/tls/certs/ca-bundle.crt; "
         "export MPLBACKEND=Agg; "
         "export PYVISTA_OFF_SCREEN=true; "
         "export PYVISTA_USE_PANEL=false; "
         "export LIBGL_ALWAYS_SOFTWARE=1; "
-        f"export PYTHONPATH={project_root}:${{PYTHONPATH:-}}; "
+        f"export PYTHONPATH={project_root}:$PYTHONPATH; "
         f"cd {project_root}/Remote; "
-        f"python remoteMorph.py "
+        f"{remoteCli.python_local} remoteMorph.py "
         f"{remote_fro_target_shell} {remote_json_shell}"
         "'"
     )

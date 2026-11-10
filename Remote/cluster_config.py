@@ -50,15 +50,15 @@ CLUSTER_DEFAULTS = {
 
     # FLITE / mesher executables. These are the values remoteOpt.py actually
     # passed on the old system. Verify with the preflight; override in JSON.
-    "surface_mesher": "/home/s.o.hassan/XieZ/work/Meshers/volume/src/a.Surf3D",
-    "volume_mesher": "/home/s.o.hassan/XieZ/work/Meshers/volume/src/a.Mesh3D",
-    "prepro_exe": "/home/s.engevabj/codes/PrePro_uns/Gen3d",
-    "solver_exe": "/home/s.engevabj/codes/FLITE_uns/UnsMgnsg3d",
-    "combine_exe": "/home/s.engevabj/codes/utilities/makeplot2",
-    "ensight_exe": "/home/s.engevabj/codes/utilities/engen_tet",
-    "splitplot_exe": "/home/s.engevabj/codes/utilities/splitplot2",
-    "makeplot_exe": "/home/s.engevabj/codes/utilities/makeplot2",
-    "hyb_plt_converter": "/home/s.engevabj/codes/utilities/hyb_plt_converter",
+    "surface_mesher": "/pixhome/s.o.hassan/XieZ/work/Meshers/volume/src/a.Surf3D",
+    "volume_mesher": "/pixhome/s.o.hassan/XieZ/work/Meshers/volume/src/a.Mesh3D",
+    "prepro_exe": "/pixhome/s.engevabj/codes/PrePro_uns/Gen3d",
+    "solver_exe": "/pixhome/s.engevabj/codes/FLITE_uns/UnsMgnsg3d",
+    "combine_exe": "/pixhome/s.engevabj/codes/utilities/makeplot2",
+    "ensight_exe": "/pixhome/s.engevabj/codes/utilities/engen_tet",
+    "splitplot_exe": "/pixhome/s.engevabj/codes/utilities/splitplot2",
+    "makeplot_exe": "/pixhome/s.engevabj/codes/utilities/makeplot2",
+    "hyb_plt_converter": "/pixhome/s.engevabj/codes/utilities/hyb_plt_converter",
 }
 
 # Keys that are executables (used by the preflight check)

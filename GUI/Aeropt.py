@@ -17,7 +17,6 @@ sys.path.append(os.path.dirname("Remote"))
 sys.path.append(os.path.dirname("Local"))
 from FileRW.logger import GuiLogger
 from Remote.pipeline_remote import HPCPipelineManager
-from Remote.cluster_config import load_cluster_config, env_setup_lines
 from Local.pipeline_local import PipelineManager
 from FileRW.RungenInpFile import RungenInpFile
 
@@ -28,45 +27,12 @@ class MainWindow(QMainWindow):
         self.run_mode = self.ask_run_location()
         # Prompt run mode early
         if self.run_mode == "HPC":
-            saved_creds = self.load_ssh_config()
-
-            if saved_creds:
-                use_saved = QMessageBox.question(
-                    self,
-                    "Use Saved Credentials?",
-                    "Use previously saved SSH credentials?",
-                    QMessageBox.Yes | QMessageBox.No
-                )
-                if use_saved == QMessageBox.Yes:
-                    self.ssh_creds = saved_creds
-                    self.run_mode = "HPC"
-                else:
-                    creds = self.get_ssh_credentials_dialog()
-                    if creds:
-                        self.ssh_creds = {
-                            "host": creds["host"],
-                            "username": creds["username"],
-                            "password": creds["password"]
-                        }
-                        self.run_mode = "HPC"
-                        if creds.get("remember"):
-                            self.save_ssh_config(self.ssh_creds)
-                    else:
-                        self.run_mode = "Local"
+            creds = self.collect_hpc_login()
+            if creds:
+                self.ssh_creds = creds
             else:
-                creds = self.get_ssh_credentials_dialog()
-                if creds:
-                    self.ssh_creds = {
-                        "host": creds["host"],
-                        "username": creds["username"],
-                        "password": creds["password"]
-                    }
-                    self.run_mode = "HPC"
-                    if creds.get("remember"):
-                        self.save_ssh_config(self.ssh_creds)
-                else:
-                    self.run_mode = "Local"
-                    
+                self.run_mode = "Local"
+
         self.setup_window()
         self.create_buttons()
         self.create_stack_pages()
@@ -162,47 +128,128 @@ class MainWindow(QMainWindow):
             "ft": 0.3048
         }.get(units, 1.0)
     
+    # ------------------------------------------------------------------
+    # HPC login (MFA-capable) and project scratch
+    # ------------------------------------------------------------------
+    def _ssh_config_path(self):
+        return os.path.join(os.path.expanduser("~"), ".aeropt", "ssh_config.json")
+
     def load_ssh_config(self):
-        import os, json
-        config_path = os.path.join(os.path.expanduser("~"), ".aeropt", "ssh_config.json")
-        if os.path.exists(config_path):
+        """Saved host / username / project. Any password saved by older versions is removed."""
+        path = self._ssh_config_path()
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"[SSH Config] Failed to read: {e}")
+            return None
+        if "password" in data:
+            data.pop("password")
             try:
-                with open(config_path, "r") as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"[SSH Config] Failed to read: {e}")
-        return None
+                with open(path, "w") as f:
+                    json.dump(data, f)
+            except Exception:
+                pass
+        return data
 
     def save_ssh_config(self, creds):
-        import os, json
-        config_dir = os.path.join(os.path.expanduser("~"), ".aeropt")
-        os.makedirs(config_dir, exist_ok=True)
-        config_path = os.path.join(config_dir, "ssh_config.json")
+        path = self._ssh_config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        keep = {k: creds[k] for k in ("host", "username", "project") if creds.get(k)}
         try:
-            with open(config_path, "w") as f:
-                json.dump(creds, f)
+            with open(path, "w") as f:
+                json.dump(keep, f)
             if hasattr(self, "logger"):
-                self.logger.log("[HPC] SSH credentials saved.")
+                self.logger.log("[HPC] Host, username and project code saved.")
         except Exception as e:
             print(f"[SSH Config] Failed to save: {e}")
-    
-    def get_ssh_credentials_dialog(self):
-        dialog = SshLoginDialog(self)
+
+    def get_ssh_credentials_dialog(self, saved=None, error=""):
+        dialog = SshLoginDialog(self, saved=saved)
+        if error:
+            dialog.show_error(error)
         if dialog.exec_() == QDialog.Accepted:
             return dialog.get_credentials()
         return None
-    
+
+    def collect_hpc_login(self, error=""):
+        """Ask for host / username / project code (password optional).
+        Returns the creds dict, or None if the user cancelled."""
+        saved = self.load_ssh_config()
+        if saved and saved.get("project") and not error:
+            use_saved = QMessageBox.question(
+                self, "Use Saved Login?",
+                f"Sign in as {saved.get('username')} on {saved.get('host')}\n"
+                f"with project {saved.get('project')}?",
+                QMessageBox.Yes | QMessageBox.No)
+            if use_saved == QMessageBox.Yes:
+                return {"host": saved["host"], "username": saved["username"],
+                        "project": saved["project"], "password": ""}
+        creds = self.get_ssh_credentials_dialog(saved=saved, error=error)
+        if not creds:
+            return None
+        if creds.pop("remember", False):
+            self.save_ssh_config(creds)
+        return creds
+
+    def hpc_scratch_root(self):
+        """/scratch/<project>/<username>/aeropt/aeropt_out on the cluster."""
+        from Remote.hpc_paths import scratch_root
+        return scratch_root(self.ssh_creds["project"], self.ssh_creds["username"])
+
     def test_ssh_connection(self, creds):
-        try:
-            self.ssh_client = paramiko.SSHClient()
-            self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            self.ssh_client.connect(creds["host"], username=creds["username"], password=creds["password"])
-            self.logger.log("[HPC] SSH connection successful")
-            return True
-        except Exception as e:
-            QMessageBox.critical(self, "SSH Failed", f"Could not connect to HPC:\n{e}")
+        """Sign in (password and/or MFA prompts from the cluster), then check that the
+        project scratch folder is usable. A wrong project code is asked for again
+        without signing in again."""
+        from mfa_login import hpc_login
+        from Remote.hpc_paths import check_scratch
+        client = hpc_login(self, creds["host"], creds["username"],
+                           creds.get("password") or None, logger=self.logger)
+        if client is None:
             return False
-    
+        self.ssh_client = client
+        creds.pop("password", None)            # not needed any more
+        self.logger.log("[HPC] SSH connection successful")
+
+        while True:
+            ok, msg = check_scratch(self.ssh_client, creds.get("project", ""), creds["username"])
+            self.logger.log(f"[HPC] {msg}")
+            if ok:
+                return True
+            code, again = QInputDialog.getText(
+                self, "Project scratch not available",
+                f"{msg}\n\nProject code:", QLineEdit.Normal, creds.get("project", ""))
+            if not again:
+                try:
+                    self.ssh_client.close()
+                except Exception:
+                    pass
+                return False
+            from Remote.hpc_paths import normalise_project_code
+            creds["project"] = normalise_project_code(code)
+            saved = self.load_ssh_config()
+            if saved and saved.get("username") == creds["username"] and saved.get("host") == creds["host"]:
+                self.save_ssh_config(creds)
+
+    def ensure_hpc_connection(self) -> bool:
+        """Call at the start of any HPC action. Reconnects in place if the session
+        dropped, so objects holding self.ssh_client (pipeline, TestManager) keep working."""
+        from Remote.hpc_auth import is_alive
+        if is_alive(getattr(self, "ssh_client", None)):
+            return True
+        if QThread.currentThread() is not QApplication.instance().thread():
+            self.logger.log("[HPC][ERROR] Connection lost; reconnect from the main window.")
+            return False
+        if QMessageBox.question(self, "HPC connection lost",
+                                "The cluster session has ended. Sign in again?") != QMessageBox.Yes:
+            return False
+        from mfa_login import hpc_login
+        c = hpc_login(self, self.ssh_creds["host"], self.ssh_creds["username"], None,
+                      client=getattr(self, "ssh_client", None), logger=self.logger)
+        return c is not None
+
     def apply_qss_theme(self, theme_name):
         if not theme_name or not hasattr(self, "themes_dir"):
             return
@@ -592,7 +639,7 @@ class MainWindow(QMainWindow):
             try:
                 # Name remote run folder after local output folder (sanitised)
                 temp = os.path.basename(self.output_directory.rstrip('/\\')).replace(' ', '_')
-                base_hpc_dir = f"/scratch/{self.ssh_creds['username']}/aeropt/aeropt_out/{temp}"
+                base_hpc_dir = posixpath.join(self.hpc_scratch_root(), temp)
                 self.base_hpc_dir = base_hpc_dir
 
                 # Create remote dirs with bash (handles parents)
@@ -604,9 +651,12 @@ class MainWindow(QMainWindow):
 
                 mkdir_cmd = "bash -lc \"" + " && ".join(mkdir_parts) + "\""
                 _in, _out, _err = self.ssh_client.exec_command(mkdir_cmd)
+                status = _out.channel.recv_exit_status()
                 err = _err.read().decode(errors="ignore").strip()
                 if err:
                     self.logger.log(f"[HPC] mkdir stderr: {err}")
+                if status != 0:
+                    raise RuntimeError(f"could not create {base_hpc_dir} (exit {status})")
 
                 self.remote_output_dir = base_hpc_dir
                 self.logger.log(f"[HPC] Created output directory and subfolders under: {self.remote_output_dir}")
@@ -969,9 +1019,11 @@ class MainWindow(QMainWindow):
             "#SBATCH --time=1-00:00",
             "#SBATCH --nodes=1",
             "#SBATCH --ntasks=1",
-            *env_setup_lines(load_cluster_config(read_overrides=False)),
+            "source ~/.bashrc",
+            "set -euo pipefail",
             f"cd \"{remote_run}\"",
-            f"python \"{load_cluster_config(read_overrides=False)['scripts_root']}/Remote/pipelineMorph.py\" \"{remote_run}\"",
+            f"/pixhome{self.ssh_creds['username']}/.conda/envs/aeropt-hpc/bin/python "
+            f"/pixhome{self.ssh_creds['username']}/aeropt/Scripts/Remote/pipelineMorph.py \"{remote_run}\"",
         ])
 
         local_batch = os.path.join(local_tmp, "batchfile_morph_orchestrator")
@@ -1493,7 +1545,7 @@ class MainWindow(QMainWindow):
         if modal_basis:
             files_to_upload["modal_basis_T_surface.npz"] = {
                 "src": modal_basis,
-                "remote_dir": remote_orig,
+                "remote_dir": posixpath.join(self.remote_output_dir, "Orig"),
             }
         else:
             self.logger.log(
@@ -1513,20 +1565,39 @@ class MainWindow(QMainWindow):
             self.logger.log("[OPT][HPC][WARN] No BAC/BPP/BCO/control files staged to orig/.")
             return remote_orig
 
-        # Upload via SFTP
+        # Upload via SFTP. An entry is either a local path (goes to orig/) or
+        # {"src": local_path, "remote_dir": remote_folder}.
+        def _mkdirs(sftp, path):
+            cur = ""
+            for part in [p for p in path.split("/") if p]:
+                cur += "/" + part
+                try:
+                    sftp.stat(cur)
+                except IOError:
+                    sftp.mkdir(cur)
+
+        failed = []
+        sftp = self.ssh_client.open_sftp()
         try:
-            sftp = self.ssh_client.open_sftp()
-            try:
-                for relname, src in files_to_upload.items():
-                    dst = posixpath.join(remote_orig, relname)
+            for relname, entry in files_to_upload.items():
+                if isinstance(entry, dict):
+                    src, rdir = entry["src"], entry["remote_dir"]
+                else:
+                    src, rdir = entry, remote_orig
+                dst = posixpath.join(rdir, relname)
+                try:
+                    _mkdirs(sftp, rdir)
                     sftp.put(src, dst)
                     self.logger.log(f"[OPT][HPC] Staged {src} → {dst}")
-            finally:
-                sftp.close()
-        except Exception as e:
-            self.logger.log(f"[OPT][HPC][WARN] Failed to upload orig inputs: {e}")
-            return ""
+                except Exception as e:
+                    failed.append(relname)
+                    self.logger.log(f"[OPT][HPC][ERROR] Could not stage {relname} → {dst}: {e}")
+        finally:
+            sftp.close()
 
+        if failed:
+            self.logger.log(f"[OPT][HPC][ERROR] Not staged: {', '.join(failed)}")
+            return ""
         return remote_orig
 
     def _pick_surface_mesh_for_opt(self) -> str:
@@ -1670,9 +1741,9 @@ class MainWindow(QMainWindow):
         prelim_run = posixpath.join(remote_run, "prelim")
         user = self.ssh_creds["username"]
 
-        py = "python"  # from the conda env activated by env_setup_lines()
+        py = f"/pixhome{user}/.conda/envs/aeropt-hpc/bin/python"
         script = (
-            f"{load_cluster_config(read_overrides=False)['scripts_root']}/Remote/"
+            f"/pixhome{user}/aeropt/Scripts/Remote/"
             f"prelimResponseSurface.py"
         )
 
@@ -1702,7 +1773,8 @@ class MainWindow(QMainWindow):
             "#SBATCH --time=3-00:00",
             "#SBATCH --nodes=1",
             "#SBATCH --ntasks=1",
-            *env_setup_lines(load_cluster_config(read_overrides=False)),
+            "source ~/.bashrc",
+            "set -euo pipefail",
             f'cd "{prelim_run}"',
             (
                 f'{py} "{script}" '
@@ -1857,9 +1929,11 @@ class MainWindow(QMainWindow):
             "#SBATCH --time=3-00:00",
             "#SBATCH --nodes=1",
             "#SBATCH --ntasks=1",
-            *env_setup_lines(load_cluster_config(read_overrides=False)),
+            "source ~/.bashrc",
+            "set -euo pipefail",
             f"cd \"{remote_run}\"",
-            f"python \"{load_cluster_config(read_overrides=False)['scripts_root']}/Remote/remoteOpt.py\" \"{remote_run}\"",
+            f"/pixhome{self.ssh_creds['username']}/.conda/envs/aeropt-hpc/bin/python "
+            f"/pixhome{self.ssh_creds['username']}/aeropt/Scripts/Remote/remoteOpt.py \"{remote_run}\"",
         ])
 
         local_batch = os.path.join(local_tmp, "batchfile_opt_orchestrator")
@@ -2223,9 +2297,9 @@ class MainWindow(QMainWindow):
 
         # Submit the sweep driver (submit_sweep.py) which will call run_case.py (which calls the pipeline)
         user = self.ssh_creds["username"]
-        py = "python"  # from the conda env activated by env_setup_lines()
+        py = f"/pixhome{user}/.conda/envs/aeropt-hpc/bin/python"
         # NOTE: these scripts will live alongside other remote scripts (we'll create them next)
-        submit_sweep = f"{load_cluster_config(read_overrides=False)['scripts_root']}/MeshFailureClassifier/sweep/submit_sweep.py"
+        submit_sweep = f"/pixhome{user}/aeropt/Scripts/MeshFailureClassifier/sweep/submit_sweep.py"
 
         batch_lines = [
             "#!/bin/bash -l",
@@ -2235,7 +2309,8 @@ class MainWindow(QMainWindow):
             "#SBATCH --time=3-00:00",
             "#SBATCH --nodes=1",
             "#SBATCH --ntasks=1",
-            *env_setup_lines(load_cluster_config(read_overrides=False)),
+            "set -euo pipefail",
+            "source ~/.bashrc",
             f'cd "{remote_run}"',
             f'{py} "{submit_sweep}" "{remote_run}"',
         ]
@@ -3418,7 +3493,7 @@ class PreviousSolutionDialog(QDialog):
         if self.is_remote():
             start = self.path_edit.text().strip()
             if not start:
-                start = f"/scratch/{self.main.ssh_creds['username']}/aeropt/aeropt_out"
+                start = self.main.hpc_scratch_root()
             self.path_edit.setText(start)
             self.refresh_listing()
         else:
@@ -4726,4 +4801,4 @@ if __name__ == "__main__":
     if window.available_themes:
         window.apply_qss_theme(window.available_themes[-1])
 
-    sys.exit(app.exec())
+    sys.exit(app.exec())

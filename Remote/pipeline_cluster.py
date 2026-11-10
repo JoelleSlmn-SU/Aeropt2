@@ -747,7 +747,7 @@ class ClusterPipelineManager:
         batch_name = f"morph_n{self.gen}_{n}"
         bf = Batchfile(batch_name)
         bf.sbatch_params["time"] = "00-01:00"
-        bf.sbatch_params["mem"] = "0"
+        bf.sbatch_params["mem"] = "8"
         
         bf.lines.append(f"cd {surf_dir}")
         bf.lines.append(f"python3 {self.morph_script} {fro_target} {config_path}")
