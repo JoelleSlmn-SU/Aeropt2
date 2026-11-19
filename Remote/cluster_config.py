@@ -45,6 +45,19 @@ CLUSTER_DEFAULTS = {
     "paraview_setup": "",
     "pvpython": "$HOME/.conda/envs/aeropt-pv/bin/pvpython",
 
+    # Memory per job (Slurm --mem). Sunbird2 compute nodes: 256 cores, ~755 GB,
+    # but MaxMemPerNode=737280 MB, so --mem=0 ("whole node") is REJECTED there
+    # (pending reason MaxMemPerLimit). "" = don't send --mem: Slurm then gives
+    # DefMemPerCPU (2880 MB) x cores, which scales with the solver's ntasks.
+    # No unit = MB, so always write G.
+    "mem_morph": "16G",
+    "mem_surface": "32G",
+    "mem_volume": "64G",
+    "mem_plt_conv": "16G",
+    "mem_prepro": "64G",
+    "mem_solver": "",      # 80 tasks x 2.88 GB = ~230 GB
+    "mem_post": "16G",
+
     # Aeropt scripts on the cluster
     "scripts_root": "$HOME/aeropt/Scripts",
 
@@ -52,8 +65,8 @@ CLUSTER_DEFAULTS = {
     # passed on the old system. Verify with the preflight; override in JSON.
     "surface_mesher": "/pixhome/s.o.hassan/XieZ/work/Meshers/volume/src/a.Surf3D",
     "volume_mesher": "/pixhome/s.o.hassan/XieZ/work/Meshers/volume/src/a.Mesh3D",
-    "prepro_exe": "/pixhome/s.engevabj/codes/PrePro_uns/Gen3d",
-    "solver_exe": "/pixhome/s.engevabj/codes/FLITE_uns/UnsMgnsg3d",
+    "prepro_exe": "/pixhome/s.2268086/aeropt/Gen3d/Prepro_v1.0_jj/Gen3d",
+    "solver_exe": "/pixhome/s.o.hassan/bin/UnsMgnsg3d_release",
     "combine_exe": "/pixhome/s.engevabj/codes/utilities/makeplot2",
     "ensight_exe": "/pixhome/s.engevabj/codes/utilities/engen_tet",
     "splitplot_exe": "/pixhome/s.engevabj/codes/utilities/splitplot2",
@@ -96,6 +109,17 @@ def load_cluster_config(read_overrides=True):
     return cfg
 
 
+def apply_mem(sbatch_params, stage, cfg=None):
+    """Set (or drop) --mem for a stage from the config. Never sends mem=0."""
+    cfg = cfg or load_cluster_config(read_overrides=False)
+    v = str(cfg.get(f"mem_{stage}", "") or "").strip()
+    if v in ("", "0"):
+        sbatch_params.pop("mem", None)
+    else:
+        sbatch_params["mem"] = v
+    return sbatch_params
+
+
 def env_setup_lines(cfg=None):
     """
     Shell lines that give a batch job the aeropt Python environment.
@@ -107,6 +131,8 @@ def env_setup_lines(cfg=None):
       `source activate` / plain `conda activate` do not.
     - set -u only after activation: conda's activate scripts reference unset
       variables and abort under -u.
+    - SLURM_EXPORT_ENV=ALL so srun steps inherit the job's modules/env
+      (the job itself still starts clean because of #SBATCH --export=NONE).
     """
     cfg = cfg or load_cluster_config(read_overrides=False)
     return [
@@ -116,6 +142,10 @@ def env_setup_lines(cfg=None):
         f"module load {cfg['env_module']}",
         'eval "$(conda shell.bash hook)"',
         f"conda activate {cfg['conda_env']}",
+        # #SBATCH --export=NONE makes Slurm set SLURM_EXPORT_ENV=NONE inside the
+        # job, so every `srun` step would start with an EMPTY environment and
+        # lose the modules loaded below (LD_LIBRARY_PATH -> libimf.so not found).
+        "export SLURM_EXPORT_ENV=ALL",
         "set -u",
     ]
 

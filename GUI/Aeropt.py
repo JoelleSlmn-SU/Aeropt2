@@ -1022,8 +1022,8 @@ class MainWindow(QMainWindow):
             "source ~/.bashrc",
             "set -euo pipefail",
             f"cd \"{remote_run}\"",
-            f"/pixhome{self.ssh_creds['username']}/.conda/envs/aeropt-hpc/bin/python "
-            f"/pixhome{self.ssh_creds['username']}/aeropt/Scripts/Remote/pipelineMorph.py \"{remote_run}\"",
+            f"/home/{self.ssh_creds['username']}/.conda/envs/aeropt-hpc/bin/python "
+            f"/home/{self.ssh_creds['username']}/aeropt/Scripts/Remote/pipelineMorph.py \"{remote_run}\"",
         ])
 
         local_batch = os.path.join(local_tmp, "batchfile_morph_orchestrator")
@@ -1545,7 +1545,7 @@ class MainWindow(QMainWindow):
         if modal_basis:
             files_to_upload["modal_basis_T_surface.npz"] = {
                 "src": modal_basis,
-                "remote_dir": posixpath.join(self.remote_output_dir, "Orig"),
+                "remote_dir": remote_orig,
             }
         else:
             self.logger.log(
@@ -1565,39 +1565,20 @@ class MainWindow(QMainWindow):
             self.logger.log("[OPT][HPC][WARN] No BAC/BPP/BCO/control files staged to orig/.")
             return remote_orig
 
-        # Upload via SFTP. An entry is either a local path (goes to orig/) or
-        # {"src": local_path, "remote_dir": remote_folder}.
-        def _mkdirs(sftp, path):
-            cur = ""
-            for part in [p for p in path.split("/") if p]:
-                cur += "/" + part
-                try:
-                    sftp.stat(cur)
-                except IOError:
-                    sftp.mkdir(cur)
-
-        failed = []
-        sftp = self.ssh_client.open_sftp()
+        # Upload via SFTP
         try:
-            for relname, entry in files_to_upload.items():
-                if isinstance(entry, dict):
-                    src, rdir = entry["src"], entry["remote_dir"]
-                else:
-                    src, rdir = entry, remote_orig
-                dst = posixpath.join(rdir, relname)
-                try:
-                    _mkdirs(sftp, rdir)
+            sftp = self.ssh_client.open_sftp()
+            try:
+                for relname, src in files_to_upload.items():
+                    dst = posixpath.join(remote_orig, relname)
                     sftp.put(src, dst)
                     self.logger.log(f"[OPT][HPC] Staged {src} → {dst}")
-                except Exception as e:
-                    failed.append(relname)
-                    self.logger.log(f"[OPT][HPC][ERROR] Could not stage {relname} → {dst}: {e}")
-        finally:
-            sftp.close()
-
-        if failed:
-            self.logger.log(f"[OPT][HPC][ERROR] Not staged: {', '.join(failed)}")
+            finally:
+                sftp.close()
+        except Exception as e:
+            self.logger.log(f"[OPT][HPC][WARN] Failed to upload orig inputs: {e}")
             return ""
+
         return remote_orig
 
     def _pick_surface_mesh_for_opt(self) -> str:
@@ -1741,9 +1722,9 @@ class MainWindow(QMainWindow):
         prelim_run = posixpath.join(remote_run, "prelim")
         user = self.ssh_creds["username"]
 
-        py = f"/pixhome{user}/.conda/envs/aeropt-hpc/bin/python"
+        py = f"/home/{user}/.conda/envs/aeropt-hpc/bin/python"
         script = (
-            f"/pixhome{user}/aeropt/Scripts/Remote/"
+            f"/home/{user}/aeropt/Scripts/Remote/"
             f"prelimResponseSurface.py"
         )
 
@@ -1932,8 +1913,8 @@ class MainWindow(QMainWindow):
             "source ~/.bashrc",
             "set -euo pipefail",
             f"cd \"{remote_run}\"",
-            f"/pixhome{self.ssh_creds['username']}/.conda/envs/aeropt-hpc/bin/python "
-            f"/pixhome{self.ssh_creds['username']}/aeropt/Scripts/Remote/remoteOpt.py \"{remote_run}\"",
+            f"/home/{self.ssh_creds['username']}/.conda/envs/aeropt-hpc/bin/python "
+            f"/home/{self.ssh_creds['username']}/aeropt/Scripts/Remote/remoteOpt.py \"{remote_run}\"",
         ])
 
         local_batch = os.path.join(local_tmp, "batchfile_opt_orchestrator")
@@ -2297,9 +2278,9 @@ class MainWindow(QMainWindow):
 
         # Submit the sweep driver (submit_sweep.py) which will call run_case.py (which calls the pipeline)
         user = self.ssh_creds["username"]
-        py = f"/pixhome{user}/.conda/envs/aeropt-hpc/bin/python"
+        py = f"/home/{user}/.conda/envs/aeropt-hpc/bin/python"
         # NOTE: these scripts will live alongside other remote scripts (we'll create them next)
-        submit_sweep = f"/pixhome{user}/aeropt/Scripts/MeshFailureClassifier/sweep/submit_sweep.py"
+        submit_sweep = f"/home/{user}/aeropt/Scripts/MeshFailureClassifier/sweep/submit_sweep.py"
 
         batch_lines = [
             "#!/bin/bash -l",
@@ -4801,4 +4782,4 @@ if __name__ == "__main__":
     if window.available_themes:
         window.apply_qss_theme(window.available_themes[-1])
 
-    sys.exit(app.exec())
+    sys.exit(app.exec())

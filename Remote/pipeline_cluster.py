@@ -34,7 +34,7 @@ else:
 
 from ShapeParameterization.controlNodeDisp import estimate_normals, getDisplacements
 from ShapeParameterization.designDisplacement import control_displacements_from_basis
-from Remote.cluster_config import load_cluster_config, env_setup_lines
+from Remote.cluster_config import load_cluster_config, env_setup_lines, apply_mem
 
 class Batchfile:
     def __init__(self, name: str):
@@ -747,7 +747,7 @@ class ClusterPipelineManager:
         batch_name = f"morph_n{self.gen}_{n}"
         bf = Batchfile(batch_name)
         bf.sbatch_params["time"] = "00-01:00"
-        bf.sbatch_params["mem"] = "8"
+        apply_mem(bf.sbatch_params, "morph", self.cluster_cfg)
         
         bf.lines.append(f"cd {surf_dir}")
         bf.lines.append(f"python3 {self.morph_script} {fro_target} {config_path}")
@@ -791,11 +791,10 @@ class ClusterPipelineManager:
         # Create batch file
         batch_name = f"vol_n{self.n}"
         bf = Batchfile(batch_name)
-        bf.sbatch_params["mem"] = "0"
+        apply_mem(bf.sbatch_params, "volume", self.cluster_cfg)
         bf.sbatch_params["time"] = "04:00:00"
         
         bf.lines.append(self.intel_module)
-        bf.lines.append(self.gnu_module)
         bf.lines.append(f"cd {vol_dir}/")
         bf.lines.append(f"cp {surf_dir}/{self.base_name}_{self.n}.fro {vol_dir}/ || true")
         bf.lines.append(f"cp {self.orig_dir}/{self.base_name}.bpp {vol_dir}/{self.base_name}_{self.n}.bpp || true")
@@ -884,7 +883,7 @@ class ClusterPipelineManager:
         batch_name = f"pre_n{self.gen}_{self.n}"
         bf = Batchfile(batch_name)
         bf.sbatch_params["ntasks"] = 1
-        bf.sbatch_params["mem"] = "0"
+        apply_mem(bf.sbatch_params, "prepro", self.cluster_cfg)
         bf.sbatch_params["time"] = "06:00:00"
         bf.sbatch_params.pop("nodes", None)
         
@@ -928,8 +927,11 @@ class ClusterPipelineManager:
         # Create batch file
         batch_name = f"sol_n{self.gen}_{self.n}_{tag_slug}"
         bf = Batchfile(batch_name)
-        bf.sbatch_params["ntasks"] = str(self.sol_parallel_domains) if self.sol_parallel_domains != 1 else 80
-        bf.sbatch_params["mem"] = "0"
+        bf.lines.append("#SBATCH --nodes=1")
+        bf.sbatch_params["ntasks"] = str(self.sol_parallel_domains) if self.sol_parallel_domains != 1 else 16
+        bf.lines.append(f"#SBATCH --ntasks-per-node={str(self.sol_parallel_domains)}")
+        bf.lines.append("#SBATCH --cpus-per-task=8")
+        apply_mem(bf.sbatch_params, "solver", self.cluster_cfg)
         bf.sbatch_params["time"] = "3-00:00"
         bf.sbatch_params.pop("nodes", None)
         

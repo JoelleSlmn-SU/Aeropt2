@@ -13,7 +13,7 @@ import os, posixpath, shutil, re, textwrap
 from Remote.runSimRemote import runSurfMorph, runCadMorph
 from ConvertFileType.convertVtmtoFro import vtm_to_fro
 from ConvertFileType.convertEnGeoToFro import engeo_to_fro
-from Remote.cluster_config import load_cluster_config, env_setup_lines
+from Remote.cluster_config import load_cluster_config, env_setup_lines, apply_mem
 
 class Batchfile:
     def __init__(self, name: str):
@@ -639,7 +639,7 @@ class HPCPipelineManager:
         # batch
         batch_name = f"surf_n{self.n}"
         bf = Batchfile(batch_name)
-        bf.sbatch_params["mem"] = "0"
+        apply_mem(bf.sbatch_params, "surface", self.cluster_cfg)
         bf.lines.append(self.intel_module)
         bf.lines.append(self.gnu_module)
         bf.lines.append(f"cd {surf_dir}")
@@ -796,7 +796,7 @@ class HPCPipelineManager:
         # --- Batchfile: always try to pull from surfaces stage at runtime (harmless if absent)
         batch_name = f"vol_n{self.n}"
         bf = Batchfile(batch_name)
-        bf.sbatch_params["mem"] = "0"
+        apply_mem(bf.sbatch_params, "volume", self.cluster_cfg)
         bf.lines.append("")
         bf.lines.append("")
         bf.lines.append(self.intel_module)
@@ -828,7 +828,7 @@ class HPCPipelineManager:
         
         batch_name = f"plt_conv_n{self.n}"
         bf = Batchfile(batch_name)
-        bf.sbatch_params["mem"] = "0"
+        apply_mem(bf.sbatch_params, "plt_conv", self.cluster_cfg)
         bf.lines.append("")
         bf.lines.append("")
         bf.lines.append("module purge")
@@ -912,7 +912,7 @@ class HPCPipelineManager:
         bf = Batchfile(batch_name)
         if self.sol_parallel_domains and self.sol_parallel_domains > 0:
             bf.sbatch_params["ntasks"] = str(self.sol_parallel_domains)
-        bf.sbatch_params["mem"] = "0"
+        apply_mem(bf.sbatch_params, "prepro", self.cluster_cfg)
         bf.sbatch_params["time"] = "2-00:00"
         bf.sbatch_params.pop("nodes", None)
 
@@ -1042,7 +1042,7 @@ class HPCPipelineManager:
         bf = Batchfile(batch_name)
         if self.sol_parallel_domains and self.sol_parallel_domains > 0:
             bf.sbatch_params["ntasks"] = str(self.sol_parallel_domains)
-        bf.sbatch_params["mem"] = "0"
+        apply_mem(bf.sbatch_params, "solver", self.cluster_cfg)
         bf.sbatch_params["time"] = "3-00:00"
         bf.sbatch_params.pop("nodes")
         bf.lines.append("")
@@ -1206,7 +1206,7 @@ class HPCPipelineManager:
         batch_name = f"post_n{self.n}_{tag_slug}"
         bf = Batchfile(batch_name)
         bf.sbatch_params["ntasks"] = 1
-        bf.sbatch_params["mem"] = "0"
+        apply_mem(bf.sbatch_params, "post", self.cluster_cfg)
         bf.sbatch_params["time"] = "01:00"
         bf.sbatch_params.pop("nodes")
         bf.lines.append("")

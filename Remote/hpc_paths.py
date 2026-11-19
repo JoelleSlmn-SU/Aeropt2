@@ -2,11 +2,12 @@
 hpc_paths.py - where AerOpt puts run data on the cluster. One definition, used everywhere.
 
 On the new cluster scratch is per *project*, not per user:
-    /scratch/<project code>                      e.g. /scratch/scw2427
-AerOpt runs go in
-    /scratch/<project>/aeropt/aeropt_out/<run>
-This folder is shared by everyone in the project: run folders are named after
-the local output folder, so two people using the same name share a run folder.
+    /scratch/<project code>          e.g. /scratch/scw2427
+Everyone in the project shares that directory, so AerOpt keeps its own runs
+under a per-user folder inside it:
+    /scratch/<project>/<username>/aeropt/aeropt_out/<run>
+Without the <username> level, two project members whose local output folders
+have the same name (both "run1") would write into the same remote run.
 """
 from __future__ import annotations
 
@@ -43,8 +44,9 @@ def project_scratch(project: str) -> str:
 
 def scratch_root(project: str, username: str) -> str:
     """Parent of all AerOpt run folders for this user in this project."""
-    # `username` is kept in the signature for callers; it is no longer part of the path.
-    return posixpath.join(project_scratch(project), "aeropt", "aeropt_out")
+    if not username or "/" in username:
+        raise ValueError(f"bad username {username!r}")
+    return posixpath.join(project_scratch(project), username, "aeropt", "aeropt_out")
 
 
 def check_scratch(ssh_client, project: str, username: str, timeout: float = 30.0) -> Tuple[bool, str]:
